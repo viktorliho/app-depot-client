@@ -1,40 +1,85 @@
 use app_depot_core::{
+    ServerProfileId,
     api::{ApiClient, ApiError},
+    library::{Library, LibraryError, LibraryPaths},
     models::{App, AssociationArtifact, Capabilities, DeclarationSnapshot, Release},
+    secrets::{NativeSecrets, SecretError, SecretStore},
 };
 use serde::Serialize;
-use std::{env, process::ExitCode};
+use std::{
+    env,
+    io::{self, IsTerminal, Read},
+    path::PathBuf,
+    process::ExitCode,
+};
 
 struct Options {
-    server: String,
+    server: Option<String>,
+    profile: Option<ServerProfileId>,
+    library_data: Option<PathBuf>,
+    library_content: Option<PathBuf>,
     allow_insecure_http: bool,
     json: bool,
-    command: String,
-    id: Option<String>,
+    confirm: bool,
+    all: bool,
+    token_stdin: bool,
+    positional: Vec<String>,
 }
 
 fn usage() -> &'static str {
-    "usage: app-depot --server URL [--json] [--allow-insecure-http] <command> [id]\n\
-     commands: capabilities | apps | app ID | releases APP_ID | release ID | artifacts RELEASE_ID | declarations RELEASE_ID\n\
-     optional Bearer token: APP_DEPOT_TOKEN environment variable"
+    "usage: app-depot [--server URL | --profile ID] [--json] [--allow-insecure-http] <command> [id]\n\
+     read: capabilities | apps | app ID | releases APP_ID | release ID | artifacts RELEASE_ID | declarations RELEASE_ID\n\
+     local: profile add NAME URL | profile list [--all] | profile rename ID NAME | profile move ID URL | profile remove ID --confirm\n\
+     credentials: profile token-set ID --token-stdin | profile token-remove ID\n\
+     sync/offline: --profile ID sync | cached-apps | cached-releases APP_ID | cached-declarations RELEASE_ID\n\
+     optional APP_DEPOT_TOKEN overrides stored token for this process; --library-data/--library-content select local roots"
 }
 
 fn parse_args() -> Result<Options, ApiError> {
     let mut args = env::args().skip(1).peekable();
     let mut server = env::var("APP_DEPOT_SERVER_URL").ok();
+    let mut explicit_server = false;
+    let mut profile = None;
+    let mut library_data = env::var_os("APP_DEPOT_LIBRARY_DATA_DIR").map(PathBuf::from);
+    let mut library_content = env::var_os("APP_DEPOT_LIBRARY_CONTENT_DIR").map(PathBuf::from);
     let mut allow_insecure_http = false;
     let mut json = false;
+    let mut confirm = false;
+    let mut all = false;
+    let mut token_stdin = false;
     let mut positional = Vec::new();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--server" => {
+                explicit_server = true;
                 server = Some(
                     args.next()
                         .ok_or_else(|| ApiError::Config(usage().into()))?,
                 );
             }
+            "--profile" => {
+                profile = Some(ServerProfileId(
+                    args.next()
+                        .ok_or_else(|| ApiError::Config(usage().into()))?,
+                ))
+            }
+            "--library-data" => {
+                library_data = Some(PathBuf::from(
+                    args.next()
+                        .ok_or_else(|| ApiError::Config(usage().into()))?,
+                ))
+            }
+            "--library-content" => {
+                library_content = Some(PathBuf::from(
+                    args.next()
+                        .ok_or_else(|| ApiError::Config(usage().into()))?,
+                ))
+            }
             "--json" => json = true,
             "--allow-insecure-http" => allow_insecure_http = true,
+            "--confirm" => confirm = true,
+            "--all" => all = true,
+            "--token-stdin" => token_stdin = true,
             "-h" | "--help" => return Err(ApiError::Config(usage().into())),
             _ if arg.starts_with('-') => {
                 return Err(ApiError::Config(format!(
@@ -45,25 +90,28 @@ fn parse_args() -> Result<Options, ApiError> {
             _ => positional.push(arg),
         }
     }
-    let command = positional
-        .first()
-        .ok_or_else(|| ApiError::Config(usage().into()))?
-        .clone();
-    let needed = match command.as_str() {
-        "capabilities" | "apps" => 1,
-        "app" | "releases" | "release" | "artifacts" | "declarations" => 2,
-        _ => return Err(ApiError::Config(usage().into())),
-    };
-    if positional.len() != needed {
+    if positional.is_empty() {
         return Err(ApiError::Config(usage().into()));
     }
+    if profile.is_some() && explicit_server {
+        return Err(ApiError::Config(
+            "--server and --profile are mutually exclusive".into(),
+        ));
+    }
+    if profile.is_some() && !explicit_server {
+        server = None;
+    }
     Ok(Options {
-        server: server
-            .ok_or_else(|| ApiError::Config(format!("server URL required\n{}", usage())))?,
+        server: server.take(),
+        profile,
+        library_data,
+        library_content,
         allow_insecure_http,
         json,
-        command,
-        id: positional.get(1).cloned(),
+        confirm,
+        all,
+        token_stdin,
+        positional,
     })
 }
 
@@ -155,14 +203,328 @@ fn print_declarations(snapshot: &DeclarationSnapshot) -> Result<(), ApiError> {
     Ok(())
 }
 
-fn run() -> Result<(), ApiError> {
-    let options = parse_args()?;
-    let token = env::var("APP_DEPOT_TOKEN")
+enum CliError {
+    Api(ApiError),
+    Library(LibraryError),
+    Secret(SecretError),
+}
+fn api_exit(error: &ApiError) -> u8 {
+    match error {
+        ApiError::Config(_) => 2,
+        ApiError::Authentication(_) => 3,
+        ApiError::Authorization(_) => 4,
+        ApiError::Transport(_) => 5,
+        ApiError::Incompatible(_) => 6,
+        ApiError::Protocol(_) => 7,
+        ApiError::Http { .. } => 8,
+    }
+}
+fn api_connection_status(error: &ApiError) -> &'static str {
+    match error {
+        ApiError::Transport(_) => "unreachable",
+        ApiError::Authentication(_) => "authentication-required",
+        ApiError::Authorization(_) => "forbidden",
+        ApiError::Incompatible(_) => "incompatible",
+        ApiError::Protocol(_) => "protocol-error",
+        _ => "http-error",
+    }
+}
+impl From<ApiError> for CliError {
+    fn from(value: ApiError) -> Self {
+        Self::Api(value)
+    }
+}
+impl From<LibraryError> for CliError {
+    fn from(value: LibraryError) -> Self {
+        Self::Library(value)
+    }
+}
+impl From<SecretError> for CliError {
+    fn from(value: SecretError) -> Self {
+        Self::Secret(value)
+    }
+}
+impl std::fmt::Display for CliError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Api(error) => error.fmt(f),
+            Self::Library(error) => error.fmt(f),
+            Self::Secret(error) => error.fmt(f),
+        }
+    }
+}
+
+fn open_library(options: &Options) -> Result<Library, CliError> {
+    let mut paths = LibraryPaths::default_for_user()?;
+    if let Some(path) = &options.library_data {
+        paths.metadata = path.clone();
+        if options.library_content.is_none() {
+            paths.content = path.clone();
+        }
+    }
+    if let Some(path) = &options.library_content {
+        paths.content = path.clone();
+    }
+    Ok(Library::open(paths)?)
+}
+
+fn selected_token(profile: &app_depot_core::library::Profile) -> Result<Option<String>, CliError> {
+    if let Some(token) = env::var("APP_DEPOT_TOKEN")
         .ok()
-        .filter(|token| !token.is_empty());
-    let client = ApiClient::new(&options.server, token, options.allow_insecure_http)?;
-    if options.command == "capabilities" {
-        let caps = client.capabilities()?;
+        .filter(|value| !value.is_empty())
+    {
+        return Ok(Some(token));
+    }
+    match profile.credential_ref.as_deref() {
+        None => Ok(None),
+        Some(reference) => match NativeSecrets.get(reference) {
+            Ok(token) => Ok(Some(token)),
+            Err(SecretError::Unavailable) => {
+                eprintln!("native secure storage unavailable; trying anonymous access");
+                Ok(None)
+            }
+            Err(error) => Err(error.into()),
+        },
+    }
+}
+
+fn run_profile(options: &Options) -> Result<(), CliError> {
+    let mut library = open_library(options)?;
+    let args = &options.positional;
+    let action = args.get(1).map(String::as_str).unwrap_or("");
+    match (action, args.len()) {
+        ("add", 4) => {
+            let profile = library.add_profile(&args[2], &args[3], options.allow_insecure_http)?;
+            if options.json {
+                print_json(&profile)?;
+            } else {
+                println!("{}  {}  {}", profile.id.0, profile.name, profile.origin);
+            }
+        }
+        ("list", 2) => {
+            let profiles = library.profiles(options.all)?;
+            if options.json {
+                print_json(&profiles)?;
+            } else {
+                for profile in profiles {
+                    println!(
+                        "{}  {}  {}  {}{}",
+                        profile.id.0,
+                        profile.name,
+                        profile.origin,
+                        profile.connection_status,
+                        if profile.archived { " (archived)" } else { "" }
+                    );
+                }
+            }
+        }
+        ("rename", 4) => library.rename_profile(&ServerProfileId(args[2].clone()), &args[3])?,
+        ("move", 4) => {
+            let id = ServerProfileId(args[2].clone());
+            if library.profile(&id)?.credential_ref.is_some() {
+                return Err(CliError::Library(LibraryError::Invalid(
+                    "remove the old profile token before changing its URL".into(),
+                )));
+            }
+            let profile = library.replace_origin(&id, &args[3], options.allow_insecure_http)?;
+            if options.json {
+                print_json(&profile)?;
+            } else {
+                println!("new profile ID: {} (old profile archived)", profile.id.0);
+            }
+        }
+        ("remove", 3) => {
+            if !options.confirm {
+                return Err(ApiError::Config(
+                    "profile removal requires --confirm; cached data stays archived".into(),
+                )
+                .into());
+            }
+            let id = ServerProfileId(args[2].clone());
+            let profile = library.profile(&id)?;
+            if profile.archived {
+                return Err(LibraryError::Invalid("profile is already archived".into()).into());
+            }
+            if let Some(reference) = profile.credential_ref {
+                NativeSecrets.delete(&reference)?;
+                library.set_credential_ref(&id, None)?;
+            }
+            library.archive_profile(&id)?;
+            println!("profile archived; cached metadata retained for offline reading");
+        }
+        ("token-set", 3) => {
+            if !options.token_stdin || io::stdin().is_terminal() {
+                return Err(ApiError::Config(
+                    "token-set requires --token-stdin with piped input".into(),
+                )
+                .into());
+            }
+            let id = ServerProfileId(args[2].clone());
+            let old = library.profile(&id)?.credential_ref;
+            let mut token = String::new();
+            io::stdin()
+                .take(16_385)
+                .read_to_string(&mut token)
+                .map_err(LibraryError::Io)?;
+            if token.len() > 16_384 {
+                return Err(SecretError::Invalid.into());
+            }
+            let token = token.trim_end_matches(['\r', '\n']);
+            let mut secrets = NativeSecrets;
+            if let Some(old) = old {
+                secrets.replace(&old, token)?;
+            } else {
+                let reference = secrets.put(token)?;
+                if let Err(error) = library.set_credential_ref(&id, Some(&reference)) {
+                    let _ = secrets.delete(&reference);
+                    return Err(error.into());
+                }
+            }
+            println!("token stored in native secure storage for profile {}", id.0);
+        }
+        ("token-remove", 3) => {
+            let id = ServerProfileId(args[2].clone());
+            if let Some(reference) = library.profile(&id)?.credential_ref {
+                NativeSecrets.delete(&reference)?;
+                library.set_credential_ref(&id, None)?;
+            }
+            println!("profile token removed");
+        }
+        _ => return Err(ApiError::Config(usage().into()).into()),
+    }
+    Ok(())
+}
+
+fn run_cached(options: &Options, profile_id: &ServerProfileId) -> Result<(), CliError> {
+    let library = open_library(options)?;
+    let args = &options.positional;
+    match (args[0].as_str(), args.len()) {
+        ("cached-apps", 1) => {
+            let rows = library.cached_apps(profile_id)?;
+            if options.json {
+                print_json(&rows)?;
+            } else {
+                for row in rows {
+                    println!(
+                        "{}  {}  [cached; last sync {:?}; stale {}]",
+                        row.value.id, row.value.name, row.last_sync, row.stale
+                    );
+                }
+            }
+        }
+        ("cached-releases", 2) => {
+            let rows = library.cached_releases(profile_id, &args[1])?;
+            if options.json {
+                print_json(&rows)?;
+            } else {
+                for row in rows {
+                    println!(
+                        "{}  {}  [cached; last sync {:?}; stale {}]",
+                        row.value.id,
+                        row.value.version.as_deref().unwrap_or("(unversioned)"),
+                        row.last_sync,
+                        row.stale
+                    );
+                }
+            }
+        }
+        ("cached-declarations", 2) => {
+            let row = library
+                .cached_snapshot(profile_id, &args[1])?
+                .ok_or_else(|| LibraryError::Invalid("cached declaration not found".into()))?;
+            if options.json {
+                print_json(&row)?;
+            } else {
+                println!("cached; last sync {:?}; stale {}", row.last_sync, row.stale);
+                print_declarations(&row.value)?;
+            }
+        }
+        _ => return Err(ApiError::Config(usage().into()).into()),
+    }
+    Ok(())
+}
+
+fn run() -> Result<(), CliError> {
+    let options = parse_args()?;
+    if options.positional[0] == "profile" {
+        return run_profile(&options);
+    }
+    if let Some(profile_id) = &options.profile
+        && options.positional[0].starts_with("cached-")
+    {
+        return run_cached(&options, profile_id);
+    }
+    let mut library = if options.profile.is_some() {
+        Some(open_library(&options)?)
+    } else {
+        None
+    };
+    let (server, token) = if let Some(profile_id) = &options.profile {
+        let profile = library.as_ref().unwrap().profile(profile_id)?;
+        if profile.archived {
+            return Err(LibraryError::Invalid("archived profile is offline-only".into()).into());
+        }
+        let token = selected_token(&profile)?;
+        (profile.origin, token)
+    } else {
+        (
+            options
+                .server
+                .clone()
+                .ok_or_else(|| ApiError::Config(format!("server URL required\n{}", usage())))?,
+            env::var("APP_DEPOT_TOKEN")
+                .ok()
+                .filter(|value| !value.is_empty()),
+        )
+    };
+    let client = ApiClient::new(&server, token, options.allow_insecure_http)?;
+    if options.positional[0] == "sync" && options.positional.len() == 1 {
+        let id = options
+            .profile
+            .as_ref()
+            .ok_or_else(|| ApiError::Config("sync requires --profile ID".into()))?;
+        let result = library.as_mut().unwrap().sync(id, &client)?;
+        if options.json {
+            print_json(&result)?;
+        } else {
+            println!(
+                "synced {} Apps, {} Releases, {} associations, {} Artifacts at {}",
+                result.apps, result.releases, result.associations, result.artifacts, result.at
+            );
+        }
+        return Ok(());
+    }
+    let command = options.positional[0].as_str();
+    let needed = match command {
+        "capabilities" | "apps" => 1,
+        "app" | "releases" | "release" | "artifacts" | "declarations" => 2,
+        _ => return Err(ApiError::Config(usage().into()).into()),
+    };
+    if options.positional.len() != needed {
+        return Err(ApiError::Config(usage().into()).into());
+    }
+    let caps = match client.capabilities() {
+        Ok(caps) => caps,
+        Err(error) => {
+            if let (Some(library), Some(id)) = (&mut library, &options.profile) {
+                library.connection_result(id, None, api_connection_status(&error))?;
+            }
+            return Err(error.into());
+        }
+    };
+    let read_page_size = caps.read_page_size();
+    if let (Some(library), Some(id)) = (&mut library, &options.profile) {
+        library.connection_result(
+            id,
+            Some(&caps),
+            if read_page_size.is_ok() {
+                "connected"
+            } else {
+                "incompatible"
+            },
+        )?;
+    }
+    if command == "capabilities" {
         if options.json {
             print_json(&caps)?;
         } else {
@@ -170,14 +532,13 @@ fn run() -> Result<(), ApiError> {
         }
         let issues = caps.incompatibilities();
         if !issues.is_empty() {
-            return Err(ApiError::Incompatible(issues.join("; ")));
+            return Err(ApiError::Incompatible(issues.join("; ")).into());
         }
         return Ok(());
     }
-    let caps = client.ensure_read_compatible()?;
-    let page_size = caps.page_size().map_err(ApiError::Incompatible)?;
-    let id = options.id.as_deref().unwrap_or("");
-    match options.command.as_str() {
+    let page_size = read_page_size.map_err(ApiError::Incompatible)?;
+    let id = options.positional.get(1).map(String::as_str).unwrap_or("");
+    match command {
         "apps" => {
             let apps = client.list_apps(page_size)?;
             if options.json {
@@ -233,6 +594,7 @@ fn run() -> Result<(), ApiError> {
         }
         _ => Err(ApiError::Config(usage().into())),
     }
+    .map_err(Into::into)
 }
 
 fn main() -> ExitCode {
@@ -240,14 +602,12 @@ fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("{error}");
-            ExitCode::from(match error {
-                ApiError::Config(_) => 2,
-                ApiError::Authentication(_) => 3,
-                ApiError::Authorization(_) => 4,
-                ApiError::Transport(_) => 5,
-                ApiError::Incompatible(_) => 6,
-                ApiError::Protocol(_) => 7,
-                ApiError::Http { .. } => 8,
+            ExitCode::from(match &error {
+                CliError::Api(error) | CliError::Library(LibraryError::Api(error)) => {
+                    api_exit(error)
+                }
+                CliError::Library(_) => 9,
+                CliError::Secret(_) => 10,
             })
         }
     }

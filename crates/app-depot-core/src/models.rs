@@ -70,6 +70,16 @@ impl Capabilities {
             Err(format!("invalid maxPageSize {}", self.limits.max_page_size))
         }
     }
+
+    pub fn read_page_size(&self) -> Result<u64, String> {
+        if self.api_version != "1.0.0" {
+            return Err(format!(
+                "unreviewed API version {} (implemented 1.0.0)",
+                self.api_version
+            ));
+        }
+        self.page_size()
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -81,6 +91,8 @@ pub struct App {
     pub owner_id: String,
     pub visibility: String,
     pub state: String,
+    #[serde(flatten)]
+    pub unknown: BTreeMap<String, Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -90,6 +102,8 @@ pub struct Release {
     pub app_id: String,
     pub state: String,
     pub version: Option<String>,
+    #[serde(flatten)]
+    pub unknown: BTreeMap<String, Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -98,6 +112,8 @@ pub struct Association {
     pub id: String,
     pub release_id: String,
     pub artifact_id: String,
+    #[serde(flatten)]
+    pub unknown: BTreeMap<String, Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -106,6 +122,8 @@ pub struct Artifact {
     pub id: String,
     pub kind: String,
     pub size: Option<u64>,
+    #[serde(flatten)]
+    pub unknown: BTreeMap<String, Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -113,6 +131,8 @@ pub struct Artifact {
 pub struct DeclarationDocument {
     pub revision_id: String,
     pub data: Value,
+    #[serde(flatten)]
+    pub unknown: BTreeMap<String, Value>,
 }
 
 impl DeclarationDocument {
@@ -191,6 +211,8 @@ pub enum EntryPointTarget {
 pub struct SnapshotAssociation {
     pub association_id: String,
     pub declaration: DeclarationDocument,
+    #[serde(flatten)]
+    pub unknown: BTreeMap<String, Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -200,6 +222,8 @@ pub struct DeclarationSnapshot {
     pub app: DeclarationDocument,
     pub release: DeclarationDocument,
     pub associations: Vec<SnapshotAssociation>,
+    #[serde(flatten)]
+    pub unknown: BTreeMap<String, Value>,
 }
 
 #[derive(Debug, Deserialize)]

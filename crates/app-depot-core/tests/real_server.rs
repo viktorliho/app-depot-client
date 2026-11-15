@@ -1,12 +1,20 @@
 //! Read-only compatibility check against an isolated Dev/Test Server.
 
-use app_depot_core::api::ApiClient;
+use app_depot_core::{
+    api::ApiClient,
+    library::{Library, LibraryPaths},
+};
 use std::env;
 
 #[test]
 #[ignore = "requires isolated Dev/Test Server and published App/Release fixtures"]
 fn reads_real_server_catalog_and_declarations() {
     let url = env::var("APP_DEPOT_TEST_SERVER_URL").expect("isolated Server URL required");
+    let parsed = url::Url::parse(&url).unwrap();
+    assert!(
+        matches!(parsed.host_str(), Some("127.0.0.1" | "localhost" | "::1")),
+        "real Server test requires a loopback Dev/Test endpoint"
+    );
     let app_id = env::var("APP_DEPOT_TEST_APP_ID").expect("fixture App ID required");
     let release_id = env::var("APP_DEPOT_TEST_RELEASE_ID").expect("fixture Release ID required");
     let token = env::var("APP_DEPOT_TEST_TOKEN").ok();
@@ -39,5 +47,42 @@ fn reads_real_server_catalog_and_declarations() {
     assert_eq!(
         snapshot.release.data["unknown"]["large"].as_u64(),
         Some(u64::MAX)
+    );
+
+    let root = tempfile::tempdir().unwrap();
+    let mut library = Library::open(LibraryPaths {
+        metadata: root.path().join("metadata"),
+        content: root.path().join("content"),
+    })
+    .unwrap();
+    let profile = library.add_profile("isolated test", &url, false).unwrap();
+    let summary = library.sync(&profile.id, &client).unwrap();
+    assert!(summary.apps >= 1 && summary.releases >= 1);
+    assert!(
+        library
+            .cached_apps(&profile.id)
+            .unwrap()
+            .iter()
+            .any(|row| row.value.id == app_id)
+    );
+    let cached = library
+        .cached_snapshot(&profile.id, &release_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        cached.value.release.data["unknown"]["large"].as_u64(),
+        Some(u64::MAX)
+    );
+    drop(library);
+    let library = Library::open(LibraryPaths {
+        metadata: root.path().join("metadata"),
+        content: root.path().join("content"),
+    })
+    .unwrap();
+    assert!(
+        library
+            .cached_snapshot(&profile.id, &release_id)
+            .unwrap()
+            .is_some()
     );
 }

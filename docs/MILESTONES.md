@@ -1,12 +1,14 @@
 # Milestones and acceptance
 
-## M0 — foundation (this repository state)
+## M0 — foundation
 
 Audit the Server contract/implementation and ArtCraft patterns; define boundaries, lifecycle gaps, local library, conformance plan and client governance; create a minimal buildable Rust workspace. No desktop app, installer or launcher is claimed. No Server change or remote publication.
 
 ## M1 — first functional client
 
 M1.1 now provides the read-only HTTP transport and CLI: capability discovery, catalog traversal, Artifact metadata and declaration snapshots. It does not provide a desktop UI, transfer engine, local library or execution.
+
+M1.2 now provides persistent local Server profiles, native secure-store token references, transactional catalog synchronization, and offline cached Apps/Releases/declaration snapshots through the CLI. It prepares local content/staging directories and reserves minimal future verified-content/job identities, but does not download or materialize Artifacts. URL changes create a new profile identity; archived profiles retain their cached catalog. Linux secure storage and filesystem behavior have been exercised; Windows/macOS adapters still require platform validation.
 
 Implement a shared core transport, declaration reader, transfer engine and local library; expose a small diagnostic CLI and an egui desktop browser on Linux. Windows/macOS paths and adapters must compile or be clearly tracked as later platform validation. All M1 operations use existing Server read APIs. No install, runtime preparation or launch implementation.
 

@@ -1,4 +1,4 @@
-# Client architecture (M0)
+# Client architecture
 
 The Server stores authoritative declarations and immutable Artifact bytes. The client reads them, chooses only operations it understands, asks for appropriate user authority, and verifies every download. Local state records what this client has downloaded or performed; it never alters the Server's meaning. Independent clients can implement the same Server contract without this repository.
 
@@ -6,7 +6,7 @@ The Server stores authoritative declarations and immutable Artifact bytes. The c
 
 ### ADR-001: Rust core, egui adapter
 
-Use a native Rust core with an egui desktop UI on Linux first, then Windows/macOS. A CLI uses the same core for diagnostics and conformance. The current workspace implements the M1.1 read-only HTTP core and CLI. Future modules/crates are introduced when concrete later responsibilities exist:
+Use a native Rust core with an egui desktop UI on Linux first, then Windows/macOS. A CLI uses the same core for diagnostics and conformance. The current workspace implements the M1.1 read-only HTTP core and CLI plus M1.2 profile, credential and catalog-cache modules. Future modules/crates are introduced when concrete later responsibilities exist:
 
 | Boundary | Responsibility |
 | --- | --- |
@@ -35,7 +35,11 @@ At connection, read `/capabilities`; retain unknown fields, check the API major/
 
 ### ADR-005: Credentials
 
-Use the OS secure store (Secret Service on Linux, Credential Manager on Windows, Keychain on macOS) for Bearer tokens, indexed by local profile ID. Keep profile metadata and token references in the library database; never serialize tokens into jobs, logs, crash reports or exports. If secure storage is unavailable, offer only session-memory tokens or anonymous access. An explicit user opt-in may use a passphrase-encrypted local vault in a later milestone after its format and recovery policy are specified; plaintext fallback is prohibited. Use HTTPS for remote servers by default; allow loopback HTTP for local development and explicit user override for self-hosted LAN endpoints with a clear transport warning. Do not send credentials across a redirect to another origin.
+Use the OS secure store (Secret Service on Linux, Credential Manager on Windows, Keychain on macOS) for Bearer tokens, with an opaque credential reference attached to one local profile ID. Keep profile metadata and token references in the library database; never serialize tokens into jobs, logs, crash reports or exports. If secure storage is unavailable, offer only session-memory tokens or anonymous access. An explicit user opt-in may use a passphrase-encrypted local vault in a later milestone after its format and recovery policy are specified; plaintext fallback is prohibited. Use HTTPS for remote servers by default; allow loopback HTTP for local development and explicit user override for self-hosted LAN endpoints with a clear transport warning. Do not send credentials across a redirect to another origin.
+
+### ADR-006: Local identity, cache and profile removal (M1.2)
+
+SQLite schema version 1 stores each profile under a generated UUID and scopes Apps, Releases, associations, Artifacts and declaration snapshots by that ID. A profile URL change creates a new profile ID and archives the old one; this keeps old cached declarations attached to their original origin. Profile removal requires `--confirm`, removes its secure token, and archives the profile and cache. Archived profiles remain readable offline but cannot synchronize. No M1.2 command deletes cached metadata or verified content. A successful sync fetches the reachable catalog first, then writes it in one transaction. Unseen records are retained and marked stale; a failed fetch does not partially replace the cache. The Server provides a consistent declaration snapshot per Release, not a globally atomic catalog snapshot.
 
 ## UI read model
 

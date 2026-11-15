@@ -107,6 +107,10 @@ impl ApiClient {
         Ok(Self { base, agent, token })
     }
 
+    pub fn origin(&self) -> &str {
+        self.base.as_str()
+    }
+
     fn url(
         &self,
         segments: &[&str],
@@ -148,6 +152,16 @@ impl ApiClient {
         cursor: Option<&str>,
         page_size: Option<u64>,
     ) -> Result<T, ApiError> {
+        self.get_json_with_etag(segments, cursor, page_size)
+            .map(|(value, _)| value)
+    }
+
+    fn get_json_with_etag<T: DeserializeOwned>(
+        &self,
+        segments: &[&str],
+        cursor: Option<&str>,
+        page_size: Option<u64>,
+    ) -> Result<(T, Option<String>), ApiError> {
         let url = self.url(segments, cursor, page_size)?;
         let mut request = self
             .agent
@@ -191,8 +205,10 @@ impl ApiClient {
                 "unexpected Content-Type {content_type:?}"
             )));
         }
+        let etag = response.header("ETag").map(str::to_owned);
         let body = read_bounded(response, MAX_JSON_BYTES)?;
         serde_json::from_slice(&body)
+            .map(|value| (value, etag))
             .map_err(|error| ApiError::Protocol(format!("malformed JSON response: {error}")))
     }
 
@@ -202,13 +218,9 @@ impl ApiClient {
 
     pub fn ensure_read_compatible(&self) -> Result<Capabilities, ApiError> {
         let capabilities = self.capabilities()?;
-        if capabilities.api_version != "1.0.0" {
-            return Err(ApiError::Incompatible(format!(
-                "unreviewed API version {} (implemented 1.0.0)",
-                capabilities.api_version
-            )));
-        }
-        capabilities.page_size().map_err(ApiError::Incompatible)?;
+        capabilities
+            .read_page_size()
+            .map_err(ApiError::Incompatible)?;
         Ok(capabilities)
     }
 
@@ -299,7 +311,15 @@ impl ApiClient {
     }
 
     pub fn declarations(&self, release_id: &str) -> Result<DeclarationSnapshot, ApiError> {
-        let snapshot: DeclarationSnapshot = self.get_json(
+        self.declarations_with_etag(release_id)
+            .map(|(value, _)| value)
+    }
+
+    pub fn declarations_with_etag(
+        &self,
+        release_id: &str,
+    ) -> Result<(DeclarationSnapshot, Option<String>), ApiError> {
+        let (snapshot, etag): (DeclarationSnapshot, Option<String>) = self.get_json_with_etag(
             &["releases", release_id, "declaration-snapshot"],
             None,
             None,
@@ -319,7 +339,7 @@ impl ApiClient {
                 "duplicate snapshot Association ID".into(),
             ));
         }
-        Ok(snapshot)
+        Ok((snapshot, etag))
     }
 
     fn pages<T: DeserializeOwned>(

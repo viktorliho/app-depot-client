@@ -4,11 +4,13 @@
 //! execution belong to later milestones.
 
 pub mod api;
+pub mod library;
 pub mod models;
+pub mod secrets;
 
 /// Locally generated identity for a configured Server profile. A URL is not an identity:
 /// endpoints may move, and different profiles may use the same URL with different credentials.
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ServerProfileId(pub String);
 
 /// Server-local App UUID scoped by the client's configured Server profile.
