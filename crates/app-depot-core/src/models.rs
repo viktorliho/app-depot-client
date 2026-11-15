@@ -117,6 +117,30 @@ pub struct Association {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "type")]
+pub enum InventoryEntry {
+    File {
+        path: String,
+        #[serde(rename = "fileId")]
+        file_id: String,
+        size: u64,
+        sha256: String,
+        executable: bool,
+    },
+    Directory {
+        path: String,
+    },
+}
+
+impl InventoryEntry {
+    pub fn path(&self) -> &str {
+        match self {
+            Self::File { path, .. } | Self::Directory { path } => path,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Artifact {
     pub id: String,

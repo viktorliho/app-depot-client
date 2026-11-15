@@ -1,8 +1,8 @@
 //! Read-only App Depot HTTP client. Every route is from the Server OpenAPI.
 
 use crate::models::{
-    App, Artifact, Association, AssociationArtifact, Capabilities, DeclarationSnapshot, Page,
-    Release,
+    App, Artifact, Association, AssociationArtifact, Capabilities, DeclarationSnapshot,
+    InventoryEntry, Page, Release,
 };
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -121,7 +121,16 @@ impl ApiClient {
         if !valid_artifact_id(artifact_id) || !artifact_id.starts_with("adfile:sha256:") {
             return Err(ApiError::Config("invalid File Artifact ID".into()));
         }
-        let url = self.url(&["artifacts", artifact_id, "content"], None, None)?;
+        self.binary_get(&["artifacts", artifact_id, "content"], offset, if_range)
+    }
+
+    fn binary_get(
+        &self,
+        segments: &[&str],
+        offset: Option<u64>,
+        if_range: Option<&str>,
+    ) -> Result<ureq::Response, ApiError> {
+        let url = self.url(segments, None, None)?;
         let mut request = self
             .agent
             .get(url.as_str())
@@ -166,6 +175,26 @@ impl ApiClient {
             300..=399 => ApiError::Protocol(format!("redirect refused (HTTP {status})")),
             _ => ApiError::Http { status, problem },
         })
+    }
+
+    pub(crate) fn tree_file_content(
+        &self,
+        artifact_id: &str,
+        file_id: &str,
+        offset: Option<u64>,
+        if_range: Option<&str>,
+    ) -> Result<ureq::Response, ApiError> {
+        if !valid_artifact_id(artifact_id)
+            || !artifact_id.starts_with("adtree:v1:sha256:")
+            || uuid::Uuid::parse_str(file_id).is_err()
+        {
+            return Err(ApiError::Config("invalid Tree Artifact or file ID".into()));
+        }
+        self.binary_get(
+            &["artifacts", artifact_id, "files", file_id],
+            offset,
+            if_range,
+        )
     }
 
     fn url(
@@ -347,6 +376,64 @@ impl ApiClient {
         Ok(artifact)
     }
 
+    pub fn tree_inventory(
+        &self,
+        id: &str,
+        page_size: u64,
+    ) -> Result<(Vec<InventoryEntry>, String), ApiError> {
+        if !valid_artifact_id(id) || !id.starts_with("adtree:v1:sha256:") {
+            return Err(ApiError::Config("invalid Tree Artifact ID".into()));
+        }
+        if !(1..=1000).contains(&page_size) {
+            return Err(ApiError::Config("page size outside protocol range".into()));
+        }
+        let mut items = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut seen = HashSet::new();
+        let mut validator: Option<String> = None;
+        for _ in 0..MAX_PAGES {
+            let (page, etag): (Page<Value>, _) = self.get_json_with_etag(
+                &["artifacts", id, "inventory"],
+                cursor.as_deref(),
+                Some(page_size),
+            )?;
+            let etag = etag.ok_or_else(|| ApiError::Protocol("inventory ETag missing".into()))?;
+            if !is_strong_etag(&etag) || validator.as_ref().is_some_and(|prior| prior != &etag) {
+                return Err(ApiError::Protocol(
+                    "inventory ETag missing, weak or changed".into(),
+                ));
+            }
+            validator = Some(etag);
+            if page.items.is_empty() && page.next_cursor.is_some()
+                || page.items.len() > page_size as usize
+                || items.len() + page.items.len() > MAX_ITEMS
+            {
+                return Err(ApiError::Protocol("invalid inventory page size".into()));
+            }
+            for raw in page.items {
+                let entry = parse_inventory_entry(raw)?;
+                if items.last().is_some_and(|previous: &InventoryEntry| {
+                    previous.path().as_bytes() >= entry.path().as_bytes()
+                }) {
+                    return Err(ApiError::Protocol(
+                        "inventory paths are duplicate or not canonically ordered".into(),
+                    ));
+                }
+                items.push(entry);
+            }
+            match page.next_cursor {
+                None => return Ok((items, validator.unwrap())),
+                Some(next) if next.is_empty() || !seen.insert(next.clone()) => {
+                    return Err(ApiError::Protocol(
+                        "empty or repeated inventory cursor".into(),
+                    ));
+                }
+                Some(next) => cursor = Some(next),
+            }
+        }
+        Err(ApiError::Protocol("inventory exceeds page limit".into()))
+    }
+
     pub fn associated_artifacts(
         &self,
         release_id: &str,
@@ -442,6 +529,49 @@ fn valid_artifact_id(id: &str) -> bool {
                 .bytes()
                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     })
+}
+
+fn is_strong_etag(value: &str) -> bool {
+    value.len() >= 2
+        && value.starts_with('"')
+        && value.ends_with('"')
+        && !value[1..value.len() - 1].contains('"')
+        && value.bytes().all(|byte| (33..=126).contains(&byte))
+}
+
+fn parse_inventory_entry(raw: Value) -> Result<InventoryEntry, ApiError> {
+    let object = raw
+        .as_object()
+        .ok_or_else(|| ApiError::Protocol("inventory entry is not an object".into()))?;
+    let kind = object
+        .get("type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ApiError::Protocol("inventory entry type missing".into()))?;
+    let allowed: &[&str] = match kind {
+        "File" => &["type", "path", "fileId", "size", "sha256", "executable"],
+        "Directory" => &["type", "path", "fileId", "size", "sha256", "executable"],
+        _ => {
+            return Err(ApiError::Protocol(
+                "unsupported inventory entry type".into(),
+            ));
+        }
+    };
+    if object.keys().any(|key| !allowed.contains(&key.as_str())) {
+        return Err(ApiError::Protocol(
+            "unexpected inventory entry field".into(),
+        ));
+    }
+    if kind == "Directory"
+        && ["fileId", "size", "sha256", "executable"]
+            .iter()
+            .any(|key| object.get(*key).is_some_and(|value| !value.is_null()))
+    {
+        return Err(ApiError::Protocol(
+            "Directory has file-only metadata".into(),
+        ));
+    }
+    serde_json::from_value(raw)
+        .map_err(|error| ApiError::Protocol(format!("malformed inventory entry: {error}")))
 }
 
 fn is_loopback(url: &Url) -> bool {
@@ -670,6 +800,85 @@ mod tests {
         handle.join().unwrap();
         let requests = requests.lock().unwrap();
         assert!(requests[1].contains("cursor=x%2F%2B+y"));
+    }
+
+    #[test]
+    fn tree_inventory_pages_require_stable_strong_validator_and_order() {
+        let id = format!("adtree:v1:sha256:{}", "a".repeat(64));
+        let first = r#"{"items":[{"type":"File","path":"a.txt","fileId":"66666666-6666-4666-8666-666666666666","size":18446744073709551615,"sha256":"559aead08264d5795d3909718cdd05abd49572e84fe55590eef31a88a08fdffd","executable":false}],"nextCursor":"opaque/next"}"#;
+        let second = r#"{"items":[{"type":"Directory","path":"empty","fileId":null,"size":null,"sha256":null,"executable":null}],"nextCursor":null}"#;
+        let with_etag = |body: &str, etag: &str| Reply {
+            status: 200,
+            content_type: "application/json",
+            body: body.into(),
+            extra_header: Some(format!("ETag: {etag}")),
+        };
+        let (url, requests, handle) = server(vec![
+            with_etag(first, "\"same\""),
+            with_etag(second, "\"same\""),
+        ]);
+        let (entries, validator) = ApiClient::new(&url, None, false)
+            .unwrap()
+            .tree_inventory(&id, 1)
+            .unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(validator, "\"same\"");
+        assert!(matches!(
+            entries[0],
+            InventoryEntry::File { size: u64::MAX, .. }
+        ));
+        handle.join().unwrap();
+        assert!(requests.lock().unwrap()[1].contains("cursor=opaque%2Fnext"));
+
+        let (url, _, handle) = server(vec![
+            with_etag(first, "\"first\""),
+            with_etag(second, "\"second\""),
+        ]);
+        assert!(matches!(
+            ApiClient::new(&url, None, false)
+                .unwrap()
+                .tree_inventory(&id, 1),
+            Err(ApiError::Protocol(_))
+        ));
+        handle.join().unwrap();
+        let second_duplicate = second.replace("\"path\":\"empty\"", "\"path\":\"a.txt\"");
+        let (url, _, handle) = server(vec![
+            with_etag(first, "\"same\""),
+            with_etag(&second_duplicate, "\"same\""),
+        ]);
+        assert!(matches!(
+            ApiClient::new(&url, None, false)
+                .unwrap()
+                .tree_inventory(&id, 1),
+            Err(ApiError::Protocol(_))
+        ));
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn tree_inventory_rejects_malformed_entries_and_cursors() {
+        let id = format!("adtree:v1:sha256:{}", "a".repeat(64));
+        let cases = [
+            r#"{"items":[{"type":"Link","path":"x"}],"nextCursor":null}"#,
+            r#"{"items":[{"type":"Directory","path":"x","fileId":"bad"}],"nextCursor":null}"#,
+            r#"{"items":[{"type":"File","path":"x","fileId":"66666666-6666-4666-8666-666666666666","size":1,"sha256":"x","executable":false,"surprise":1}],"nextCursor":null}"#,
+            r#"{"items":[],"nextCursor":"never"}"#,
+        ];
+        for body in cases {
+            let (url, _, handle) = server(vec![Reply {
+                status: 200,
+                content_type: "application/json",
+                body: body.into(),
+                extra_header: Some("ETag: \"same\"".into()),
+            }]);
+            assert!(matches!(
+                ApiClient::new(&url, None, false)
+                    .unwrap()
+                    .tree_inventory(&id, 1),
+                Err(ApiError::Protocol(_))
+            ));
+            handle.join().unwrap();
+        }
     }
 
     #[test]

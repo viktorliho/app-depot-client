@@ -2,7 +2,7 @@
 
 Native reference client for the open [App Depot Server](https://github.com/viktorliho/app-depot-server) protocol. The client is optional: independent clients can implement the documented Server API without using this code.
 
-M1.3 adds verified, resumable single-file Artifact downloads to the HTTP core and diagnostic CLI. The client also has persistent Server profiles and an offline catalog cache. There is no desktop UI, tree downloader, installer or launcher yet. See [milestones](docs/MILESTONES.md) and the [server API audit](docs/SERVER_API_AUDIT.md).
+M1.4 adds verified, resumable Tree Artifact downloads to the HTTP core and diagnostic CLI. The client also downloads single-file Artifacts, stores Server profiles and keeps an offline catalog cache. There is no desktop UI, installer or launcher yet. See [milestones](docs/MILESTONES.md) and the [server API audit](docs/SERVER_API_AUDIT.md).
 
 ## Build and use
 
@@ -36,7 +36,7 @@ app-depot profile remove PROFILE_ID --confirm
 
 To store a profile token, pipe it to `app-depot profile token-set PROFILE_ID --token-stdin`; replacement updates that profile's existing secure-store entry. On Linux the native backend is Secret Service, with Credential Manager and Keychain selected on Windows and macOS. If unavailable, use anonymous access or `APP_DEPOT_TOKEN` for one process; there is no plaintext fallback. `--library-data ABSOLUTE_PATH` or `APP_DEPOT_LIBRARY_DATA_DIR` selects the metadata root. `--library-content ABSOLUTE_PATH` or `APP_DEPOT_LIBRARY_CONTENT_DIR` selects the content root separately. With only `--library-data`, both roots use that path. Defaults are the OS user data directory under `app-depot-client`. Local-library failures exit 9 and native credential failures exit 10.
 
-## File Artifact downloads
+## Artifact downloads
 
 ```sh
 app-depot --profile PROFILE_ID download start RELEASE_ID ASSOCIATION_ID
@@ -46,12 +46,14 @@ app-depot --profile PROFILE_ID download resume JOB_ID
 app-depot --profile PROFILE_ID download retry JOB_ID
 app-depot --profile PROFILE_ID download cancel JOB_ID
 app-depot --profile PROFILE_ID download files
+app-depot --profile PROFILE_ID download trees
+app-depot --profile PROFILE_ID download tree-files JOB_ID
 ```
 
-`download start` requires an accessible Release association and creates a durable job; use `artifacts RELEASE_ID` to find its association ID. The command prints the job ID before transfer. `--pause-after-bytes N` pauses after at least N accepted bytes for diagnostics. A process interruption leaves a resumable job, and `download jobs` reconciles interrupted states. `download files` validates and lists verified local files offline, including the absolute materialized path. `--json` applies to download commands. A cancelled job retains its staging data but cannot be resumed; no completed bytes are removed. An archived profile can list jobs and verified files offline but cannot download. The client never names files from Server metadata or treats a verified file as installed or launchable.
+`download start` requires an accessible Release association and creates a durable File or Tree job; use `artifacts RELEASE_ID` to find its association ID. The command prints the job ID before transfer. `--pause-after-bytes N` pauses after at least N accepted bytes for diagnostics. A process interruption leaves a resumable job, and `download jobs` reconciles interrupted states. `download files` and `download trees` validate and list verified local Artifacts offline, including absolute materialized paths. `download tree-files JOB_ID` shows each member's path, progress and verification state. `--json` applies to download commands. A cancelled job retains verified member objects and staging data but cannot be resumed; no completed bytes are removed. An archived profile can list jobs and verified Artifacts offline but cannot download. Tree paths and executable flags come only from verified Server inventory; no entry point, installation or launch behavior is inferred.
 
-The client implements the Server's `apiVersion: 1.0.0` read and File Artifact transfer contract. Other API versions are reported as unreviewed until their contract is checked. File transfer requires `adfile:sha256` identity and advertised Range support. A missing download Range capability or unknown identity format is reported by `capabilities`; read-only catalog commands can still operate when the read contract is compatible.
+The client implements the Server's `apiVersion: 1.0.0` read, File and Tree transfer contract. Other API versions are reported as unreviewed until their contract is checked. Tree transfer requires `adtree:v1:sha256`, `adfile:sha256` and advertised Range support. A missing download Range capability or unknown identity format is reported by `capabilities`; read-only catalog commands can still operate when the read contract is compatible. Linux Tree completion uses atomic no-replace directory promotion. Windows/macOS Tree completion still needs an equivalent implementation and validation.
 
-The real Server tests are ignored in routine runs. Against an isolated Dev/Test Server with a Published fixture containing an unknown `uint64` field and a File Artifact larger than 64 KiB, set `APP_DEPOT_TEST_SERVER_URL`, `APP_DEPOT_TEST_APP_ID`, `APP_DEPOT_TEST_RELEASE_ID`, and optionally `APP_DEPOT_TEST_TOKEN` and `APP_DEPOT_TEST_ASSOCIATION_COUNT`, then run `cargo test -p app-depot-core --test real_server --locked -- --ignored`. The tests use a disposable local library and exercise interruption, Range resume, SHA-256 and offline materialization. Never point them at Production.
+The real Server tests are ignored in routine runs. Against an isolated Dev/Test Server with a Published fixture containing an unknown `uint64` field, a File Artifact larger than 64 KiB, and a Tree Artifact with multiple files, nested and empty directories, executable flag and a large member, set `APP_DEPOT_TEST_SERVER_URL`, `APP_DEPOT_TEST_APP_ID`, `APP_DEPOT_TEST_RELEASE_ID`, and optionally `APP_DEPOT_TEST_TOKEN` and `APP_DEPOT_TEST_ASSOCIATION_COUNT`, then run `cargo test -p app-depot-core --test real_server --locked -- --ignored`. For the Linux process interruption test, also set `APP_DEPOT_TEST_TREE_ASSOCIATION_ID` and run `cargo test -p app-depot --test tree_sigkill --locked -- --ignored`. These tests use disposable local libraries and exercise inventory pagination, interruption, Range resume, SHA-256, Tree Identity v1 and offline materialization. Never point them at Production.
 
 The client treats Server declarations and downloaded content as untrusted. A download never implies permission or ability to install or execute it.

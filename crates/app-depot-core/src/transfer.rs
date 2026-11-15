@@ -65,14 +65,14 @@ fn digest(id: &str) -> Result<&str, LibraryError> {
     }
     Ok(value)
 }
-fn strong_etag(value: &str) -> bool {
+pub(crate) fn strong_etag(value: &str) -> bool {
     value.len() >= 2
         && value.starts_with('"')
         && value.ends_with('"')
         && !value[1..value.len() - 1].contains('"')
         && value.bytes().all(|byte| (33..=126).contains(&byte))
 }
-fn safe_regular(path: &Path) -> Result<bool, LibraryError> {
+pub(crate) fn safe_regular(path: &Path) -> Result<bool, LibraryError> {
     match fs::symlink_metadata(path) {
         Ok(meta) if meta.is_file() && !meta.file_type().is_symlink() => Ok(true),
         Ok(_) => Err(invalid(format!("unsafe existing file: {}", path.display()))),
@@ -80,7 +80,7 @@ fn safe_regular(path: &Path) -> Result<bool, LibraryError> {
         Err(error) => Err(error.into()),
     }
 }
-fn open_regular(path: &Path, write: bool) -> Result<File, LibraryError> {
+pub(crate) fn open_regular(path: &Path, write: bool) -> Result<File, LibraryError> {
     let mut options = OpenOptions::new();
     options.read(true).write(write);
     #[cfg(unix)]
@@ -105,7 +105,7 @@ fn same_inode(first: &Path, second: &Path) -> Result<bool, LibraryError> {
 fn same_inode(_first: &Path, _second: &Path) -> Result<bool, LibraryError> {
     Ok(false)
 }
-fn private_dir(path: &Path) -> Result<(), LibraryError> {
+pub(crate) fn private_dir(path: &Path) -> Result<(), LibraryError> {
     if path.exists() {
         if fs::symlink_metadata(path)?.is_dir() {
             return Ok(());
@@ -124,18 +124,18 @@ fn private_dir(path: &Path) -> Result<(), LibraryError> {
     )?;
     Ok(())
 }
-fn existing_dir(path: &Path) -> Result<(), LibraryError> {
+pub(crate) fn existing_dir(path: &Path) -> Result<(), LibraryError> {
     let meta = fs::symlink_metadata(path)?;
     if !meta.is_dir() || meta.file_type().is_symlink() {
         return Err(invalid("unsafe content directory"));
     }
     Ok(())
 }
-fn sync_dir(path: &Path) -> Result<(), LibraryError> {
+pub(crate) fn sync_dir(path: &Path) -> Result<(), LibraryError> {
     File::open(path)?.sync_all()?;
     Ok(())
 }
-fn hash_file(path: &Path, expected_size: u64) -> Result<String, LibraryError> {
+pub(crate) fn hash_file(path: &Path, expected_size: u64) -> Result<String, LibraryError> {
     if !safe_regular(path)? {
         return Err(invalid("verified file is missing"));
     }
@@ -165,8 +165,135 @@ fn content_range(value: &str) -> Option<(u64, u64, u64)> {
     (start <= end && end < total).then_some((start, end, total))
 }
 
+pub(crate) enum BlobOutcome {
+    Complete,
+    Stopped,
+}
+
+pub(crate) struct BlobSpec<'a> {
+    pub expected_size: u64,
+    pub expected_digest: &'a str,
+    pub prior_etag: Option<&'a str>,
+    pub pause_after: Option<u64>,
+}
+
+/// Shared bounded Range/If-Range receiver for standalone and Tree member files.
+pub(crate) fn receive_blob(
+    response: ureq::Response,
+    file: &mut File,
+    mut offset: u64,
+    mut hash: Sha256,
+    spec: BlobSpec<'_>,
+    mut checkpoint: impl FnMut(&File, u64, &Sha256, Option<&str>) -> Result<bool, LibraryError>,
+) -> Result<BlobOutcome, LibraryError> {
+    let BlobSpec {
+        expected_size,
+        expected_digest,
+        prior_etag,
+        pause_after,
+    } = spec;
+    let status = response.status();
+    if status == 416 {
+        if response.header("Content-Range") != Some(format!("bytes */{expected_size}").as_str()) {
+            return Err(invalid("invalid 416 Content-Range"));
+        }
+        file.set_len(0)?;
+        hash = Sha256::new();
+        checkpoint(file, 0, &hash, None)?;
+        return Err(LibraryError::Api(ApiError::Transport(
+            "range rejected; restarting from zero".into(),
+        )));
+    }
+    let etag = response
+        .header("ETag")
+        .ok_or_else(|| invalid("download ETag missing"))?
+        .to_owned();
+    if !strong_etag(&etag) {
+        return Err(invalid("download ETag is not strong"));
+    }
+    if status == 206 {
+        if offset == 0 || prior_etag != Some(etag.as_str()) {
+            return Err(invalid("unexpected or changed 206 ETag"));
+        }
+        if response.header("Content-Range").and_then(content_range)
+            != Some((offset, expected_size - 1, expected_size))
+        {
+            return Err(invalid("invalid Content-Range"));
+        }
+    } else if status == 200 {
+        if response.header("Content-Range").is_some() {
+            return Err(invalid("unexpected Content-Range on full response"));
+        }
+        if offset > 0 {
+            file.set_len(0)?;
+            file.seek(SeekFrom::Start(0))?;
+            offset = 0;
+            hash = Sha256::new();
+            checkpoint(file, 0, &hash, Some(&etag))?;
+        }
+    } else {
+        return Err(invalid(format!("unexpected download status {status}")));
+    }
+    let length = response
+        .header("Content-Length")
+        .and_then(|v| v.parse::<u64>().ok())
+        .ok_or_else(|| invalid("download Content-Length missing or invalid"))?;
+    if length != expected_size - offset {
+        return Err(invalid("download Content-Length mismatch"));
+    }
+    if response
+        .header("Content-Type")
+        .unwrap_or("")
+        .split(';')
+        .next()
+        != Some("application/octet-stream")
+    {
+        return Err(invalid("download Content-Type mismatch"));
+    }
+    let mut reader = response.into_reader();
+    let mut buf = [0u8; CHUNK];
+    let mut since = 0u64;
+    while offset < expected_size {
+        let count = reader
+            .read(&mut buf[..((expected_size - offset).min(CHUNK as u64) as usize)])
+            .map_err(|e| LibraryError::Api(ApiError::Transport(e.to_string())))?;
+        if count == 0 {
+            return Err(LibraryError::Api(ApiError::Transport(
+                "truncated download body".into(),
+            )));
+        }
+        file.write_all(&buf[..count])?;
+        hash.update(&buf[..count]);
+        offset += count as u64;
+        since += count as u64;
+        if since >= CHECKPOINT || pause_after.is_some_and(|limit| offset >= limit) {
+            let stopped = checkpoint(file, offset, &hash, Some(&etag))?;
+            since = 0;
+            if stopped || pause_after.is_some_and(|limit| offset >= limit) {
+                return Ok(BlobOutcome::Stopped);
+            }
+        }
+    }
+    checkpoint(file, offset, &hash, Some(&etag))?;
+    let mut extra = [0u8; 1];
+    if reader
+        .read(&mut extra)
+        .map_err(|e| LibraryError::Api(ApiError::Transport(e.to_string())))?
+        != 0
+    {
+        return Err(invalid("download body exceeds Content-Length"));
+    }
+    if format!("{:x}", hash.finalize()) != expected_digest {
+        file.set_len(0)?;
+        file.seek(SeekFrom::Start(0))?;
+        checkpoint(file, 0, &Sha256::new(), None)?;
+        return Err(invalid("SHA-256 mismatch"));
+    }
+    Ok(BlobOutcome::Complete)
+}
+
 impl Library {
-    fn lock_job(&self, id: &str) -> Result<File, LibraryError> {
+    pub(crate) fn lock_job(&self, id: &str) -> Result<File, LibraryError> {
         let stage = self.stage(id)?;
         let dir = stage
             .parent()
@@ -195,7 +322,7 @@ impl Library {
             .join(id)
             .join("file.part"))
     }
-    fn object(&self, artifact_id: &str) -> Result<PathBuf, LibraryError> {
+    pub(crate) fn object(&self, artifact_id: &str) -> Result<PathBuf, LibraryError> {
         let hash = digest(artifact_id)?;
         Ok(self
             .paths
@@ -287,14 +414,14 @@ impl Library {
         ids.iter().map(|id| self.job(id)).collect()
     }
     pub fn pause_job(&mut self, id: &str) -> Result<DownloadJob, LibraryError> {
-        let changed=self.conn.execute("UPDATE download_jobs SET state='Paused',updated_at=?2 WHERE id=?1 AND state IN ('Queued','Downloading','Failed')",params![id,now()?])?;
+        let changed=self.conn.execute("UPDATE download_jobs SET state='Paused',updated_at=?2 WHERE id=?1 AND state IN ('Queued','FetchingInventory','Downloading','Failed')",params![id,now()?])?;
         if changed == 0 {
             return Err(invalid("job cannot be paused"));
         }
         self.job(id)
     }
     pub fn cancel_job(&mut self, id: &str) -> Result<DownloadJob, LibraryError> {
-        let changed=self.conn.execute("UPDATE download_jobs SET state='Cancelled',updated_at=?2 WHERE id=?1 AND state IN ('Queued','Downloading','Paused','Failed')",params![id,now()?])?;
+        let changed=self.conn.execute("UPDATE download_jobs SET state='Cancelled',updated_at=?2 WHERE id=?1 AND state IN ('Queued','FetchingInventory','Downloading','Paused','Failed')",params![id,now()?])?;
         if changed == 0 {
             return Err(invalid("job cannot be cancelled"));
         }
@@ -307,14 +434,24 @@ impl Library {
         }
         self.job(id)
     }
-    fn state(&mut self, id: &str, state: &str, error: Option<&str>) -> Result<(), LibraryError> {
+    pub(crate) fn state(
+        &mut self,
+        id: &str,
+        state: &str,
+        error: Option<&str>,
+    ) -> Result<(), LibraryError> {
         self.conn.execute(
             "UPDATE download_jobs SET state=?2,last_error=?3,updated_at=?4 WHERE id=?1",
             params![id, state, error, now()?],
         )?;
         Ok(())
     }
-    fn transition(&mut self, id: &str, from: &str, to: &str) -> Result<bool, LibraryError> {
+    pub(crate) fn transition(
+        &mut self,
+        id: &str,
+        from: &str,
+        to: &str,
+    ) -> Result<bool, LibraryError> {
         Ok(self.conn.execute(
             "UPDATE download_jobs SET state=?3,updated_at=?4 WHERE id=?1 AND state=?2",
             params![id, from, to, now()?],
@@ -481,129 +618,55 @@ impl Library {
         pause_after: Option<u64>,
     ) -> Result<(), LibraryError> {
         let job = self.job(id)?;
-        let (mut file, mut offset, mut hash) = self.prepare_stage(&job)?;
+        let (mut file, offset, hash) = self.prepare_stage(&job)?;
         if offset == job.expected_size {
             if !self.transition(id, "Downloading", "Verifying")? {
                 return Ok(());
             }
             if format!("{:x}", hash.finalize()) != digest(&job.artifact_id)? {
+                file.set_len(0)?;
+                file.seek(SeekFrom::Start(0))?;
+                self.checkpoint(id, &file, 0, &Sha256::new(), None)?;
                 return Err(invalid("SHA-256 mismatch"));
             }
             self.transition(id, "Verifying", "Committing")?;
             return self.commit_file(&job);
         }
-        let requested = offset;
         let response = client.file_content(
             &job.artifact_id,
             (offset > 0).then_some(offset),
             job.etag.as_deref(),
         )?;
-        let status = response.status();
-        if status == 416 {
-            if response.header("Content-Range")
-                != Some(format!("bytes */{}", job.expected_size).as_str())
-            {
-                return Err(invalid("invalid 416 Content-Range"));
+        let result = receive_blob(
+            response,
+            &mut file,
+            offset,
+            hash,
+            BlobSpec {
+                expected_size: job.expected_size,
+                expected_digest: digest(&job.artifact_id)?,
+                prior_etag: job.etag.as_deref(),
+                pause_after,
+            },
+            |file, len, hash, etag| {
+                self.checkpoint(id, file, len, hash, etag)?;
+                Ok(matches!(
+                    self.job(id)?.state.as_str(),
+                    "Paused" | "Cancelled"
+                ))
+            },
+        )?;
+        if matches!(result, BlobOutcome::Stopped) {
+            if self.job(id)?.state == "Downloading" {
+                self.state(id, "Paused", None)?;
             }
-            file.set_len(0)?;
-            hash = Sha256::new();
-            self.checkpoint(id, &file, 0, &hash, None)?;
-            return Err(LibraryError::Api(ApiError::Transport(
-                "range rejected; restarting from zero".into(),
-            )));
+            return Ok(());
         }
-        let etag = response
-            .header("ETag")
-            .ok_or_else(|| invalid("download ETag missing"))?
-            .to_owned();
-        if !strong_etag(&etag) {
-            return Err(invalid("download ETag is not strong"));
-        }
-        if status == 206 {
-            if requested == 0 || job.etag.as_deref() != Some(etag.as_str()) {
-                return Err(invalid("unexpected or changed 206 ETag"));
-            }
-            if response.header("Content-Range").and_then(content_range)
-                != Some((requested, job.expected_size - 1, job.expected_size))
-            {
-                return Err(invalid("invalid Content-Range"));
-            }
-        } else if status == 200 {
-            if response.header("Content-Range").is_some() {
-                return Err(invalid("unexpected Content-Range on full response"));
-            }
-            if requested > 0 {
-                file.set_len(0)?;
-                file.seek(SeekFrom::Start(0))?;
-                offset = 0;
-                hash = Sha256::new();
-                self.checkpoint(id, &file, 0, &hash, Some(&etag))?;
-            }
-        } else {
-            return Err(invalid(format!("unexpected download status {status}")));
-        }
-        let length = response
-            .header("Content-Length")
-            .and_then(|v| v.parse::<u64>().ok())
-            .ok_or_else(|| invalid("download Content-Length missing or invalid"))?;
-        if length != job.expected_size - offset {
-            return Err(invalid("download Content-Length mismatch"));
-        }
-        if response
-            .header("Content-Type")
-            .unwrap_or("")
-            .split(';')
-            .next()
-            != Some("application/octet-stream")
-        {
-            return Err(invalid("download Content-Type mismatch"));
-        }
-        let mut reader = response.into_reader();
-        let mut buf = [0u8; CHUNK];
-        let mut since = 0u64;
-        while offset < job.expected_size {
-            let count = reader
-                .read(&mut buf[..((job.expected_size - offset).min(CHUNK as u64) as usize)])
-                .map_err(|e| LibraryError::Api(ApiError::Transport(e.to_string())))?;
-            if count == 0 {
-                return Err(LibraryError::Api(ApiError::Transport(
-                    "truncated download body".into(),
-                )));
-            }
-            file.write_all(&buf[..count])?;
-            hash.update(&buf[..count]);
-            offset += count as u64;
-            since += count as u64;
-            if since >= CHECKPOINT || pause_after.is_some_and(|limit| offset >= limit) {
-                self.checkpoint(id, &file, offset, &hash, Some(&etag))?;
-                since = 0;
-                match self.job(id)?.state.as_str() {
-                    "Cancelled" | "Paused" => return Ok(()),
-                    _ if pause_after.is_some_and(|limit| offset >= limit) => {
-                        self.state(id, "Paused", None)?;
-                        return Ok(());
-                    }
-                    _ => {}
-                }
-            }
-        }
-        self.checkpoint(id, &file, offset, &hash, Some(&etag))?;
         if matches!(self.job(id)?.state.as_str(), "Paused" | "Cancelled") {
             return Ok(());
         }
-        let mut extra = [0u8; 1];
-        if reader
-            .read(&mut extra)
-            .map_err(|e| LibraryError::Api(ApiError::Transport(e.to_string())))?
-            != 0
-        {
-            return Err(invalid("download body exceeds Content-Length"));
-        }
         if !self.transition(id, "Downloading", "Verifying")? {
             return Ok(());
-        }
-        if format!("{:x}", hash.finalize()) != digest(&job.artifact_id)? {
-            return Err(invalid("SHA-256 mismatch"));
         }
         self.transition(id, "Verifying", "Committing")?;
         self.commit_file(&job)
@@ -698,7 +761,7 @@ impl Library {
         }
     }
     pub fn reconcile_file_jobs(&mut self) -> Result<(), LibraryError> {
-        let ids:Vec<String>=self.conn.prepare("SELECT id FROM download_jobs WHERE state IN ('Downloading','Verifying','Committing')")?.query_map([],|r|r.get(0))?.collect::<Result<_,_>>()?;
+        let ids:Vec<String>=self.conn.prepare("SELECT id FROM download_jobs WHERE artifact_id LIKE 'adfile:sha256:%' AND state IN ('Downloading','Verifying','Committing')")?.query_map([],|r|r.get(0))?.collect::<Result<_,_>>()?;
         for id in ids {
             let _lock = match self.lock_job(&id) {
                 Ok(value) => value,
@@ -1193,8 +1256,18 @@ mod tests {
         let f = fixture(vec![1], "normal");
         let paths = f.library.paths.clone();
         let id = f.profile.clone();
-        f.library.conn.execute_batch("PRAGMA user_version=1; DROP INDEX download_jobs_active; ALTER TABLE download_jobs DROP COLUMN association_id; ALTER TABLE download_jobs DROP COLUMN expected_size; ALTER TABLE download_jobs DROP COLUMN etag; ALTER TABLE download_jobs DROP COLUMN progress; ALTER TABLE download_jobs DROP COLUMN checkpoint_hash; ALTER TABLE download_jobs DROP COLUMN last_error; ALTER TABLE download_jobs DROP COLUMN updated_at; ALTER TABLE download_jobs DROP COLUMN attempts; ALTER TABLE verified_content DROP COLUMN association_id;").unwrap();
+        f.library.conn.execute_batch("PRAGMA user_version=1; DROP TABLE tree_files; DROP INDEX download_jobs_active; ALTER TABLE download_jobs DROP COLUMN inventory_json; ALTER TABLE download_jobs DROP COLUMN inventory_etag; ALTER TABLE download_jobs DROP COLUMN association_id; ALTER TABLE download_jobs DROP COLUMN expected_size; ALTER TABLE download_jobs DROP COLUMN etag; ALTER TABLE download_jobs DROP COLUMN progress; ALTER TABLE download_jobs DROP COLUMN checkpoint_hash; ALTER TABLE download_jobs DROP COLUMN last_error; ALTER TABLE download_jobs DROP COLUMN updated_at; ALTER TABLE download_jobs DROP COLUMN attempts; ALTER TABLE verified_content DROP COLUMN association_id;").unwrap();
         let library = Library::open(paths).unwrap();
         assert_eq!(library.profile(&id).unwrap().name, "fixture");
+    }
+    #[test]
+    fn migration_from_v2_preserves_file_job() {
+        let mut f = fixture(vec![1], "normal");
+        let job = queue(&mut f);
+        let paths = f.library.paths.clone();
+        f.library.conn.execute_batch("PRAGMA user_version=2; DROP TABLE tree_files; DROP INDEX download_jobs_active; ALTER TABLE download_jobs DROP COLUMN inventory_json; ALTER TABLE download_jobs DROP COLUMN inventory_etag; CREATE UNIQUE INDEX download_jobs_active ON download_jobs(profile_id,artifact_id,association_id) WHERE state IN ('Queued','Downloading','Verifying','Committing','Paused');").unwrap();
+        let library = Library::open(paths).unwrap();
+        assert_eq!(library.job(&job.id).unwrap().artifact_id, job.artifact_id);
+        assert_eq!(library.job(&job.id).unwrap().state, "Queued");
     }
 }

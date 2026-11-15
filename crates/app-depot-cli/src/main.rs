@@ -34,7 +34,7 @@ fn usage() -> &'static str {
      local: profile add NAME URL | profile list [--all] | profile rename ID NAME | profile move ID URL | profile remove ID --confirm\n\
      credentials: profile token-set ID --token-stdin | profile token-remove ID\n\
      sync/offline: --profile ID sync | cached-apps | cached-releases APP_ID | cached-declarations RELEASE_ID\n\
-     download: --profile ID download start RELEASE_ID ASSOCIATION_ID [--pause-after-bytes N] | jobs | files | pause JOB_ID | resume JOB_ID | retry JOB_ID | cancel JOB_ID\n\
+     download: --profile ID download start RELEASE_ID ASSOCIATION_ID [--pause-after-bytes N] | jobs | files | trees | tree-files JOB_ID | pause JOB_ID | resume JOB_ID | retry JOB_ID | cancel JOB_ID\n\
      optional APP_DEPOT_TOKEN overrides stored token for this process; --library-data/--library-content select local roots"
 }
 
@@ -477,6 +477,7 @@ fn run_download(options: &Options) -> Result<(), CliError> {
     let args = &options.positional;
     let mut library = open_library(options)?;
     library.reconcile_file_jobs()?;
+    library.reconcile_tree_jobs()?;
     match (args.get(1).map(String::as_str), args.len()) {
         (Some("jobs"), 2) => {
             let jobs = library.jobs(Some(profile_id))?;
@@ -500,6 +501,43 @@ fn run_download(options: &Options) -> Result<(), CliError> {
                         file.artifact_id,
                         file.size,
                         file.path.display()
+                    );
+                }
+            }
+            Ok(())
+        }
+        (Some("trees"), 2) => {
+            let trees = library.verified_trees(Some(profile_id))?;
+            if options.json {
+                print_json(&trees)?;
+            } else {
+                for tree in trees {
+                    println!(
+                        "{}  {} files  {}",
+                        tree.artifact_id,
+                        tree.file_count,
+                        tree.path.display()
+                    );
+                }
+            }
+            Ok(())
+        }
+        (Some("tree-files"), 3) => {
+            let job = library.job(&args[2])?;
+            if &job.profile_id != profile_id {
+                return Err(LibraryError::Invalid("job belongs to another profile".into()).into());
+            }
+            let files = library.tree_files(&args[2])?;
+            if options.json {
+                print_json(&files)?;
+            } else {
+                for file in files {
+                    println!(
+                        "{}  {}/{} bytes  {}",
+                        if file.verified { "Verified" } else { "Pending" },
+                        file.progress,
+                        file.size,
+                        file.path
                     );
                 }
             }
@@ -532,7 +570,22 @@ fn run_download(options: &Options) -> Result<(), CliError> {
                 options.allow_insecure_http,
             )?;
             let job = if args[1] == "start" {
-                library.queue_file(&client, profile_id, &args[2], &args[3])?
+                let caps = client.ensure_read_compatible()?;
+                let association = client
+                    .list_associations(&args[2], caps.page_size().map_err(ApiError::Incompatible)?)?
+                    .into_iter()
+                    .find(|a| a.id == args[3])
+                    .ok_or_else(|| {
+                        LibraryError::Invalid(
+                            "Association is absent from accessible Release".into(),
+                        )
+                    })?;
+                let artifact = client.artifact(&association.artifact_id)?;
+                if artifact.kind == "Tree" {
+                    library.queue_tree(&client, profile_id, &args[2], &args[3])?
+                } else {
+                    library.queue_file(&client, profile_id, &args[2], &args[3])?
+                }
             } else {
                 let job = library.job(&args[2])?;
                 if &job.profile_id != profile_id {
@@ -543,7 +596,11 @@ fn run_download(options: &Options) -> Result<(), CliError> {
                 library.retry_job(&args[2])?
             };
             eprintln!("download job: {}", job.id);
-            let final_job = library.run_file_job(&client, &job.id, options.pause_after)?;
+            let final_job = if job.artifact_id.starts_with("adtree:v1:sha256:") {
+                library.run_tree_job(&client, &job.id, options.pause_after)?
+            } else {
+                library.run_file_job(&client, &job.id, options.pause_after)?
+            };
             print_job(&final_job, options.json)
         }
         _ => Err(ApiError::Config(usage().into()).into()),

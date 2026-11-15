@@ -13,7 +13,7 @@ use std::{
 };
 use uuid::Uuid;
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 const MARKER: &str = ".app-depot-library-id";
 
 #[derive(Debug)]
@@ -272,8 +272,12 @@ impl Library {
             }
             conn.execute_batch(SCHEMA)?;
             conn.execute_batch(MIGRATE_V2)?;
+            conn.execute_batch(MIGRATE_V3)?;
         } else if version == 1 {
             conn.execute_batch(MIGRATE_V2)?;
+            conn.execute_batch(MIGRATE_V3)?;
+        } else if version == 2 {
+            conn.execute_batch(MIGRATE_V3)?;
         } else if version != SCHEMA_VERSION {
             return Err(invalid("library schema migration is required"));
         }
@@ -685,6 +689,29 @@ ALTER TABLE download_jobs ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE verified_content ADD COLUMN association_id TEXT;
 CREATE UNIQUE INDEX download_jobs_active ON download_jobs(profile_id,artifact_id,association_id) WHERE state IN ('Queued','Downloading','Verifying','Committing','Paused');
 PRAGMA user_version=2;
+COMMIT;
+"#;
+
+const MIGRATE_V3: &str = r#"
+BEGIN IMMEDIATE;
+ALTER TABLE download_jobs ADD COLUMN inventory_json TEXT;
+ALTER TABLE download_jobs ADD COLUMN inventory_etag TEXT;
+DROP INDEX download_jobs_active;
+CREATE UNIQUE INDEX download_jobs_active ON download_jobs(profile_id,artifact_id,association_id) WHERE state IN ('Queued','FetchingInventory','Downloading','Verifying','Committing','Paused');
+CREATE TABLE tree_files (
+  job_id TEXT NOT NULL REFERENCES download_jobs(id),
+  path TEXT NOT NULL,
+  file_id TEXT NOT NULL,
+  size INTEGER NOT NULL CHECK(size >= 0),
+  sha256 TEXT NOT NULL,
+  executable INTEGER NOT NULL CHECK(executable IN (0,1)),
+  progress INTEGER NOT NULL DEFAULT 0 CHECK(progress >= 0),
+  etag TEXT,
+  checkpoint_hash TEXT,
+  verified INTEGER NOT NULL DEFAULT 0 CHECK(verified IN (0,1)),
+  PRIMARY KEY(job_id,path), UNIQUE(job_id,file_id)
+);
+PRAGMA user_version=3;
 COMMIT;
 "#;
 

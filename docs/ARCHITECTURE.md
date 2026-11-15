@@ -6,7 +6,7 @@ The Server stores authoritative declarations and immutable Artifact bytes. The c
 
 ### ADR-001: Rust core, egui adapter
 
-Use a native Rust core with an egui desktop UI on Linux first, then Windows/macOS. A CLI uses the same core for diagnostics and conformance. The current workspace implements the M1.1 read-only HTTP core and CLI plus M1.2 profile, credential and catalog-cache modules. Future modules/crates are introduced when concrete later responsibilities exist:
+Use a native Rust core with an egui desktop UI on Linux first, then Windows/macOS. A CLI uses the same core for diagnostics and conformance. The current workspace implements the M1.1 read-only HTTP core and CLI, M1.2 profiles/catalog cache, M1.3 File transfer and M1.4 Tree transfer. Future modules/crates are introduced when concrete later responsibilities exist:
 
 | Boundary | Responsibility |
 | --- | --- |
@@ -44,6 +44,10 @@ SQLite schema version 1 stores each profile under a generated UUID and scopes Ap
 ### ADR-007: File transfer and cross-filesystem completion (M1.3)
 
 Use one staging file and a local advisory job lock for each File Artifact transfer. Store a synchronized byte checkpoint and SHA-256 prefix digest in SQLite, then rehash that prefix on resume before issuing `Range` with a strong `If-Range` validator. A matching `206` must identify the exact remainder; a `200` restarts from zero. Keep objects and user-visible materializations under the same content root so hard links provide atomic no-replace promotion without another full copy. Synchronize file and content directories before committing `Completed` in SQLite; reconcile an interrupted `Committing` state by re-verifying the bytes. Metadata and content roots may be on separate filesystems, so no cross-filesystem transaction is assumed. Reuse verified object bytes across profiles while retaining separate profile/association records. This is a local storage decision, not a Server protocol field.
+
+### ADR-008: Tree inventory and atomic materialization (M1.4)
+
+Fetch the entire unfiltered inventory with the Server's page limit and opaque cursors. Require one strong ETag, canonical order, valid file IDs and exact Tree Identity v1 before writing destination paths. Persist the complete inventory and per-member checkpoints in schema version 3. A member file uses the same Range/If-Range/SHA-256 receiver as a standalone File Artifact but becomes only an immutable local object; it is never registered as a separate Association. Construct the visible tree from verified objects in a private staging directory on the content filesystem, preserving explicit empty directories and only the portable executable bit. On Unix, create paths relative to directory descriptors with `openat`/`mkdirat` and `O_NOFOLLOW`. On Linux, `renameat2(RENAME_NOREPLACE)` promotes a verified tree without replacing another destination. Synchronize files and directories before the SQLite Completed transaction; reconcile Committing after a crash by re-verifying the destination or rebuilding from verified objects. Other platforms need an equivalent no-replace directory promotion before Tree completion is enabled. Tree identity is verified independently of destination naming compatibility.
 
 ## UI read model
 

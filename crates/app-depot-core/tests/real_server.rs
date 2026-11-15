@@ -173,3 +173,112 @@ fn downloads_and_resumes_real_file_artifact() {
     assert_eq!(file.size, job.expected_size);
     assert!(file.path.exists());
 }
+
+#[test]
+#[ignore = "requires isolated loopback Dev/Test Server with a Published multi-file Tree Artifact"]
+fn downloads_and_resumes_real_tree_artifact() {
+    let url = env::var("APP_DEPOT_TEST_SERVER_URL").expect("isolated Server URL required");
+    let parsed = url::Url::parse(&url).unwrap();
+    assert!(matches!(
+        parsed.host_str(),
+        Some("127.0.0.1" | "localhost" | "::1")
+    ));
+    let release_id = env::var("APP_DEPOT_TEST_RELEASE_ID").expect("fixture Release ID required");
+    let client = ApiClient::new(&url, env::var("APP_DEPOT_TEST_TOKEN").ok(), false).unwrap();
+    let caps = client.capabilities().unwrap();
+    let association = client
+        .associated_artifacts(&release_id, caps.page_size().unwrap())
+        .unwrap()
+        .into_iter()
+        .find(|item| item.artifact.kind == "Tree")
+        .expect("Published Tree fixture required");
+    let (entries, etag) = client.tree_inventory(&association.artifact.id, 1).unwrap();
+    assert!(etag.starts_with('"'));
+    assert_eq!(
+        app_depot_core::tree::identity(&entries).unwrap(),
+        association.artifact.id
+    );
+    assert!(entries.iter().any(|e| e.path() == "empty/nested"));
+    let root = tempfile::tempdir().unwrap();
+    let paths = LibraryPaths {
+        metadata: root.path().join("data"),
+        content: root.path().join("content"),
+    };
+    let mut library = Library::open(paths.clone()).unwrap();
+    let profile = library
+        .add_profile("disposable Tree fixture", &url, false)
+        .unwrap();
+    let job = library
+        .queue_tree(
+            &client,
+            &profile.id,
+            &release_id,
+            &association.association.id,
+        )
+        .unwrap();
+    assert_eq!(
+        library
+            .run_tree_job(&client, &job.id, Some(65536))
+            .unwrap()
+            .state,
+        "Paused"
+    );
+    let files = library.tree_files(&job.id).unwrap();
+    assert!(files.iter().any(|f| f.verified));
+    let incomplete = files
+        .iter()
+        .find(|f| f.progress > 0 && !f.verified)
+        .unwrap();
+    let response = ureq::get(&format!(
+        "{}/api/v1/artifacts/{}/files/{}",
+        url.trim_end_matches('/'),
+        job.artifact_id,
+        incomplete.file_id
+    ))
+    .set("Range", &format!("bytes={}-", incomplete.progress))
+    .set("If-Range", incomplete.etag.as_deref().unwrap())
+    .call()
+    .unwrap();
+    assert_eq!(response.status(), 206);
+    assert_eq!(
+        response.header("Content-Range"),
+        Some(
+            format!(
+                "bytes {}-{}/{}",
+                incomplete.progress,
+                incomplete.size - 1,
+                incomplete.size
+            )
+            .as_str()
+        )
+    );
+    drop(library);
+    let mut library = Library::open(paths.clone()).unwrap();
+    library.retry_job(&job.id).unwrap();
+    assert_eq!(
+        library.run_tree_job(&client, &job.id, None).unwrap().state,
+        "Completed"
+    );
+    drop(library);
+    let library = Library::open(paths).unwrap();
+    let tree = library
+        .verified_trees(Some(&profile.id))
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(tree.artifact_id, association.artifact.id);
+    assert!(tree.path.join("empty/nested").is_dir());
+    assert!(tree.path.join("data/large.bin").is_file());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_ne!(
+            std::fs::metadata(tree.path.join("bin/run.sh"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o111,
+            0
+        );
+    }
+}
