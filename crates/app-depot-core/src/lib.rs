@@ -1,12 +1,12 @@
 //! UI-independent foundation for App Depot client identities.
 //!
-//! Read-only HTTP protocol is implemented in M1.1. Persistence, installation and
-//! execution belong to later milestones.
+//! HTTP catalog, local metadata, and verified file transfer live here.
 
 pub mod api;
 pub mod library;
 pub mod models;
 pub mod secrets;
+pub mod transfer;
 
 /// Locally generated identity for a configured Server profile. A URL is not an identity:
 /// endpoints may move, and different profiles may use the same URL with different credentials.

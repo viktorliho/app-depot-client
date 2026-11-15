@@ -6,9 +6,11 @@ Audit the Server contract/implementation and ArtCraft patterns; define boundarie
 
 ## M1 — first functional client
 
-M1.1 now provides the read-only HTTP transport and CLI: capability discovery, catalog traversal, Artifact metadata and declaration snapshots. It does not provide a desktop UI, transfer engine, local library or execution.
+M1.1 introduced the read-only HTTP transport and CLI: capability discovery, catalog traversal, Artifact metadata and declaration snapshots.
 
-M1.2 now provides persistent local Server profiles, native secure-store token references, transactional catalog synchronization, and offline cached Apps/Releases/declaration snapshots through the CLI. It prepares local content/staging directories and reserves minimal future verified-content/job identities, but does not download or materialize Artifacts. URL changes create a new profile identity; archived profiles retain their cached catalog. Linux secure storage and filesystem behavior have been exercised; Windows/macOS adapters still require platform validation.
+M1.2 introduced persistent local Server profiles, native secure-store token references, transactional catalog synchronization, and offline cached Apps/Releases/declaration snapshots through the CLI. URL changes create a new profile identity; archived profiles retain their cached catalog. Linux secure storage and filesystem behavior have been exercised; Windows/macOS adapters still require platform validation.
+
+M1.3 now implements single-file Artifact transfer through the existing content endpoint. Jobs retain profile and association context, validated checkpoints, strong ETags, and durable states. The CLI starts, pauses, resumes, retries and cancels transfers, then lists SHA-256-verified files offline. Range resume, full-200 restart, 416 recovery, staged integrity checks, object reuse and crash reconciliation are implemented. Tree Artifacts, installation and execution remain future work. Linux transfer and real Server compatibility have been validated; Windows/macOS transfer filesystem guarantees remain to be tested.
 
 Implement a shared core transport, declaration reader, transfer engine and local library; expose a small diagnostic CLI and an egui desktop browser on Linux. Windows/macOS paths and adapters must compile or be clearly tracked as later platform validation. All M1 operations use existing Server read APIs. No install, runtime preparation or launch implementation.
 

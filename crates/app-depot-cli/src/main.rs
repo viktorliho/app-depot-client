@@ -4,6 +4,7 @@ use app_depot_core::{
     library::{Library, LibraryError, LibraryPaths},
     models::{App, AssociationArtifact, Capabilities, DeclarationSnapshot, Release},
     secrets::{NativeSecrets, SecretError, SecretStore},
+    transfer::DownloadJob,
 };
 use serde::Serialize;
 use std::{
@@ -23,6 +24,7 @@ struct Options {
     confirm: bool,
     all: bool,
     token_stdin: bool,
+    pause_after: Option<u64>,
     positional: Vec<String>,
 }
 
@@ -32,6 +34,7 @@ fn usage() -> &'static str {
      local: profile add NAME URL | profile list [--all] | profile rename ID NAME | profile move ID URL | profile remove ID --confirm\n\
      credentials: profile token-set ID --token-stdin | profile token-remove ID\n\
      sync/offline: --profile ID sync | cached-apps | cached-releases APP_ID | cached-declarations RELEASE_ID\n\
+     download: --profile ID download start RELEASE_ID ASSOCIATION_ID [--pause-after-bytes N] | jobs | files | pause JOB_ID | resume JOB_ID | retry JOB_ID | cancel JOB_ID\n\
      optional APP_DEPOT_TOKEN overrides stored token for this process; --library-data/--library-content select local roots"
 }
 
@@ -47,6 +50,7 @@ fn parse_args() -> Result<Options, ApiError> {
     let mut confirm = false;
     let mut all = false;
     let mut token_stdin = false;
+    let mut pause_after = None;
     let mut positional = Vec::new();
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -80,6 +84,14 @@ fn parse_args() -> Result<Options, ApiError> {
             "--confirm" => confirm = true,
             "--all" => all = true,
             "--token-stdin" => token_stdin = true,
+            "--pause-after-bytes" => {
+                pause_after = Some(
+                    args.next()
+                        .ok_or_else(|| ApiError::Config(usage().into()))?
+                        .parse()
+                        .map_err(|_| ApiError::Config("invalid pause byte count".into()))?,
+                )
+            }
             "-h" | "--help" => return Err(ApiError::Config(usage().into())),
             _ if arg.starts_with('-') => {
                 return Err(ApiError::Config(format!(
@@ -111,6 +123,7 @@ fn parse_args() -> Result<Options, ApiError> {
         confirm,
         all,
         token_stdin,
+        pause_after,
         positional,
     })
 }
@@ -444,10 +457,106 @@ fn run_cached(options: &Options, profile_id: &ServerProfileId) -> Result<(), Cli
     Ok(())
 }
 
+fn print_job(job: &DownloadJob, json: bool) -> Result<(), CliError> {
+    if json {
+        print_json(job)?;
+    } else {
+        println!(
+            "{}  {}  {}/{} bytes  {}",
+            job.id, job.state, job.progress, job.expected_size, job.artifact_id
+        );
+    }
+    Ok(())
+}
+
+fn run_download(options: &Options) -> Result<(), CliError> {
+    let profile_id = options
+        .profile
+        .as_ref()
+        .ok_or_else(|| ApiError::Config("download requires --profile ID".into()))?;
+    let args = &options.positional;
+    let mut library = open_library(options)?;
+    library.reconcile_file_jobs()?;
+    match (args.get(1).map(String::as_str), args.len()) {
+        (Some("jobs"), 2) => {
+            let jobs = library.jobs(Some(profile_id))?;
+            if options.json {
+                print_json(&jobs)?;
+            } else {
+                for job in jobs {
+                    print_job(&job, false)?;
+                }
+            }
+            Ok(())
+        }
+        (Some("files"), 2) => {
+            let files = library.verified_files(Some(profile_id))?;
+            if options.json {
+                print_json(&files)?;
+            } else {
+                for file in files {
+                    println!(
+                        "{}  {} bytes  {}",
+                        file.artifact_id,
+                        file.size,
+                        file.path.display()
+                    );
+                }
+            }
+            Ok(())
+        }
+        (Some("pause"), 3) => {
+            let job = library.job(&args[2])?;
+            if &job.profile_id != profile_id {
+                return Err(LibraryError::Invalid("job belongs to another profile".into()).into());
+            }
+            print_job(&library.pause_job(&args[2])?, options.json)
+        }
+        (Some("cancel"), 3) => {
+            let job = library.job(&args[2])?;
+            if &job.profile_id != profile_id {
+                return Err(LibraryError::Invalid("job belongs to another profile".into()).into());
+            }
+            print_job(&library.cancel_job(&args[2])?, options.json)
+        }
+        (Some("start"), 4) | (Some("resume" | "retry"), 3) => {
+            let profile = library.profile(profile_id)?;
+            if profile.archived {
+                return Err(
+                    LibraryError::Invalid("archived profile is offline-only".into()).into(),
+                );
+            }
+            let client = ApiClient::new(
+                &profile.origin,
+                selected_token(&profile)?,
+                options.allow_insecure_http,
+            )?;
+            let job = if args[1] == "start" {
+                library.queue_file(&client, profile_id, &args[2], &args[3])?
+            } else {
+                let job = library.job(&args[2])?;
+                if &job.profile_id != profile_id {
+                    return Err(
+                        LibraryError::Invalid("job belongs to another profile".into()).into(),
+                    );
+                }
+                library.retry_job(&args[2])?
+            };
+            eprintln!("download job: {}", job.id);
+            let final_job = library.run_file_job(&client, &job.id, options.pause_after)?;
+            print_job(&final_job, options.json)
+        }
+        _ => Err(ApiError::Config(usage().into()).into()),
+    }
+}
+
 fn run() -> Result<(), CliError> {
     let options = parse_args()?;
     if options.positional[0] == "profile" {
         return run_profile(&options);
+    }
+    if options.positional[0] == "download" {
+        return run_download(&options);
     }
     if let Some(profile_id) = &options.profile
         && options.positional[0].starts_with("cached-")

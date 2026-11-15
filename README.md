@@ -2,7 +2,7 @@
 
 Native reference client for the open [App Depot Server](https://github.com/viktorliho/app-depot-server) protocol. The client is optional: independent clients can implement the documented Server API without using this code.
 
-M1.2 adds persistent Server profiles and an offline catalog cache to the read-only HTTP core and diagnostic CLI. There is no desktop UI, downloader, installer or launcher yet. See [milestones](docs/MILESTONES.md) and the [server API audit](docs/SERVER_API_AUDIT.md).
+M1.3 adds verified, resumable single-file Artifact downloads to the HTTP core and diagnostic CLI. The client also has persistent Server profiles and an offline catalog cache. There is no desktop UI, tree downloader, installer or launcher yet. See [milestones](docs/MILESTONES.md) and the [server API audit](docs/SERVER_API_AUDIT.md).
 
 ## Build and use
 
@@ -34,10 +34,24 @@ app-depot profile remove PROFILE_ID --confirm
 
 `profile move` creates a new profile ID and archives the old profile and its cache; remove a stored token first with `profile token-remove PROFILE_ID`. `profile remove --confirm` archives the profile, removes its stored token, and retains cached metadata for offline reading through `--profile PROFILE_ID`; `profile list --all` shows archived profiles. There is no cache purge command in M1.2. Profiles with the same URL remain separate. `sync` retrieves all accessible Apps, Releases, associations, Artifact metadata and declaration snapshots before writing a SQLite transaction. A failed sync keeps the previous cache. A successful sync marks unseen older records stale but retains them. Cached output always says `source: cache` in JSON and includes last-sync and stale fields; it does not claim a globally atomic Server catalog snapshot.
 
-To store a profile token, pipe it to `app-depot profile token-set PROFILE_ID --token-stdin`; replacement updates that profile's existing secure-store entry. On Linux the native backend is Secret Service, with Credential Manager and Keychain selected on Windows and macOS. If unavailable, use anonymous access or `APP_DEPOT_TOKEN` for one process; there is no plaintext fallback. `--library-data ABSOLUTE_PATH` or `APP_DEPOT_LIBRARY_DATA_DIR` selects the metadata root. `--library-content ABSOLUTE_PATH` or `APP_DEPOT_LIBRARY_CONTENT_DIR` selects the future content root separately. With only `--library-data`, both roots use that path. Defaults are the OS user data directory under `app-depot-client`. Local-library failures exit 9 and native credential failures exit 10.
+To store a profile token, pipe it to `app-depot profile token-set PROFILE_ID --token-stdin`; replacement updates that profile's existing secure-store entry. On Linux the native backend is Secret Service, with Credential Manager and Keychain selected on Windows and macOS. If unavailable, use anonymous access or `APP_DEPOT_TOKEN` for one process; there is no plaintext fallback. `--library-data ABSOLUTE_PATH` or `APP_DEPOT_LIBRARY_DATA_DIR` selects the metadata root. `--library-content ABSOLUTE_PATH` or `APP_DEPOT_LIBRARY_CONTENT_DIR` selects the content root separately. With only `--library-data`, both roots use that path. Defaults are the OS user data directory under `app-depot-client`. Local-library failures exit 9 and native credential failures exit 10.
 
-The client currently implements the Server's `apiVersion: 1.0.0` read contract. Other API versions are reported as unreviewed until their contract is checked. A missing download Range capability or unknown identity format is reported by `capabilities`; read-only catalog commands can still operate when the read contract is compatible.
+## File Artifact downloads
 
-The real Server test is ignored in routine runs. Against an isolated Dev/Test Server with a Published fixture containing an unknown `uint64` field, set `APP_DEPOT_TEST_SERVER_URL`, `APP_DEPOT_TEST_APP_ID`, `APP_DEPOT_TEST_RELEASE_ID`, and optionally `APP_DEPOT_TEST_TOKEN` and `APP_DEPOT_TEST_ASSOCIATION_COUNT`, then run `cargo test -p app-depot-core --test real_server --locked -- --ignored`. Never point it at Production.
+```sh
+app-depot --profile PROFILE_ID download start RELEASE_ID ASSOCIATION_ID
+app-depot --profile PROFILE_ID download jobs
+app-depot --profile PROFILE_ID download pause JOB_ID
+app-depot --profile PROFILE_ID download resume JOB_ID
+app-depot --profile PROFILE_ID download retry JOB_ID
+app-depot --profile PROFILE_ID download cancel JOB_ID
+app-depot --profile PROFILE_ID download files
+```
+
+`download start` requires an accessible Release association and creates a durable job; use `artifacts RELEASE_ID` to find its association ID. The command prints the job ID before transfer. `--pause-after-bytes N` pauses after at least N accepted bytes for diagnostics. A process interruption leaves a resumable job, and `download jobs` reconciles interrupted states. `download files` validates and lists verified local files offline, including the absolute materialized path. `--json` applies to download commands. A cancelled job retains its staging data but cannot be resumed; no completed bytes are removed. An archived profile can list jobs and verified files offline but cannot download. The client never names files from Server metadata or treats a verified file as installed or launchable.
+
+The client implements the Server's `apiVersion: 1.0.0` read and File Artifact transfer contract. Other API versions are reported as unreviewed until their contract is checked. File transfer requires `adfile:sha256` identity and advertised Range support. A missing download Range capability or unknown identity format is reported by `capabilities`; read-only catalog commands can still operate when the read contract is compatible.
+
+The real Server tests are ignored in routine runs. Against an isolated Dev/Test Server with a Published fixture containing an unknown `uint64` field and a File Artifact larger than 64 KiB, set `APP_DEPOT_TEST_SERVER_URL`, `APP_DEPOT_TEST_APP_ID`, `APP_DEPOT_TEST_RELEASE_ID`, and optionally `APP_DEPOT_TEST_TOKEN` and `APP_DEPOT_TEST_ASSOCIATION_COUNT`, then run `cargo test -p app-depot-core --test real_server --locked -- --ignored`. The tests use a disposable local library and exercise interruption, Range resume, SHA-256 and offline materialization. Never point them at Production.
 
 The client treats Server declarations and downloaded content as untrusted. A download never implies permission or ability to install or execute it.

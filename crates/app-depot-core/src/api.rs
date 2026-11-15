@@ -101,7 +101,8 @@ impl ApiClient {
         }
         let agent = ureq::AgentBuilder::new()
             .timeout_connect(Duration::from_secs(5))
-            .timeout(Duration::from_secs(20))
+            .timeout_read(Duration::from_secs(30))
+            .timeout_write(Duration::from_secs(20))
             .redirects(0)
             .build();
         Ok(Self { base, agent, token })
@@ -109,6 +110,62 @@ impl ApiClient {
 
     pub fn origin(&self) -> &str {
         self.base.as_str()
+    }
+
+    pub(crate) fn file_content(
+        &self,
+        artifact_id: &str,
+        offset: Option<u64>,
+        if_range: Option<&str>,
+    ) -> Result<ureq::Response, ApiError> {
+        if !valid_artifact_id(artifact_id) || !artifact_id.starts_with("adfile:sha256:") {
+            return Err(ApiError::Config("invalid File Artifact ID".into()));
+        }
+        let url = self.url(&["artifacts", artifact_id, "content"], None, None)?;
+        let mut request = self
+            .agent
+            .get(url.as_str())
+            .set("Accept", "application/octet-stream");
+        if let Some(token) = &self.token {
+            request = request.set("Authorization", &format!("Bearer {token}"));
+        }
+        if let Some(offset) = offset {
+            request = request.set("Range", &format!("bytes={offset}-"));
+            if let Some(etag) = if_range {
+                request = request.set("If-Range", etag);
+            }
+        }
+        let response = match request.call() {
+            Ok(response) | Err(ureq::Error::Status(_, response)) => response,
+            Err(ureq::Error::Transport(error)) => {
+                return Err(ApiError::Transport(error.to_string()));
+            }
+        };
+        let status = response.status();
+        if matches!(status, 200 | 206 | 416) {
+            return Ok(response);
+        }
+        let content_type = response
+            .header("Content-Type")
+            .unwrap_or("")
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_owned();
+        let problem = if content_type == "application/problem+json" {
+            read_bounded(response, MAX_ERROR_BYTES)
+                .ok()
+                .and_then(|body| parse_problem(&body, status))
+        } else {
+            None
+        };
+        Err(match status {
+            401 => ApiError::Authentication(problem),
+            403 => ApiError::Authorization(problem),
+            300..=399 => ApiError::Protocol(format!("redirect refused (HTTP {status})")),
+            _ => ApiError::Http { status, problem },
+        })
     }
 
     fn url(

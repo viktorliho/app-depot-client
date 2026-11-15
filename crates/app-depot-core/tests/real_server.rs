@@ -86,3 +86,90 @@ fn reads_real_server_catalog_and_declarations() {
             .is_some()
     );
 }
+
+#[test]
+#[ignore = "requires isolated loopback Dev/Test Server with a published File Artifact"]
+fn downloads_and_resumes_real_file_artifact() {
+    let url = env::var("APP_DEPOT_TEST_SERVER_URL").expect("isolated Server URL required");
+    let parsed = url::Url::parse(&url).unwrap();
+    assert!(
+        matches!(parsed.host_str(), Some("127.0.0.1" | "localhost" | "::1")),
+        "real download test requires loopback Dev/Test Server"
+    );
+    let release_id = env::var("APP_DEPOT_TEST_RELEASE_ID").expect("fixture Release ID required");
+    let client = ApiClient::new(&url, env::var("APP_DEPOT_TEST_TOKEN").ok(), false).unwrap();
+    let caps = client.capabilities().unwrap();
+    let association = client
+        .associated_artifacts(&release_id, caps.page_size().unwrap())
+        .unwrap()
+        .into_iter()
+        .find(|item| item.artifact.kind == "File" && item.artifact.size.unwrap_or(0) > 65536)
+        .expect("published fixture needs File Artifact larger than 64 KiB to test Range resume");
+    let root = tempfile::tempdir().unwrap();
+    let paths = LibraryPaths {
+        metadata: root.path().join("data"),
+        content: root.path().join("content"),
+    };
+    let mut library = Library::open(paths.clone()).unwrap();
+    let profile = library
+        .add_profile("disposable download fixture", &url, false)
+        .unwrap();
+    let job = library
+        .queue_file(
+            &client,
+            &profile.id,
+            &release_id,
+            &association.association.id,
+        )
+        .unwrap();
+    assert_eq!(
+        library
+            .run_file_job(&client, &job.id, Some(1))
+            .unwrap()
+            .state,
+        "Paused"
+    );
+    assert!(library.job(&job.id).unwrap().progress > 0);
+    assert!(library.job(&job.id).unwrap().progress < job.expected_size);
+    let paused = library.job(&job.id).unwrap();
+    let mut request = ureq::get(&format!(
+        "{}/api/v1/artifacts/{}/content",
+        url.trim_end_matches('/'),
+        job.artifact_id
+    ))
+    .set("Range", &format!("bytes={}-", paused.progress))
+    .set("If-Range", paused.etag.as_deref().unwrap());
+    if let Ok(token) = env::var("APP_DEPOT_TEST_TOKEN") {
+        request = request.set("Authorization", &format!("Bearer {token}"));
+    }
+    let response = request.call().unwrap();
+    assert_eq!(response.status(), 206);
+    assert_eq!(
+        response.header("Content-Range"),
+        Some(
+            format!(
+                "bytes {}-{}/{}",
+                paused.progress,
+                job.expected_size - 1,
+                job.expected_size
+            )
+            .as_str()
+        )
+    );
+    assert_eq!(response.header("ETag"), paused.etag.as_deref());
+    drop(library);
+    let mut library = Library::open(paths).unwrap();
+    library.retry_job(&job.id).unwrap();
+    assert_eq!(
+        library.run_file_job(&client, &job.id, None).unwrap().state,
+        "Completed"
+    );
+    let file = library
+        .verified_files(Some(&profile.id))
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(file.artifact_id, job.artifact_id);
+    assert_eq!(file.size, job.expected_size);
+    assert!(file.path.exists());
+}

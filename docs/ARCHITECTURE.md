@@ -17,7 +17,7 @@ Use a native Rust core with an egui desktop UI on Linux first, then Windows/macO
 | Install/runtime/launch ports | Future capability-aware implementations. Each exposes supported declaration versions/methods and a preparation/launch plan; UI cannot call arbitrary commands directly. No such implementation in M0/M1. |
 | GUI/CLI | Commands and read models from core. GUI renders grid/table, details and queue; CLI exposes capability checks, catalog, validation and download diagnostics. |
 
-Core exposes asynchronous commands and immutable state snapshots/events. UI thread never blocks on HTTP or hashing. Background operations publish progress and durable transitions. The CLI is a first-class consumer, so a future TUI, mobile frontend or Decky client would not require splitting logic out of egui. The protocol itself remains language neutral.
+The current core exposes synchronous CLI-oriented calls and durable state snapshots. A future GUI adapter must run HTTP and hashing away from the UI thread and publish progress from the same core jobs. The CLI is a first-class consumer, so a future TUI, mobile frontend or Decky client would not require splitting logic out of egui. The protocol itself remains language neutral.
 
 ### ADR-002: Explicit identity and selection
 
@@ -40,6 +40,10 @@ Use the OS secure store (Secret Service on Linux, Credential Manager on Windows,
 ### ADR-006: Local identity, cache and profile removal (M1.2)
 
 SQLite schema version 1 stores each profile under a generated UUID and scopes Apps, Releases, associations, Artifacts and declaration snapshots by that ID. A profile URL change creates a new profile ID and archives the old one; this keeps old cached declarations attached to their original origin. Profile removal requires `--confirm`, removes its secure token, and archives the profile and cache. Archived profiles remain readable offline but cannot synchronize. No M1.2 command deletes cached metadata or verified content. A successful sync fetches the reachable catalog first, then writes it in one transaction. Unseen records are retained and marked stale; a failed fetch does not partially replace the cache. The Server provides a consistent declaration snapshot per Release, not a globally atomic catalog snapshot.
+
+### ADR-007: File transfer and cross-filesystem completion (M1.3)
+
+Use one staging file and a local advisory job lock for each File Artifact transfer. Store a synchronized byte checkpoint and SHA-256 prefix digest in SQLite, then rehash that prefix on resume before issuing `Range` with a strong `If-Range` validator. A matching `206` must identify the exact remainder; a `200` restarts from zero. Keep objects and user-visible materializations under the same content root so hard links provide atomic no-replace promotion without another full copy. Synchronize file and content directories before committing `Completed` in SQLite; reconcile an interrupted `Committing` state by re-verifying the bytes. Metadata and content roots may be on separate filesystems, so no cross-filesystem transaction is assumed. Reuse verified object bytes across profiles while retaining separate profile/association records. This is a local storage decision, not a Server protocol field.
 
 ## UI read model
 

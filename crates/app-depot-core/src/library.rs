@@ -13,7 +13,7 @@ use std::{
 };
 use uuid::Uuid;
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 const MARKER: &str = ".app-depot-library-id";
 
 #[derive(Debug)]
@@ -105,12 +105,12 @@ pub struct Cached<T> {
 }
 
 pub struct Library {
-    conn: Connection,
+    pub(crate) conn: Connection,
     pub paths: LibraryPaths,
     pub id: String,
 }
 
-fn now() -> Result<i64, LibraryError> {
+pub(crate) fn now() -> Result<i64, LibraryError> {
     Ok(SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|_| LibraryError::Invalid("system time before Unix epoch".into()))?
@@ -271,6 +271,9 @@ impl Library {
                 return Err(invalid("unrecognized existing SQLite schema"));
             }
             conn.execute_batch(SCHEMA)?;
+            conn.execute_batch(MIGRATE_V2)?;
+        } else if version == 1 {
+            conn.execute_batch(MIGRATE_V2)?;
         } else if version != SCHEMA_VERSION {
             return Err(invalid("library schema migration is required"));
         }
@@ -666,6 +669,22 @@ CREATE TABLE snapshots (profile_id TEXT NOT NULL, release_id TEXT NOT NULL, snap
 CREATE TABLE verified_content (profile_id TEXT NOT NULL, artifact_id TEXT NOT NULL, local_ref TEXT NOT NULL, verified_at INTEGER NOT NULL, PRIMARY KEY(profile_id,artifact_id,local_ref), FOREIGN KEY(profile_id,artifact_id) REFERENCES artifacts(profile_id,id));
 CREATE TABLE download_jobs (id TEXT PRIMARY KEY, profile_id TEXT NOT NULL REFERENCES profiles(id), artifact_id TEXT NOT NULL, state TEXT NOT NULL, created_at INTEGER NOT NULL, FOREIGN KEY(profile_id,artifact_id) REFERENCES artifacts(profile_id,id));
 PRAGMA user_version=1;
+COMMIT;
+"#;
+
+const MIGRATE_V2: &str = r#"
+BEGIN IMMEDIATE;
+ALTER TABLE download_jobs ADD COLUMN association_id TEXT;
+ALTER TABLE download_jobs ADD COLUMN expected_size INTEGER;
+ALTER TABLE download_jobs ADD COLUMN etag TEXT;
+ALTER TABLE download_jobs ADD COLUMN progress INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE download_jobs ADD COLUMN checkpoint_hash TEXT;
+ALTER TABLE download_jobs ADD COLUMN last_error TEXT;
+ALTER TABLE download_jobs ADD COLUMN updated_at INTEGER;
+ALTER TABLE download_jobs ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE verified_content ADD COLUMN association_id TEXT;
+CREATE UNIQUE INDEX download_jobs_active ON download_jobs(profile_id,artifact_id,association_id) WHERE state IN ('Queued','Downloading','Verifying','Committing','Paused');
+PRAGMA user_version=2;
 COMMIT;
 "#;
 
