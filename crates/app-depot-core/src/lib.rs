@@ -1,6 +1,10 @@
 //! UI-independent foundation for App Depot client identities.
 //!
-//! Network, persistence, installation and execution are planned in M1 and later.
+//! Read-only HTTP protocol is implemented in M1.1. Persistence, installation and
+//! execution belong to later milestones.
+
+pub mod api;
+pub mod models;
 
 /// Locally generated identity for a configured Server profile. A URL is not an identity:
 /// endpoints may move, and different profiles may use the same URL with different credentials.

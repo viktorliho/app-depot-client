@@ -25,3 +25,7 @@ Use the Server OpenAPI as the route/schema source and `docs/tree-identity.md` ve
 4. Linux GUI smoke tests for catalog, details, queue and offline library. Windows/macOS filesystem and secure-store checks run when those platform milestones start.
 
 No test should execute downloaded software or modify Production Server state. A fake HTTP server is appropriate for malformed responses and adversarial paths; real Server tests remain required for the actual protocol.
+
+## M1.1 implemented coverage
+
+The read-only core tests cover capabilities and unknown fields, exact large integers, Bearer versus anonymous requests, RFC 9457 errors, expired/repeated cursors, multi-page traversal, multiple associations, safe URL encoding, refused redirects and malformed/oversized responses. `crates/app-depot-core/tests/real_server.rs` is deliberately ignored in routine runs and requires an isolated published fixture when invoked with `--ignored`; it reads capabilities, catalog, Artifact metadata and the consistent declaration snapshot without mutating the Server. Transfer, artwork, GUI, local-library and launch tests remain for their later milestones.

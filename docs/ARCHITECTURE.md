@@ -6,7 +6,7 @@ The Server stores authoritative declarations and immutable Artifact bytes. The c
 
 ### ADR-001: Rust core, egui adapter
 
-Use a native Rust core with an egui desktop UI on Linux first, then Windows/macOS. A CLI uses the same core for diagnostics and conformance. The current workspace contains only a minimal core identity foundation. Future modules/crates are introduced when concrete M1 responsibilities exist:
+Use a native Rust core with an egui desktop UI on Linux first, then Windows/macOS. A CLI uses the same core for diagnostics and conformance. The current workspace implements the M1.1 read-only HTTP core and CLI. Future modules/crates are introduced when concrete later responsibilities exist:
 
 | Boundary | Responsibility |
 | --- | --- |

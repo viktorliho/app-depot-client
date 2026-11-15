@@ -6,6 +6,8 @@ Audit the Server contract/implementation and ArtCraft patterns; define boundarie
 
 ## M1 — first functional client
 
+M1.1 now provides the read-only HTTP transport and CLI: capability discovery, catalog traversal, Artifact metadata and declaration snapshots. It does not provide a desktop UI, transfer engine, local library or execution.
+
 Implement a shared core transport, declaration reader, transfer engine and local library; expose a small diagnostic CLI and an egui desktop browser on Linux. Windows/macOS paths and adapters must compile or be clearly tracked as later platform validation. All M1 operations use existing Server read APIs. No install, runtime preparation or launch implementation.
 
 Acceptance criteria:

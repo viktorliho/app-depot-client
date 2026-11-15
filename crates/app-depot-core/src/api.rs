@@ -1,0 +1,737 @@
+//! Read-only App Depot HTTP client. Every route is from the Server OpenAPI.
+
+use crate::models::{
+    App, Artifact, Association, AssociationArtifact, Capabilities, DeclarationSnapshot, Page,
+    Release,
+};
+use serde::de::DeserializeOwned;
+use serde_json::Value;
+use std::{collections::HashSet, fmt, io::Read, time::Duration};
+use url::{Host, Url};
+
+const MAX_JSON_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_ERROR_BYTES: u64 = 64 * 1024;
+const MAX_PAGES: usize = 10_000;
+const MAX_ITEMS: usize = 100_000;
+
+#[derive(Clone, Debug)]
+pub struct Problem {
+    pub code: String,
+    pub title: String,
+    pub detail: Option<String>,
+}
+
+#[derive(Debug)]
+pub enum ApiError {
+    Config(String),
+    Transport(String),
+    Authentication(Option<Problem>),
+    Authorization(Option<Problem>),
+    Incompatible(String),
+    Protocol(String),
+    Http {
+        status: u16,
+        problem: Option<Problem>,
+    },
+}
+
+impl fmt::Display for ApiError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Config(message) => write!(f, "configuration: {message}"),
+            Self::Transport(message) => write!(f, "transport: {message}"),
+            Self::Authentication(problem) => {
+                write!(f, "authentication failed: {}", problem_label(problem))
+            }
+            Self::Authorization(problem) => {
+                write!(f, "authorization failed: {}", problem_label(problem))
+            }
+            Self::Incompatible(message) => write!(f, "incompatible server: {message}"),
+            Self::Protocol(message) => write!(f, "protocol: {message}"),
+            Self::Http { status, problem } => {
+                write!(f, "HTTP {status}: {}", problem_label(problem))
+            }
+        }
+    }
+}
+
+impl std::error::Error for ApiError {}
+
+fn problem_label(problem: &Option<Problem>) -> String {
+    match problem {
+        Some(problem) => format!("{} ({})", problem.title, problem.code),
+        None => "no valid Problem Details body".into(),
+    }
+}
+
+pub struct ApiClient {
+    base: Url,
+    agent: ureq::Agent,
+    token: Option<String>,
+}
+
+impl ApiClient {
+    pub fn new(
+        server_url: &str,
+        token: Option<String>,
+        allow_insecure_http: bool,
+    ) -> Result<Self, ApiError> {
+        let base =
+            Url::parse(server_url).map_err(|_| ApiError::Config("invalid server URL".into()))?;
+        if !matches!(base.scheme(), "http" | "https")
+            || base.host().is_none()
+            || !base.username().is_empty()
+            || base.password().is_some()
+            || base.query().is_some()
+            || base.fragment().is_some()
+            || base.path() != "/"
+        {
+            return Err(ApiError::Config(
+                "server URL must be an HTTP(S) origin without credentials, path, query or fragment"
+                    .into(),
+            ));
+        }
+        if base.scheme() == "http" && !allow_insecure_http && !is_loopback(&base) {
+            return Err(ApiError::Config("remote HTTP requires explicit --allow-insecure-http; Bearer tokens would be exposed in transit".into()));
+        }
+        if token.as_ref().is_some_and(|token| {
+            token.is_empty() || !token.bytes().all(|byte| (33..=126).contains(&byte))
+        }) {
+            return Err(ApiError::Config("invalid Bearer token".into()));
+        }
+        let agent = ureq::AgentBuilder::new()
+            .timeout_connect(Duration::from_secs(5))
+            .timeout(Duration::from_secs(20))
+            .redirects(0)
+            .build();
+        Ok(Self { base, agent, token })
+    }
+
+    fn url(
+        &self,
+        segments: &[&str],
+        cursor: Option<&str>,
+        page_size: Option<u64>,
+    ) -> Result<Url, ApiError> {
+        let mut url = self.base.clone();
+        {
+            let mut path = url
+                .path_segments_mut()
+                .map_err(|_| ApiError::Config("invalid server origin".into()))?;
+            path.extend(["api", "v1"]);
+            for segment in segments {
+                if segment.is_empty()
+                    || *segment == "."
+                    || *segment == ".."
+                    || segment.chars().any(char::is_control)
+                {
+                    return Err(ApiError::Config("invalid URL path segment".into()));
+                }
+                path.push(segment);
+            }
+        }
+        if cursor.is_some() || page_size.is_some() {
+            let mut query = url.query_pairs_mut();
+            if let Some(size) = page_size {
+                query.append_pair("pageSize", &size.to_string());
+            }
+            if let Some(cursor) = cursor {
+                query.append_pair("cursor", cursor);
+            }
+        }
+        Ok(url)
+    }
+
+    fn get_json<T: DeserializeOwned>(
+        &self,
+        segments: &[&str],
+        cursor: Option<&str>,
+        page_size: Option<u64>,
+    ) -> Result<T, ApiError> {
+        let url = self.url(segments, cursor, page_size)?;
+        let mut request = self
+            .agent
+            .get(url.as_str())
+            .set("Accept", "application/json");
+        if let Some(token) = &self.token {
+            request = request.set("Authorization", &format!("Bearer {token}"));
+        }
+        let response = match request.call() {
+            Ok(response) => response,
+            Err(ureq::Error::Status(_, response)) => response,
+            Err(ureq::Error::Transport(error)) => {
+                return Err(ApiError::Transport(error.to_string()));
+            }
+        };
+        let status = response.status();
+        let content_type = response
+            .header("Content-Type")
+            .unwrap_or("")
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .trim();
+        if !(200..300).contains(&status) {
+            let problem = if content_type == "application/problem+json" {
+                read_bounded(response, MAX_ERROR_BYTES)
+                    .ok()
+                    .and_then(|body| parse_problem(&body, status))
+            } else {
+                None
+            };
+            return Err(match status {
+                401 => ApiError::Authentication(problem),
+                403 => ApiError::Authorization(problem),
+                300..=399 => ApiError::Protocol(format!("redirect refused (HTTP {status})")),
+                _ => ApiError::Http { status, problem },
+            });
+        }
+        if content_type != "application/json" {
+            return Err(ApiError::Protocol(format!(
+                "unexpected Content-Type {content_type:?}"
+            )));
+        }
+        let body = read_bounded(response, MAX_JSON_BYTES)?;
+        serde_json::from_slice(&body)
+            .map_err(|error| ApiError::Protocol(format!("malformed JSON response: {error}")))
+    }
+
+    pub fn capabilities(&self) -> Result<Capabilities, ApiError> {
+        self.get_json(&["capabilities"], None, None)
+    }
+
+    pub fn ensure_read_compatible(&self) -> Result<Capabilities, ApiError> {
+        let capabilities = self.capabilities()?;
+        if capabilities.api_version != "1.0.0" {
+            return Err(ApiError::Incompatible(format!(
+                "unreviewed API version {} (implemented 1.0.0)",
+                capabilities.api_version
+            )));
+        }
+        capabilities.page_size().map_err(ApiError::Incompatible)?;
+        Ok(capabilities)
+    }
+
+    pub fn list_apps(&self, page_size: u64) -> Result<Vec<App>, ApiError> {
+        self.pages(&["apps"], page_size)
+    }
+
+    pub fn app(&self, id: &str) -> Result<App, ApiError> {
+        let app: App = self.get_json(&["apps", id], None, None)?;
+        if app.id != id {
+            return Err(ApiError::Protocol("App ID does not match request".into()));
+        }
+        Ok(app)
+    }
+
+    pub fn list_releases(&self, app_id: &str, page_size: u64) -> Result<Vec<Release>, ApiError> {
+        let releases: Vec<Release> = self.pages(&["apps", app_id, "releases"], page_size)?;
+        if releases.iter().any(|release| release.app_id != app_id) {
+            return Err(ApiError::Protocol(
+                "Release belongs to a different App".into(),
+            ));
+        }
+        Ok(releases)
+    }
+
+    pub fn release(&self, id: &str) -> Result<Release, ApiError> {
+        let release: Release = self.get_json(&["releases", id], None, None)?;
+        if release.id != id {
+            return Err(ApiError::Protocol(
+                "Release ID does not match request".into(),
+            ));
+        }
+        Ok(release)
+    }
+
+    pub fn list_associations(
+        &self,
+        release_id: &str,
+        page_size: u64,
+    ) -> Result<Vec<Association>, ApiError> {
+        let associations: Vec<Association> =
+            self.pages(&["releases", release_id, "artifacts"], page_size)?;
+        if associations
+            .iter()
+            .any(|association| association.release_id != release_id)
+        {
+            return Err(ApiError::Protocol(
+                "Association belongs to a different Release".into(),
+            ));
+        }
+        Ok(associations)
+    }
+
+    pub fn artifact(&self, id: &str) -> Result<Artifact, ApiError> {
+        if !valid_artifact_id(id) {
+            return Err(ApiError::Config("invalid Artifact ID".into()));
+        }
+        let artifact: Artifact = self.get_json(&["artifacts", id], None, None)?;
+        if artifact.id != id
+            || !valid_artifact_id(&artifact.id)
+            || !matches!(artifact.kind.as_str(), "File" | "Tree")
+            || (artifact.kind == "File") != artifact.id.starts_with("adfile:sha256:")
+            || (artifact.kind == "File" && artifact.size.is_none())
+        {
+            return Err(ApiError::Protocol("invalid Artifact metadata".into()));
+        }
+        Ok(artifact)
+    }
+
+    pub fn associated_artifacts(
+        &self,
+        release_id: &str,
+        page_size: u64,
+    ) -> Result<Vec<AssociationArtifact>, ApiError> {
+        self.list_associations(release_id, page_size)?
+            .into_iter()
+            .map(|association| {
+                if !valid_artifact_id(&association.artifact_id) {
+                    return Err(ApiError::Protocol("invalid Association Artifact ID".into()));
+                }
+                let artifact = self.artifact(&association.artifact_id)?;
+                Ok(AssociationArtifact {
+                    association,
+                    artifact,
+                })
+            })
+            .collect()
+    }
+
+    pub fn declarations(&self, release_id: &str) -> Result<DeclarationSnapshot, ApiError> {
+        let snapshot: DeclarationSnapshot = self.get_json(
+            &["releases", release_id, "declaration-snapshot"],
+            None,
+            None,
+        )?;
+        if snapshot.release_id != release_id {
+            return Err(ApiError::Protocol(
+                "snapshot Release ID does not match request".into(),
+            ));
+        }
+        let mut ids = HashSet::new();
+        if snapshot
+            .associations
+            .iter()
+            .any(|association| !ids.insert(&association.association_id))
+        {
+            return Err(ApiError::Protocol(
+                "duplicate snapshot Association ID".into(),
+            ));
+        }
+        Ok(snapshot)
+    }
+
+    fn pages<T: DeserializeOwned>(
+        &self,
+        segments: &[&str],
+        page_size: u64,
+    ) -> Result<Vec<T>, ApiError> {
+        if !(1..=1000).contains(&page_size) {
+            return Err(ApiError::Config("page size outside protocol range".into()));
+        }
+        let mut items = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut seen = HashSet::new();
+        for _ in 0..MAX_PAGES {
+            let page: Page<T> = self.get_json(segments, cursor.as_deref(), Some(page_size))?;
+            if page.items.len() > page_size as usize || items.len() + page.items.len() > MAX_ITEMS {
+                return Err(ApiError::Protocol(
+                    "collection exceeds advertised page size or client limit".into(),
+                ));
+            }
+            items.extend(page.items);
+            match page.next_cursor {
+                None => return Ok(items),
+                Some(next) if next.is_empty() || !seen.insert(next.clone()) => {
+                    return Err(ApiError::Protocol(
+                        "empty or repeated pagination cursor".into(),
+                    ));
+                }
+                Some(next) => cursor = Some(next),
+            }
+        }
+        Err(ApiError::Protocol("collection exceeds page limit".into()))
+    }
+}
+
+fn valid_artifact_id(id: &str) -> bool {
+    let digest = id
+        .strip_prefix("adfile:sha256:")
+        .or_else(|| id.strip_prefix("adtree:v1:sha256:"));
+    digest.is_some_and(|digest| {
+        digest.len() == 64
+            && digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
+}
+
+fn is_loopback(url: &Url) -> bool {
+    match url.host() {
+        Some(Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(Host::Ipv6(ip)) => ip.is_loopback(),
+        Some(Host::Domain(name)) => name == "localhost",
+        None => false,
+    }
+}
+
+fn read_bounded(response: ureq::Response, max: u64) -> Result<Vec<u8>, ApiError> {
+    if response
+        .header("Content-Length")
+        .and_then(|value| value.parse::<u64>().ok())
+        .is_some_and(|length| length > max)
+    {
+        return Err(ApiError::Protocol(
+            "JSON response exceeds size limit".into(),
+        ));
+    }
+    let mut body = Vec::new();
+    response
+        .into_reader()
+        .take(max + 1)
+        .read_to_end(&mut body)
+        .map_err(|error| ApiError::Transport(error.to_string()))?;
+    if body.len() as u64 > max {
+        return Err(ApiError::Protocol(
+            "JSON response exceeds size limit".into(),
+        ));
+    }
+    Ok(body)
+}
+
+fn parse_problem(body: &[u8], http_status: u16) -> Option<Problem> {
+    let value: Value = serde_json::from_slice(body).ok()?;
+    let object = value.as_object()?;
+    let status = object.get("status")?.as_u64()?;
+    let code = object.get("code")?.as_str()?;
+    let title = object.get("title")?.as_str()?;
+    let kind = object.get("type")?.as_str()?;
+    if status != u64::from(http_status) || kind != format!("urn:app-depot:problem:{code}") {
+        return None;
+    }
+    Some(Problem {
+        code: code.into(),
+        title: title.into(),
+        detail: object
+            .get("detail")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::{AppConvention, AssociationConvention, ReleaseConvention};
+    use std::{
+        io::Write,
+        net::TcpListener,
+        sync::{Arc, Mutex},
+        thread,
+    };
+
+    const CAPS: &str = r#"{"apiVersion":"1.0.0","ingestionModes":["BareFile","BareTree"],"zipMethods":["Store"],"treeIdentity":"adtree:v1:sha256","fileIdentity":"adfile:sha256","uploadRanges":true,"downloadRanges":true,"limits":{"maxPageSize":1000,"maxConcurrentRanges":8,"maxUploadBytes":18446744073709551615},"features":["serverImport"],"futureNumber":18446744073709551616}"#;
+
+    struct Reply {
+        status: u16,
+        content_type: &'static str,
+        body: String,
+        extra_header: Option<String>,
+    }
+
+    fn json(body: &str) -> Reply {
+        Reply {
+            status: 200,
+            content_type: "application/json",
+            body: body.into(),
+            extra_header: None,
+        }
+    }
+
+    fn server(replies: Vec<Reply>) -> (String, Arc<Mutex<Vec<String>>>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = format!("http://{}/", listener.local_addr().unwrap());
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let received = requests.clone();
+        let handle = thread::spawn(move || {
+            for reply in replies {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let mut bytes = Vec::new();
+                let mut buf = [0; 1024];
+                loop {
+                    let n = stream.read(&mut buf).unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    bytes.extend_from_slice(&buf[..n]);
+                    if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                received
+                    .lock()
+                    .unwrap()
+                    .push(String::from_utf8(bytes).unwrap());
+                let status_text = match reply.status {
+                    200 => "OK",
+                    302 => "Found",
+                    400 => "Bad Request",
+                    401 => "Unauthorized",
+                    403 => "Forbidden",
+                    _ => "Error",
+                };
+                write!(stream, "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n",
+                    reply.status, status_text, reply.content_type, reply.body.len()).unwrap();
+                if let Some(extra) = reply.extra_header {
+                    write!(stream, "{extra}\r\n").unwrap();
+                }
+                let _ = stream.write_all(b"\r\n");
+                let _ = stream.write_all(reply.body.as_bytes());
+            }
+        });
+        (address, requests, handle)
+    }
+
+    #[test]
+    fn capabilities_preserve_unknown_numbers_and_report_incompatibility() {
+        let (address, _, handle) = server(vec![json(CAPS)]);
+        let caps = ApiClient::new(&address, None, false)
+            .unwrap()
+            .capabilities()
+            .unwrap();
+        assert_eq!(caps.limits.max_upload_bytes, u64::MAX);
+        assert_eq!(
+            caps.unknown["futureNumber"].to_string(),
+            "18446744073709551616"
+        );
+        assert!(caps.incompatibilities().is_empty());
+        handle.join().unwrap();
+
+        let incompatible = CAPS
+            .replace("adtree:v1:sha256", "future-tree")
+            .replace("\"downloadRanges\":true", "\"downloadRanges\":false");
+        let caps: Capabilities = serde_json::from_str(&incompatible).unwrap();
+        assert_eq!(caps.incompatibilities().len(), 2);
+    }
+
+    #[test]
+    fn anonymous_and_bearer_requests_are_distinct() {
+        let (address, requests, handle) = server(vec![json(CAPS), json(CAPS)]);
+        ApiClient::new(&address, None, false)
+            .unwrap()
+            .capabilities()
+            .unwrap();
+        ApiClient::new(&address, Some("test-secret".into()), false)
+            .unwrap()
+            .capabilities()
+            .unwrap();
+        handle.join().unwrap();
+        let requests = requests.lock().unwrap();
+        assert!(requests[0].starts_with("GET /api/v1/capabilities HTTP/1.1"));
+        assert!(!requests[0].to_ascii_lowercase().contains("authorization:"));
+        assert!(
+            requests[1].contains("Authorization: Bearer test-secret")
+                || requests[1].contains("authorization: Bearer test-secret")
+        );
+    }
+
+    #[test]
+    fn problem_details_classify_authorization_and_invalid_cursor() {
+        let unauthorized = r#"{"type":"urn:app-depot:problem:unauthorized","title":"Authentication required","status":401,"code":"unauthorized"}"#;
+        let forbidden = r#"{"type":"urn:app-depot:problem:forbidden","title":"Forbidden","status":403,"code":"forbidden"}"#;
+        let invalid = r#"{"type":"urn:app-depot:problem:invalid_cursor","title":"Invalid cursor","status":400,"code":"invalid_cursor"}"#;
+        let (address, _, handle) = server(vec![
+            Reply {
+                status: 401,
+                content_type: "application/problem+json",
+                body: unauthorized.into(),
+                extra_header: None,
+            },
+            Reply {
+                status: 403,
+                content_type: "application/problem+json",
+                body: forbidden.into(),
+                extra_header: None,
+            },
+            json(r#"{"items":[],"nextCursor":"expired"}"#),
+            Reply {
+                status: 400,
+                content_type: "application/problem+json",
+                body: invalid.into(),
+                extra_header: None,
+            },
+        ]);
+        let client = ApiClient::new(&address, None, false).unwrap();
+        assert!(matches!(
+            client.capabilities(),
+            Err(ApiError::Authentication(Some(_)))
+        ));
+        assert!(matches!(
+            client.capabilities(),
+            Err(ApiError::Authorization(Some(_)))
+        ));
+        assert!(
+            matches!(client.list_apps(1), Err(ApiError::Http { status: 400, problem: Some(Problem { code, .. }) }) if code == "invalid_cursor")
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn traverses_multiple_pages_and_encodes_opaque_cursor() {
+        let first = r#"{"items":[{"id":"a","name":"A","slug":"a","ownerId":"owner","visibility":"Public","state":"Published"}],"nextCursor":"x/+ y"}"#;
+        let second = r#"{"items":[{"id":"b","name":"B","slug":"b","ownerId":"owner","visibility":"Public","state":"Published"}],"nextCursor":null}"#;
+        let (address, requests, handle) = server(vec![json(first), json(second)]);
+        let apps = ApiClient::new(&address, None, false)
+            .unwrap()
+            .list_apps(1)
+            .unwrap();
+        assert_eq!(apps.len(), 2);
+        handle.join().unwrap();
+        let requests = requests.lock().unwrap();
+        assert!(requests[1].contains("cursor=x%2F%2B+y"));
+    }
+
+    #[test]
+    fn repeated_cursor_and_wrong_content_type_are_protocol_errors() {
+        let page = r#"{"items":[],"nextCursor":"again"}"#;
+        let (address, _, handle) = server(vec![
+            json(page),
+            json(page),
+            Reply {
+                status: 200,
+                content_type: "text/html",
+                body: "{}".into(),
+                extra_header: None,
+            },
+        ]);
+        let client = ApiClient::new(&address, None, false).unwrap();
+        assert!(matches!(client.list_apps(1), Err(ApiError::Protocol(_))));
+        assert!(matches!(client.capabilities(), Err(ApiError::Protocol(_))));
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn snapshot_preserves_all_json_kinds_and_multiple_associations() {
+        let body = r#"{"releaseId":"r","app":{"revisionId":"ra","data":{"appDepot":{"summary":"hello","new":18446744073709551616},"other":[null,true,18446744073709551615]}},"release":{"revisionId":"rr","data":[1,"text",null]},"associations":[{"associationId":"x","declaration":{"revisionId":"rx","data":{"appDepot":{"entryPoints":[{"id":"run","target":{"type":"ArtifactFile"},"future":true}]}}}},{"associationId":"y","declaration":{"revisionId":"ry","data":null}}]}"#;
+        let (address, _, handle) = server(vec![json(body)]);
+        let snapshot = ApiClient::new(&address, None, false)
+            .unwrap()
+            .declarations("r")
+            .unwrap();
+        assert_eq!(snapshot.associations.len(), 2);
+        assert_eq!(
+            snapshot.app.data["appDepot"]["new"].to_string(),
+            "18446744073709551616"
+        );
+        assert_eq!(snapshot.app.data["other"][2].as_u64(), Some(u64::MAX));
+        assert!(snapshot.release.data.is_array());
+        assert!(snapshot.associations[1].declaration.data.is_null());
+        let known: AppConvention = snapshot.app.convention().unwrap().unwrap();
+        assert_eq!(known.summary.as_deref(), Some("hello"));
+        let known: AssociationConvention = snapshot.associations[0]
+            .declaration
+            .convention()
+            .unwrap()
+            .unwrap();
+        assert_eq!(known.entry_points.unwrap()[0].id, "run");
+        let known: Result<Option<ReleaseConvention>, _> = snapshot.release.convention();
+        assert!(known.is_ok_and(|value| value.is_none()));
+        let printed = serde_json::to_string(&snapshot).unwrap();
+        assert!(printed.contains("18446744073709551616"));
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn all_associations_resolve_to_distinct_artifact_metadata() {
+        let file_id = format!("adfile:sha256:{}", "a".repeat(64));
+        let tree_id = format!("adtree:v1:sha256:{}", "b".repeat(64));
+        let first_page = format!(
+            r#"{{"items":[{{"id":"x","releaseId":"r","artifactId":"{file_id}"}}],"nextCursor":"next"}}"#
+        );
+        let second_page = format!(
+            r#"{{"items":[{{"id":"y","releaseId":"r","artifactId":"{tree_id}"}}],"nextCursor":null}}"#
+        );
+        let file = format!(r#"{{"id":"{file_id}","kind":"File","size":18446744073709551615}}"#);
+        let tree = format!(r#"{{"id":"{tree_id}","kind":"Tree","size":null}}"#);
+        let (address, requests, handle) = server(vec![
+            json(&first_page),
+            json(&second_page),
+            json(&file),
+            json(&tree),
+        ]);
+        let items = ApiClient::new(&address, None, false)
+            .unwrap()
+            .associated_artifacts("r", 1)
+            .unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].artifact.size, Some(u64::MAX));
+        assert_eq!(items[1].artifact.size, None);
+        handle.join().unwrap();
+        let requests = requests.lock().unwrap();
+        assert!(requests[2].starts_with(&format!("GET /api/v1/artifacts/{file_id} HTTP/1.1")));
+    }
+
+    #[test]
+    fn redirects_never_forward_credentials() {
+        let target = TcpListener::bind("127.0.0.1:0").unwrap();
+        target.set_nonblocking(true).unwrap();
+        let target_url = format!("http://{}/steal", target.local_addr().unwrap());
+        let (address, requests, handle) = server(vec![Reply {
+            status: 302,
+            content_type: "text/plain",
+            body: String::new(),
+            extra_header: Some(format!("Location: {target_url}")),
+        }]);
+        let error = ApiClient::new(&address, Some("secret".into()), false)
+            .unwrap()
+            .capabilities()
+            .unwrap_err();
+        assert!(matches!(error, ApiError::Protocol(_)));
+        handle.join().unwrap();
+        assert_eq!(requests.lock().unwrap().len(), 1);
+        assert!(target.accept().is_err());
+    }
+
+    #[test]
+    fn missing_malformed_and_oversized_responses_fail() {
+        let (address, _, handle) = server(vec![
+            json("{}"),
+            json("not json"),
+            Reply {
+                status: 200,
+                content_type: "application/json",
+                body: "x".repeat(MAX_JSON_BYTES as usize + 1),
+                extra_header: None,
+            },
+        ]);
+        let client = ApiClient::new(&address, None, false).unwrap();
+        assert!(matches!(client.capabilities(), Err(ApiError::Protocol(_))));
+        assert!(matches!(client.capabilities(), Err(ApiError::Protocol(_))));
+        assert!(matches!(client.capabilities(), Err(ApiError::Protocol(_))));
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn rejects_unsafe_urls_and_encodes_path_segments() {
+        for url in [
+            "file:///tmp",
+            "https://user:pass@example.org/",
+            "https://example.org/api",
+            "http://example.org/",
+        ] {
+            assert!(ApiClient::new(url, None, false).is_err());
+        }
+        let client = ApiClient::new("http://127.0.0.1:8787/", None, false).unwrap();
+        assert!(
+            client
+                .url(&["apps", "a/b"], None, None)
+                .unwrap()
+                .as_str()
+                .ends_with("/api/v1/apps/a%2Fb")
+        );
+    }
+}
