@@ -20,7 +20,7 @@
 
 ## Git publication policy
 
-- For an explicitly authorized development task, ordinary verified commits may be pushed to the configured `origin/main` as a fast-forward update if the current owner instruction does not prohibit it and no Hard Stop remains. A task-specific no-push instruction takes precedence; M0 has such an instruction. No agent may create or change a remote merely to satisfy this policy.
+- After completing an explicitly authorized development task, agents MAY create coherent verified local commits and MUST push them to the configured `origin/main` without separate permission, provided every required check has passed, no Hard Stop remains, and the current owner instruction does not prohibit push. This standing authorization covers ordinary fixes within that task, not unrelated work. A task-specific no-push instruction takes precedence; M0 has such an instruction. No agent may create or change a remote merely to satisfy this policy.
 - Before any allowed push, verify working/staged status, branch/upstream and configured fetch/push URLs; fetch and verify synchronization with `origin/main`; review every outgoing commit and full diff for task scope, secrets, credentials and disposable artifacts. If `origin/main` advances, integrate without discarding others’ work, rerun affected checks and review again. Never force-push, rewrite remote history, bypass protection or publish unverified work.
 - Do not create GitHub Releases, publication tags or packages, or deploy anything, without explicit authorization. Local commits required by an owner task remain local when that task forbids push.
 
