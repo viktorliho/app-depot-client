@@ -1,8 +1,8 @@
 [workspace]
-members = ["crates/app-depot-core", "crates/app-depot-cli"]
+members = ["crates/app-depot-core", "crates/app-depot-cli", "crates/app-depot-desktop"]
 resolver = "3"
 
 [workspace.package]
 edition = "2024"
 license = "MIT"
-rust-version = "1.88"
+rust-version = "1.95"

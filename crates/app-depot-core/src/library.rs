@@ -467,6 +467,32 @@ impl Library {
     ) -> Result<Vec<Cached<Association>>, LibraryError> {
         self.cached_rows(id, "associations", Some(release_id))
     }
+    pub fn cached_artifact(
+        &self,
+        id: &ServerProfileId,
+        artifact_id: &str,
+    ) -> Result<Option<Cached<Artifact>>, LibraryError> {
+        let profile = self.profile(id)?;
+        let raw: Option<(String, i64)> = self
+            .conn
+            .query_row(
+                "SELECT metadata_json,last_seen FROM artifacts WHERE profile_id=?1 AND id=?2",
+                params![id.0, artifact_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        raw.map(|(json, last_seen)| {
+            Ok(Cached {
+                profile_id: id.clone(),
+                value: serde_json::from_str(&json)?,
+                last_seen,
+                last_sync: profile.last_sync,
+                stale: profile.last_sync != Some(last_seen),
+                source: "cache",
+            })
+        })
+        .transpose()
+    }
     pub fn cached_snapshot(
         &self,
         id: &ServerProfileId,

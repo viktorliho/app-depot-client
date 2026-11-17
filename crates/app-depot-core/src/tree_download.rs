@@ -260,10 +260,10 @@ impl Library {
         let id = Uuid::new_v4().to_string();
         let time = now()?;
         let tx = self.conn.transaction()?;
-        tx.execute("INSERT INTO apps(profile_id,id,metadata_json,last_seen) VALUES (?1,?2,?3,?4) ON CONFLICT(profile_id,id) DO UPDATE SET metadata_json=excluded.metadata_json,last_seen=excluded.last_seen",params![profile_id.0,app.id,serde_json::to_string(&app)?,time])?;
-        tx.execute("INSERT INTO releases(profile_id,id,app_id,metadata_json,last_seen) VALUES (?1,?2,?3,?4,?5) ON CONFLICT(profile_id,id) DO UPDATE SET app_id=excluded.app_id,metadata_json=excluded.metadata_json,last_seen=excluded.last_seen",params![profile_id.0,release.id,release.app_id,serde_json::to_string(&release)?,time])?;
-        tx.execute("INSERT INTO artifacts(profile_id,id,metadata_json,last_seen) VALUES (?1,?2,?3,?4) ON CONFLICT(profile_id,id) DO UPDATE SET metadata_json=excluded.metadata_json,last_seen=excluded.last_seen",params![profile_id.0,artifact.id,serde_json::to_string(&artifact)?,time])?;
-        tx.execute("INSERT INTO associations(profile_id,id,release_id,artifact_id,metadata_json,last_seen) VALUES (?1,?2,?3,?4,?5,?6) ON CONFLICT(profile_id,id) DO UPDATE SET release_id=excluded.release_id,artifact_id=excluded.artifact_id,metadata_json=excluded.metadata_json,last_seen=excluded.last_seen",params![profile_id.0,association.id,association.release_id,association.artifact_id,serde_json::to_string(&association)?,time])?;
+        tx.execute("INSERT INTO apps(profile_id,id,metadata_json,last_seen) VALUES (?1,?2,?3,0) ON CONFLICT(profile_id,id) DO UPDATE SET metadata_json=excluded.metadata_json",params![profile_id.0,app.id,serde_json::to_string(&app)?])?;
+        tx.execute("INSERT INTO releases(profile_id,id,app_id,metadata_json,last_seen) VALUES (?1,?2,?3,?4,0) ON CONFLICT(profile_id,id) DO UPDATE SET app_id=excluded.app_id,metadata_json=excluded.metadata_json",params![profile_id.0,release.id,release.app_id,serde_json::to_string(&release)?])?;
+        tx.execute("INSERT INTO artifacts(profile_id,id,metadata_json,last_seen) VALUES (?1,?2,?3,0) ON CONFLICT(profile_id,id) DO UPDATE SET metadata_json=excluded.metadata_json",params![profile_id.0,artifact.id,serde_json::to_string(&artifact)?])?;
+        tx.execute("INSERT INTO associations(profile_id,id,release_id,artifact_id,metadata_json,last_seen) VALUES (?1,?2,?3,?4,?5,0) ON CONFLICT(profile_id,id) DO UPDATE SET release_id=excluded.release_id,artifact_id=excluded.artifact_id,metadata_json=excluded.metadata_json",params![profile_id.0,association.id,association.release_id,association.artifact_id,serde_json::to_string(&association)?])?;
         tx.execute("INSERT INTO download_jobs(id,profile_id,artifact_id,association_id,state,created_at,updated_at,expected_size) VALUES (?1,?2,?3,?4,'Queued',?5,?5,0)",params![id,profile_id.0,artifact.id,association.id,time])?;
         tx.commit()?;
         self.job(&id)
@@ -1085,6 +1085,12 @@ mod tests {
         assert_eq!(library.job(&job.id).unwrap().state, "Completed");
         let visible = library.verified_trees(Some(&job.profile_id)).unwrap();
         assert_eq!(visible.len(), 1);
+        assert!(
+            library
+                .verified_files(Some(&job.profile_id))
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(visible[0].file_count, 2);
         assert!(visible[0].path.join("empty/nested").is_dir());
         #[cfg(unix)]
@@ -1106,6 +1112,7 @@ mod tests {
         })
         .unwrap();
         assert_eq!(library.verified_trees(None).unwrap().len(), 1);
+        assert!(library.verified_files(None).unwrap().is_empty());
     }
     #[test]
     fn interrupted_committing_recovers_without_network() {

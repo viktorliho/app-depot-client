@@ -387,10 +387,10 @@ impl Library {
         let id = Uuid::new_v4().to_string();
         let time = now()?;
         let tx = self.conn.transaction()?;
-        tx.execute("INSERT INTO apps(profile_id,id,metadata_json,last_seen) VALUES (?1,?2,?3,?4) ON CONFLICT(profile_id,id) DO UPDATE SET metadata_json=excluded.metadata_json,last_seen=excluded.last_seen",params![profile_id.0,app.id,serde_json::to_string(&app)?,time])?;
-        tx.execute("INSERT INTO releases(profile_id,id,app_id,metadata_json,last_seen) VALUES (?1,?2,?3,?4,?5) ON CONFLICT(profile_id,id) DO UPDATE SET app_id=excluded.app_id,metadata_json=excluded.metadata_json,last_seen=excluded.last_seen",params![profile_id.0,release.id,release.app_id,serde_json::to_string(&release)?,time])?;
-        tx.execute("INSERT INTO artifacts(profile_id,id,metadata_json,last_seen) VALUES (?1,?2,?3,?4) ON CONFLICT(profile_id,id) DO UPDATE SET metadata_json=excluded.metadata_json,last_seen=excluded.last_seen",params![profile_id.0,artifact.id,serde_json::to_string(&artifact)?,time])?;
-        tx.execute("INSERT INTO associations(profile_id,id,release_id,artifact_id,metadata_json,last_seen) VALUES (?1,?2,?3,?4,?5,?6) ON CONFLICT(profile_id,id) DO UPDATE SET release_id=excluded.release_id,artifact_id=excluded.artifact_id,metadata_json=excluded.metadata_json,last_seen=excluded.last_seen",params![profile_id.0,association.id,association.release_id,association.artifact_id,serde_json::to_string(&association)?,time])?;
+        tx.execute("INSERT INTO apps(profile_id,id,metadata_json,last_seen) VALUES (?1,?2,?3,0) ON CONFLICT(profile_id,id) DO UPDATE SET metadata_json=excluded.metadata_json",params![profile_id.0,app.id,serde_json::to_string(&app)?])?;
+        tx.execute("INSERT INTO releases(profile_id,id,app_id,metadata_json,last_seen) VALUES (?1,?2,?3,?4,0) ON CONFLICT(profile_id,id) DO UPDATE SET app_id=excluded.app_id,metadata_json=excluded.metadata_json",params![profile_id.0,release.id,release.app_id,serde_json::to_string(&release)?])?;
+        tx.execute("INSERT INTO artifacts(profile_id,id,metadata_json,last_seen) VALUES (?1,?2,?3,0) ON CONFLICT(profile_id,id) DO UPDATE SET metadata_json=excluded.metadata_json",params![profile_id.0,artifact.id,serde_json::to_string(&artifact)?])?;
+        tx.execute("INSERT INTO associations(profile_id,id,release_id,artifact_id,metadata_json,last_seen) VALUES (?1,?2,?3,?4,?5,0) ON CONFLICT(profile_id,id) DO UPDATE SET release_id=excluded.release_id,artifact_id=excluded.artifact_id,metadata_json=excluded.metadata_json",params![profile_id.0,association.id,association.release_id,association.artifact_id,serde_json::to_string(&association)?])?;
         tx.execute("INSERT INTO download_jobs(id,profile_id,artifact_id,association_id,state,created_at,updated_at,expected_size) VALUES (?1,?2,?3,?4,'Queued',?5,?5,?6)",params![id,profile_id.0,artifact.id,association.id,time,size as i64])?;
         tx.commit()?;
         self.job(&id)
@@ -791,7 +791,7 @@ impl Library {
         &self,
         profile: Option<&ServerProfileId>,
     ) -> Result<Vec<VerifiedFile>, LibraryError> {
-        let mut stmt=self.conn.prepare("SELECT profile_id,artifact_id,association_id,local_ref,verified_at FROM verified_content WHERE ?1 IS NULL OR profile_id=?1 ORDER BY verified_at")?;
+        let mut stmt=self.conn.prepare("SELECT profile_id,artifact_id,association_id,local_ref,verified_at FROM verified_content WHERE artifact_id LIKE 'adfile:sha256:%' AND (?1 IS NULL OR profile_id=?1) ORDER BY verified_at")?;
         let rows = stmt
             .query_map([profile.map(|p| p.0.as_str())], |r| {
                 Ok((
@@ -1015,6 +1015,36 @@ mod tests {
         f.library
             .queue_file(&f.client, &f.profile, "release", ASSOCIATION)
             .unwrap()
+    }
+    #[test]
+    fn queue_file_does_not_advance_catalog_sync_epoch() {
+        let mut f = fixture(b"download me".to_vec(), "normal");
+        f.library
+            .conn
+            .execute(
+                "UPDATE profiles SET last_sync=42 WHERE id=?1",
+                [&f.profile.0],
+            )
+            .unwrap();
+        f.library
+            .conn
+            .execute(
+                "INSERT INTO apps(profile_id,id,metadata_json,last_seen) VALUES (?1,'app','{}',42)",
+                [&f.profile.0],
+            )
+            .unwrap();
+        queue(&mut f);
+        assert_eq!(f.library.profile(&f.profile).unwrap().last_sync, Some(42));
+        let seen: i64 = f
+            .library
+            .conn
+            .query_row(
+                "SELECT last_seen FROM apps WHERE profile_id=?1 AND id='app'",
+                [&f.profile.0],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(seen, 42);
     }
     #[test]
     fn zero_and_normal_files_complete_with_offline_materialization() {

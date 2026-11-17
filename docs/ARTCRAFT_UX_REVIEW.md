@@ -13,3 +13,5 @@ Inspected [`storytold/craft-launcher`](https://github.com/storytold/craft-launch
 | Settings/packaging | Desktop settings and platform packaging live outside core; Linux, Windows and macOS packaging scripts are explicit. | Start Linux native packaging after M1 core works; design paths and credential adapters for all three OSes. |
 
 ArtCraft is a useful UX and Rust boundary reference, not an App Depot protocol source. Its fixed application catalog and GitHub asset naming rules would violate Server-authoritative declaration semantics here.
+
+M1.5 uses ArtCraft's broad navigation and grid/table/details/queue separation as UX guidance. The implementation uses a separate egui crate with command/event workers over the existing App Depot core, native Wayland/X11 windowing and bounded asynchronous artwork. It deliberately exposes every Release association and keeps download completion separate from installation or launch state. ArtCraft's updater, GitHub release picker, installer and branding are not used.

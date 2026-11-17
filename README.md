@@ -2,18 +2,21 @@
 
 Native reference client for the open [App Depot Server](https://github.com/viktorliho/app-depot-server) protocol. The client is optional: independent clients can implement the documented Server API without using this code.
 
-M1.4 adds verified, resumable Tree Artifact downloads to the HTTP core and diagnostic CLI. The client also downloads single-file Artifacts, stores Server profiles and keeps an offline catalog cache. There is no desktop UI, installer or launcher yet. See [milestones](docs/MILESTONES.md) and the [server API audit](docs/SERVER_API_AUDIT.md).
+M1.5 adds a native egui desktop browser using the same HTTP core, profiles, offline cache and verified File/Tree download engine as the CLI. It does not install or launch software. See [milestones](docs/MILESTONES.md) and the [server API audit](docs/SERVER_API_AUDIT.md).
 
 ## Build and use
 
 ```sh
 cargo build --workspace --locked
+cargo run -p app-depot-desktop --locked
 cargo run -p app-depot -- --server http://127.0.0.1:8787 capabilities
 cargo run -p app-depot -- --server http://127.0.0.1:8787 apps
 cargo run -p app-depot -- --server http://127.0.0.1:8787 releases APP_ID
 cargo run -p app-depot -- --server http://127.0.0.1:8787 artifacts RELEASE_ID
 cargo run -p app-depot -- --server http://127.0.0.1:8787 declarations RELEASE_ID --json
 ```
+
+The desktop app has Catalog, Library, Downloads and Settings views. Add a profile in Settings, select it, then synchronize while online. Catalog offers grid/table views, search, App details, all Release associations and individual File/Tree download actions. Library and Downloads read the same durable local state as the CLI; completed downloads remain visible after restart or when the Server is unavailable. Artwork is loaded asynchronously from the Server's App artwork API and cached in memory for the session; missing or rejected images use a placeholder. The UI never presents Install or Launch actions. `APP_DEPOT_LIBRARY_DATA_DIR` and `APP_DEPOT_LIBRARY_CONTENT_DIR` choose disposable or separate roots for the desktop app, using the same validation as the CLI. On Linux, Wayland and X11 are supported. The GUI requires Rust 1.95 or newer.
 
 Also available: `app APP_ID` and `release RELEASE_ID`. `--json` produces machine-readable JSON with exact integer values. Set `APP_DEPOT_TOKEN` for a temporary Bearer token; it is never stored. `APP_DEPOT_SERVER_URL` can provide the URL instead of `--server`. Remote HTTP requires `--allow-insecure-http`; HTTPS does not. The client refuses redirects. Exit codes: 2 configuration, 3 authentication, 4 authorization, 5 transport, 6 incompatible capabilities, 7 malformed protocol response, 8 other HTTP error.
 

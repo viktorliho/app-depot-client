@@ -1,11 +1,12 @@
 //! Read-only App Depot HTTP client. Every route is from the Server OpenAPI.
 
 use crate::models::{
-    App, Artifact, Association, AssociationArtifact, Capabilities, DeclarationSnapshot,
+    App, Artifact, Artwork, Association, AssociationArtifact, Capabilities, DeclarationSnapshot,
     InventoryEntry, Page, Release,
 };
 use serde::de::DeserializeOwned;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::{collections::HashSet, fmt, io::Read, time::Duration};
 use url::{Host, Url};
 
@@ -320,6 +321,93 @@ impl ApiClient {
             return Err(ApiError::Protocol("App ID does not match request".into()));
         }
         Ok(app)
+    }
+
+    pub fn list_artwork(&self, app_id: &str) -> Result<Vec<Artwork>, ApiError> {
+        #[derive(serde::Deserialize)]
+        struct List {
+            items: Vec<Artwork>,
+        }
+        let list: List = self.get_json(&["apps", app_id, "artwork"], None, None)?;
+        if list.items.len() > 1000 || list.items.iter().any(|item| item.app_id != app_id) {
+            return Err(ApiError::Protocol("invalid artwork list".into()));
+        }
+        Ok(list.items)
+    }
+
+    /// Fetch only the current Server-bound image. The caller decodes it off the UI thread.
+    pub fn artwork_bytes(&self, item: &Artwork) -> Result<Vec<u8>, ApiError> {
+        const MAX_ARTWORK: u64 = 8 * 1024 * 1024;
+        if item.size == 0
+            || item.size > MAX_ARTWORK
+            || item.width == 0
+            || item.height == 0
+            || item.width > 8192
+            || item.height > 8192
+            || u64::from(item.width) * u64::from(item.height) > 16_000_000
+            || !matches!(
+                item.mime_type.as_str(),
+                "image/png" | "image/jpeg" | "image/webp"
+            )
+            || item.digest.len() != 64
+            || !item.digest.bytes().all(|c| c.is_ascii_hexdigit())
+        {
+            return Err(ApiError::Protocol("unsafe artwork metadata".into()));
+        }
+        let url = self.url(
+            &["apps", &item.app_id, "artwork", &item.role, "content"],
+            None,
+            None,
+        )?;
+        let mut request = self.agent.get(url.as_str()).set("Accept", &item.mime_type);
+        if let Some(token) = &self.token {
+            request = request.set("Authorization", &format!("Bearer {token}"));
+        }
+        let response = match request.call() {
+            Ok(response) | Err(ureq::Error::Status(_, response)) => response,
+            Err(ureq::Error::Transport(error)) => {
+                return Err(ApiError::Transport(error.to_string()));
+            }
+        };
+        if response.status() != 200 {
+            let status = response.status();
+            return Err(match status {
+                401 => ApiError::Authentication(None),
+                403 => ApiError::Authorization(None),
+                300..=399 => ApiError::Protocol(format!("redirect refused (HTTP {status})")),
+                _ => ApiError::Http {
+                    status,
+                    problem: None,
+                },
+            });
+        }
+        let mime = response
+            .header("Content-Type")
+            .unwrap_or("")
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .trim();
+        if mime != item.mime_type {
+            return Err(ApiError::Protocol(
+                "artwork MIME type differs from binding".into(),
+            ));
+        }
+        if response
+            .header("Content-Length")
+            .and_then(|v| v.parse::<u64>().ok())
+            .is_some_and(|n| n != item.size)
+        {
+            return Err(ApiError::Protocol(
+                "artwork length differs from binding".into(),
+            ));
+        }
+        let bytes = read_bounded(response, MAX_ARTWORK)?;
+        if bytes.len() as u64 != item.size || format!("{:x}", Sha256::digest(&bytes)) != item.digest
+        {
+            return Err(ApiError::Protocol("artwork digest or size mismatch".into()));
+        }
+        Ok(bytes)
     }
 
     pub fn list_releases(&self, app_id: &str, page_size: u64) -> Result<Vec<Release>, ApiError> {
@@ -744,6 +832,85 @@ mod tests {
             requests[1].contains("Authorization: Bearer test-secret")
                 || requests[1].contains("authorization: Bearer test-secret")
         );
+    }
+
+    #[test]
+    fn artwork_uses_profile_auth_and_verifies_binding() {
+        let body = "image-bytes";
+        let digest = format!("{:x}", Sha256::digest(body.as_bytes()));
+        let item = Artwork {
+            app_id: "app-id".into(),
+            role: "Icon".into(),
+            id: "binding-id".into(),
+            digest,
+            mime_type: "image/png".into(),
+            size: body.len() as u64,
+            width: 2,
+            height: 2,
+            etag: "\"artwork\"".into(),
+        };
+        let (address, requests, handle) = server(vec![Reply {
+            status: 200,
+            content_type: "image/png",
+            body: body.into(),
+            extra_header: None,
+        }]);
+        let api = ApiClient::new(&address, Some("test-secret".into()), false).unwrap();
+        assert_eq!(api.artwork_bytes(&item).unwrap(), body.as_bytes());
+        handle.join().unwrap();
+        let request = &requests.lock().unwrap()[0];
+        assert!(request.starts_with("GET /api/v1/apps/app-id/artwork/Icon/content HTTP/1.1"));
+        assert!(request.contains("Bearer test-secret"));
+    }
+
+    #[test]
+    fn artwork_rejects_bad_mime_digest_and_size() {
+        let item = Artwork {
+            app_id: "app-id".into(),
+            role: "Icon".into(),
+            id: "binding-id".into(),
+            digest: "0".repeat(64),
+            mime_type: "image/png".into(),
+            size: 3,
+            width: 2,
+            height: 2,
+            etag: "\"artwork\"".into(),
+        };
+        let replies = vec![
+            Reply {
+                status: 200,
+                content_type: "image/jpeg",
+                body: "abc".into(),
+                extra_header: None,
+            },
+            Reply {
+                status: 200,
+                content_type: "image/png",
+                body: "abc".into(),
+                extra_header: None,
+            },
+            Reply {
+                status: 200,
+                content_type: "image/png",
+                body: "ab".into(),
+                extra_header: None,
+            },
+        ];
+        let (address, _, handle) = server(replies);
+        let api = ApiClient::new(&address, None, false).unwrap();
+        for _ in 0..3 {
+            assert!(matches!(
+                api.artwork_bytes(&item),
+                Err(ApiError::Protocol(_))
+            ));
+        }
+        handle.join().unwrap();
+        let mut oversized = item;
+        oversized.size = 8 * 1024 * 1024 + 1;
+        assert!(matches!(
+            api.artwork_bytes(&oversized),
+            Err(ApiError::Protocol(_))
+        ));
     }
 
     #[test]

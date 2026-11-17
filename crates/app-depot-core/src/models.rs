@@ -150,6 +150,21 @@ pub struct Artifact {
     pub unknown: BTreeMap<String, Value>,
 }
 
+/// Current App artwork binding; its digest identifies image bytes, not an Artifact.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Artwork {
+    pub app_id: String,
+    pub role: String,
+    pub id: String,
+    pub digest: String,
+    pub mime_type: String,
+    pub size: u64,
+    pub width: u32,
+    pub height: u32,
+    pub etag: String,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeclarationDocument {
