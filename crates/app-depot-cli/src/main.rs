@@ -35,6 +35,7 @@ fn usage() -> &'static str {
      credentials: profile token-set ID --token-stdin | profile token-remove ID\n\
      sync/offline: --profile ID sync | cached-apps | cached-releases APP_ID | cached-declarations RELEASE_ID\n\
      download: --profile ID download start RELEASE_ID ASSOCIATION_ID [--pause-after-bytes N] | jobs | files | trees | tree-files JOB_ID | pause JOB_ID | resume JOB_ID | retry JOB_ID | cancel JOB_ID\n\
+     launch: --profile ID launch list RELEASE_ID | launch play RELEASE_ID ASSOCIATION_ID ENTRY_POINT_ID\n\
      optional APP_DEPOT_TOKEN overrides stored token for this process; --library-data/--library-content select local roots"
 }
 
@@ -607,6 +608,64 @@ fn run_download(options: &Options) -> Result<(), CliError> {
     }
 }
 
+fn run_launch(options: &Options) -> Result<(), CliError> {
+    let profile = options
+        .profile
+        .as_ref()
+        .ok_or_else(|| ApiError::Config("launch requires --profile ID".into()))?;
+    let args = &options.positional;
+    if !matches!(
+        (args.get(1).map(String::as_str), args.len()),
+        (Some("list"), 3) | (Some("play"), 5)
+    ) {
+        return Err(ApiError::Config(usage().into()).into());
+    }
+    let library = open_library(options)?;
+    let candidates = library.launch_candidates(profile, &args[2])?;
+    if args[1] == "list" {
+        if options.json {
+            print_json(&candidates)?
+        } else {
+            for candidate in candidates {
+                println!(
+                    "{}  {}  {}  {}  {}",
+                    candidate.association_id,
+                    candidate.entry_id,
+                    candidate.status,
+                    candidate.target.as_deref().unwrap_or("(none)"),
+                    candidate.reason
+                )
+            }
+        }
+        return Ok(());
+    }
+    let selected = candidates
+        .into_iter()
+        .find(|c| c.association_id == args[3] && c.entry_id == args[4])
+        .ok_or_else(|| {
+            LibraryError::Invalid(
+                "selected Association and entry-point ID not found in cached Release snapshot"
+                    .into(),
+            )
+        })?;
+    if selected.status != "Ready" {
+        return Err(LibraryError::Invalid(format!(
+            "launch unavailable: {} ({})",
+            selected.status, selected.reason
+        ))
+        .into());
+    }
+    let mut child = selected.spawn()?;
+    eprintln!("started process {}", child.id());
+    let status = child.wait().map_err(LibraryError::Io)?;
+    if status.success() {
+        println!("process exited successfully");
+        Ok(())
+    } else {
+        Err(LibraryError::Invalid(format!("process exited with {status}")).into())
+    }
+}
+
 fn run() -> Result<(), CliError> {
     let options = parse_args()?;
     if options.positional[0] == "profile" {
@@ -614,6 +673,9 @@ fn run() -> Result<(), CliError> {
     }
     if options.positional[0] == "download" {
         return run_download(&options);
+    }
+    if options.positional[0] == "launch" {
+        return run_launch(&options);
     }
     if let Some(profile_id) = &options.profile
         && options.positional[0].starts_with("cached-")

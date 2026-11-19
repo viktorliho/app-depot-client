@@ -8,7 +8,7 @@ use app_depot_core::{
     ServerProfileId,
     api::ApiClient,
     library::LibraryPaths,
-    models::{AppConvention, AssociationConvention, EntryPointTarget, ReleaseConvention},
+    models::{AppConvention, AssociationConvention, ReleaseConvention},
     transfer::DownloadJob,
 };
 use eframe::egui::{self, Color32, RichText, TextureHandle};
@@ -73,6 +73,7 @@ struct Desktop {
     last_tree_details_refresh: Instant,
     tree_progress: HashMap<String, Vec<app_depot_core::tree_download::TreeFileProgress>>,
     live_progress: HashMap<String, LiveProgress>,
+    launch_states: HashMap<String, (String, String)>,
     search: String,
     sort_desc: bool,
     prefs: Preferences,
@@ -120,6 +121,7 @@ impl Desktop {
             last_tree_details_refresh: Instant::now(),
             tree_progress: HashMap::new(),
             live_progress: HashMap::new(),
+            launch_states: HashMap::new(),
             search: String::new(),
             sort_desc: false,
             prefs,
@@ -209,6 +211,8 @@ impl Desktop {
         self.snapshot.files.clear();
         self.snapshot.trees.clear();
         self.snapshot.jobs.clear();
+        self.snapshot.launches.clear();
+        self.launch_states.clear();
         self.prefs.last_profile = Some(id.0.clone());
         self.remember();
         self.send(Command::Refresh(Some(id)));
@@ -244,6 +248,7 @@ impl Desktop {
                         self.snapshot.jobs = s.jobs;
                         self.snapshot.files = s.files;
                         self.snapshot.trees = s.trees;
+                        self.snapshot.launches = s.launches;
                     }
                 }
                 Event::Jobs { profile, jobs } => {
@@ -253,6 +258,18 @@ impl Desktop {
                 }
                 Event::JobChanged => {
                     self.send(Command::Refresh(self.active.clone()));
+                }
+                Event::Launch {
+                    profile,
+                    association,
+                    entry,
+                    state,
+                    message,
+                } => {
+                    if self.active.as_ref() == Some(&profile) {
+                        self.launch_states
+                            .insert(format!("{association}:{entry}"), (state, message));
+                    }
                 }
                 Event::CatalogChanged(profile) => {
                     if self.active.as_ref() == Some(&profile) {

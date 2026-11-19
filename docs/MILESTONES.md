@@ -20,7 +20,9 @@ M1.5.1 redesigns the desktop around first-run Server connection, guided personal
 
 M1.5.2 adds bounded live transfer observations, measured speed and conditional ETA, Tree member counts/current path, clearer processing states and actionable errors in Downloads. It reduces small-file latency on the measured HTTP Dev/Test Server and avoids repeated full Tree progress scans and unnecessary small-member staging synchronizations. Recovery remains based on durable SQLite checkpoints and verified objects. Tree transfer remains sequential; Windows/macOS performance and desktop behavior remain unvalidated.
 
-Implement a shared core transport, declaration reader, transfer engine and local library; expose a small diagnostic CLI and an egui desktop browser on Linux. Windows/macOS paths and adapters must compile or be clearly tracked as later platform validation. All M1 operations use existing Server read APIs. No install, runtime preparation or launch implementation.
+M2.1 implements the optional Server NativePortableV1 contract in the shared core, CLI and Linux desktop. It assesses cached Release snapshots and verified local content without inventing entry points, resolves exact File/Tree targets and working directories without following symlinks, rehashes the opened executable before direct process creation, and reports process exit. It adds no installation or runtime preparation. Windows/macOS launch adapters and actual game-specific compatibility remain separate work.
+
+The original M1 objective was a shared core transport, declaration reader, transfer engine, local library, diagnostic CLI and egui desktop browser on Linux. All M1 network operations use existing Server read APIs. M1 did not include installation, runtime preparation or launch; M2.1 adds only the separately declared native portable launch method.
 
 Acceptance criteria:
 
@@ -33,8 +35,6 @@ Acceptance criteria:
 7. UI distinguishes Downloadable, Downloading, Downloaded and verified, Installation required when explicitly established by a recognized future declaration, Installed/ready to launch only when actually established, unsupported platform/runtime/procedure and missing/invalid launch declaration. In M1, install/launch statuses are informational or unavailable; there is no functional Launch action.
 8. CLI and GUI use the same core operations. Tests in [CONFORMANCE.md](CONFORMANCE.md) pass against isolated Dev/Test data; no Production data changes.
 
-Recommended build order: (1) protocol models/capability negotiation and CLI read commands; (2) declaration and compatibility read model; (3) local profile/library schema and credential adapter; (4) file transfer/integrity/recovery; (5) tree inventory/path validation/identity; (6) egui browser/details/queue; (7) Linux packaging and platform validation. Keep each step testable and avoid adding UI-specific behavior to core.
-
 ## Later milestones
 
-Only after a shared contract decision, implement one narrowly defined portable launch or installation method at a time with user consent, capability reporting, security validation and independent-client examples. No arbitrary script runner or automatic dependency installer is implied. Windows/macOS packaging and platform adapters follow verified core behavior.
+Installation, runtime preparation and any additional launch methods require separately authorized, optional shared contracts and client implementations. No arbitrary script runner or automatic dependency installer is implied. Windows/macOS packaging and native launch adapters follow verified platform-specific behavior.

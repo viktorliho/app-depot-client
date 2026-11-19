@@ -3,6 +3,7 @@
 use app_depot_core::{
     ServerProfileId,
     api::ApiClient,
+    launch::LaunchCandidate,
     library::{Library, LibraryPaths, Profile},
     models::{App, Artifact, Association, DeclarationSnapshot, Release},
     secrets::{NativeSecrets, SecretStore},
@@ -12,11 +13,11 @@ use app_depot_core::{
 use eframe::egui;
 use image::ImageReader;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     io::Cursor,
     path::PathBuf,
     sync::{
-        Arc,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicU64, Ordering},
         mpsc::{self, Receiver, Sender},
     },
@@ -58,6 +59,7 @@ pub struct Snapshot {
     pub jobs: Vec<DownloadJob>,
     pub files: Vec<VerifiedFile>,
     pub trees: Vec<VerifiedTree>,
+    pub launches: Vec<LaunchCandidate>,
     pub library_data: PathBuf,
     pub library_content: PathBuf,
 }
@@ -108,6 +110,13 @@ pub enum Command {
         usage: ArtUse,
     },
     Reveal(PathBuf),
+    Play {
+        profile: ServerProfileId,
+        release: String,
+        association: String,
+        entry: String,
+        declaration_revision: String,
+    },
 }
 
 pub enum Event {
@@ -142,6 +151,13 @@ pub enum Event {
     Notice(String),
     Error(String),
     SelectProfile(ServerProfileId),
+    Launch {
+        profile: ServerProfileId,
+        association: String,
+        entry: String,
+        state: String,
+        message: String,
+    },
     SyncState {
         profile: ServerProfileId,
         running: bool,
@@ -346,6 +362,21 @@ pub(crate) fn snapshot(
         result.jobs = lib.jobs(Some(id)).map_err(|e| e.to_string())?;
         result.files = lib.verified_files(Some(id)).map_err(|e| e.to_string())?;
         result.trees = lib.verified_trees(Some(id)).map_err(|e| e.to_string())?;
+        for app in &result.apps {
+            for release in &app.releases {
+                if release.declaration.is_some() {
+                    result.launches.extend(
+                        lib.launch_candidates_with_verified(
+                            id,
+                            &release.release.id,
+                            &result.files,
+                            &result.trees,
+                        )
+                        .map_err(|e| e.to_string())?,
+                    );
+                }
+            }
+        }
     }
     Ok(result)
 }
@@ -561,6 +592,83 @@ fn operation(
                 std::process::Command::new("xdg-open").arg(&folder).spawn()
             }
             .map_err(|e| e.to_string())?;
+            return Ok(false);
+        }
+        Command::Play {
+            profile,
+            release,
+            association,
+            entry,
+            declaration_revision,
+        } => {
+            static ACTIVE: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+            let active = ACTIVE.get_or_init(|| Mutex::new(HashSet::new()));
+            let key = format!("{}:{association}:{entry}", profile.0);
+            if !active
+                .lock()
+                .map_err(|_| "launch state unavailable")?
+                .insert(key.clone())
+            {
+                return Err("This program is already running or starting".into());
+            }
+            let paths = paths.clone();
+            let tx = tx.clone();
+            let ctx = ctx.clone();
+            thread::spawn(move || {
+                let announce = |state: &str, message: String| {
+                    send(
+                        &tx,
+                        &ctx,
+                        Event::Launch {
+                            profile: profile.clone(),
+                            association: association.clone(),
+                            entry: entry.clone(),
+                            state: state.into(),
+                            message,
+                        },
+                    )
+                };
+                announce("Starting", "Checking local content before launch".into());
+                let result = (|| -> Result<(), String> {
+                    let lib = Library::open(paths).map_err(|e| e.to_string())?;
+                    let candidate = lib
+                        .launch_candidates(&profile, &release)
+                        .map_err(|e| e.to_string())?
+                        .into_iter()
+                        .find(|c| c.association_id == association && c.entry_id == entry)
+                        .ok_or("selected launch declaration is no longer cached")?;
+                    if candidate.declaration_revision != declaration_revision {
+                        return Err(
+                            "Launch declaration changed; review the updated choice before playing"
+                                .into(),
+                        );
+                    }
+                    if candidate.status != "Ready" {
+                        return Err(format!("{}: {}", candidate.status, candidate.reason));
+                    }
+                    let mut child = candidate.spawn().map_err(|e| e.to_string())?;
+                    let pid = child.id();
+                    if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+                        announce(
+                            "Exited",
+                            format!("Process {pid} exited immediately: {status}"),
+                        );
+                        return Ok(());
+                    }
+                    announce("Running", format!("Process {pid} started"));
+                    let status = child.wait().map_err(|e| e.to_string())?;
+                    announce("Exited", format!("Process {pid} exited: {status}"));
+                    Ok(())
+                })();
+                if let Err(error) = result {
+                    announce("Launch failed", error)
+                }
+                if let Some(active) = ACTIVE.get()
+                    && let Ok(mut active) = active.lock()
+                {
+                    active.remove(&key);
+                }
+            });
             return Ok(false);
         }
     }

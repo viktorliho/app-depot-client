@@ -485,6 +485,85 @@ impl Desktop {
             "Available to download"
         }
     }
+    fn play_controls(&mut self, ui: &mut egui::Ui, association: &str) {
+        let choices: Vec<_> = self
+            .snapshot
+            .launches
+            .iter()
+            .filter(|c| c.association_id == association)
+            .cloned()
+            .collect();
+        for candidate in choices {
+            let key = format!("{}:{}", association, candidate.entry_id);
+            let state = self.launch_states.get(&key).cloned();
+            if candidate.status == "Ready" {
+                let label = candidate
+                    .label
+                    .clone()
+                    .unwrap_or_else(|| candidate.entry_id.clone());
+                let multiple = self
+                    .snapshot
+                    .launches
+                    .iter()
+                    .filter(|c| c.release_id == candidate.release_id && c.status == "Ready")
+                    .count()
+                    > 1;
+                let busy = state
+                    .as_ref()
+                    .is_some_and(|(s, _)| s == "Starting" || s == "Running");
+                ui.horizontal_wrapped(|ui| {
+                    if ui
+                        .add_enabled(
+                            !busy,
+                            egui::Button::new(if multiple {
+                                format!("Play: {label}")
+                            } else {
+                                "Play".into()
+                            }),
+                        )
+                        .clicked()
+                    {
+                        self.send(Command::Play {
+                            profile: candidate.profile_id.clone(),
+                            release: candidate.release_id.clone(),
+                            association: candidate.association_id.clone(),
+                            entry: candidate.entry_id.clone(),
+                            declaration_revision: candidate.declaration_revision.clone(),
+                        });
+                        self.launch_states.insert(
+                            key.clone(),
+                            (
+                                "Starting".into(),
+                                "Checking local content before launch".into(),
+                            ),
+                        );
+                    }
+                    ui.label(
+                        RichText::new(format!(
+                            "{label} · {}",
+                            state.as_ref().map_or("Ready to play", |(s, _)| s.as_str())
+                        ))
+                        .small(),
+                    );
+                });
+            } else if candidate.status != "NoLaunch" {
+                ui.label(
+                    RichText::new(format!(
+                        "{}: {}",
+                        candidate.label.as_deref().unwrap_or(&candidate.entry_id),
+                        candidate.reason
+                    ))
+                    .small()
+                    .weak(),
+                );
+            }
+            if let Some((state, message)) = &state
+                && state != "Starting"
+            {
+                ui.label(RichText::new(message).small());
+            }
+        }
+    }
     fn details(&mut self, ui: &mut egui::Ui, id: &str) {
         let Some(view) = self.snapshot.apps.iter().find(|v| v.app.id == id).cloned() else {
             self.selected_app = None;
@@ -543,7 +622,7 @@ impl Desktop {
                                         self.send(Command::Download {profile,release:release.release.id.clone(),association:item.association.id.clone(),kind:artifact.kind.clone()}); self.screen=Screen::Downloads;
                                     }
                                 });
-                                if let Some(c)=&convention && let Some(points)=&c.entry_points { for point in points { let target=match &point.target { EntryPointTarget::ArtifactFile=>"Artifact file".to_owned(),EntryPointTarget::TreeFile{path}=>format!("Tree path: {path}") }; ui.label(RichText::new(format!("Declared entry point: {} ({target}); launching unavailable",point.label.as_deref().unwrap_or(&point.id))).small().weak()); } }
+                                self.play_controls(ui,&item.association.id);
                                 egui::CollapsingHeader::new("Technical details").id_salt(&item.association.id).show(ui,|ui| {
                                     copy_line(ui,"Association ID",&item.association.id);
                                     if let Some(artifact)=&item.artifact { copy_line(ui,"Artifact ID",&artifact.id); }
@@ -694,6 +773,7 @@ impl Desktop {
                                 if ui.button("Open folder").clicked() {
                                     self.send(Command::Reveal(path.clone()));
                                 }
+                                self.play_controls(ui, &association);
                             });
                             egui::CollapsingHeader::new("Technical details")
                                 .id_salt(&association)
@@ -939,7 +1019,7 @@ impl Desktop {
             if self.settings_tab==SettingsTab::Diagnostics {
             section(ui,"Diagnostics & about",|ui| {
                 ui.label(format!("App Depot Desktop {}",env!("CARGO_PKG_VERSION")));
-                ui.label("Download and verification client. Installation and launching are unavailable.");
+                ui.label("Verified downloads and native portable launch on Linux. Installation remains unavailable.");
                 if let Some(p)=self.profile() {
                     egui::CollapsingHeader::new("Server technical details").show(ui,|ui| {
                         copy_line(ui,"Profile ID",&p.id.0);

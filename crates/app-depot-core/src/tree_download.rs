@@ -270,7 +270,10 @@ impl Library {
         self.job(&id)
     }
 
-    fn tree_inventory(&self, id: &str) -> Result<Option<Vec<InventoryEntry>>, LibraryError> {
+    pub(crate) fn tree_inventory(
+        &self,
+        id: &str,
+    ) -> Result<Option<Vec<InventoryEntry>>, LibraryError> {
         let raw: Option<String> = self.conn.query_row(
             "SELECT inventory_json FROM download_jobs WHERE id=?1",
             [id],
