@@ -255,9 +255,24 @@ fn downloads_and_resumes_real_tree_artifact() {
     drop(library);
     let mut library = Library::open(paths.clone()).unwrap();
     library.retry_job(&job.id).unwrap();
+    let paused = library.job(&job.id).unwrap();
+    let mut observations = Vec::new();
     assert_eq!(
-        library.run_tree_job(&client, &job.id, None).unwrap().state,
+        library
+            .run_tree_job_observed(&client, &job.id, None, &mut |event| observations
+                .push(event))
+            .unwrap()
+            .state,
         "Completed"
+    );
+    assert_eq!(
+        observations.iter().map(|event| event.network_bytes).max(),
+        Some(paused.expected_size - paused.progress)
+    );
+    assert!(
+        observations.iter().any(
+            |event| event.phase == app_depot_core::transfer::TransferPhase::PreparingLocalFiles
+        )
     );
     drop(library);
     let library = Library::open(paths).unwrap();

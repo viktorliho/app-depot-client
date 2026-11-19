@@ -1,5 +1,6 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 mod preferences;
+mod telemetry;
 mod views;
 mod worker;
 
@@ -18,6 +19,7 @@ use std::{
     path::PathBuf,
     time::{Duration, Instant},
 };
+use telemetry::LiveProgress;
 use worker::{AppView, ArtUse, Command, Event, Snapshot, Worker};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -68,7 +70,9 @@ struct Desktop {
     settings_tab: SettingsTab,
     selected_app: Option<String>,
     selected_job: Option<String>,
+    last_tree_details_refresh: Instant,
     tree_progress: HashMap<String, Vec<app_depot_core::tree_download::TreeFileProgress>>,
+    live_progress: HashMap<String, LiveProgress>,
     search: String,
     sort_desc: bool,
     prefs: Preferences,
@@ -113,7 +117,9 @@ impl Desktop {
             settings_tab: SettingsTab::Servers,
             selected_app: None,
             selected_job: None,
+            last_tree_details_refresh: Instant::now(),
             tree_progress: HashMap::new(),
+            live_progress: HashMap::new(),
             search: String::new(),
             sort_desc: false,
             prefs,
@@ -191,6 +197,7 @@ impl Desktop {
         self.active = Some(id.clone());
         self.selected_app = None;
         self.selected_job = None;
+        self.live_progress.clear();
         self.token.clear();
         self.token_visible = false;
         self.edit_name.clear();
@@ -256,6 +263,16 @@ impl Desktop {
                 }
                 Event::TreeFiles { job, files } => {
                     self.tree_progress.insert(job, files);
+                }
+                Event::Transfer {
+                    job,
+                    observation,
+                    at,
+                } => {
+                    self.live_progress
+                        .entry(job)
+                        .and_modify(|p| p.update(observation.clone(), at))
+                        .or_insert_with(|| LiveProgress::new(observation, at));
                 }
                 Event::Artwork {
                     profile,

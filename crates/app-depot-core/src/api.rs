@@ -122,7 +122,12 @@ impl ApiClient {
         if !valid_artifact_id(artifact_id) || !artifact_id.starts_with("adfile:sha256:") {
             return Err(ApiError::Config("invalid File Artifact ID".into()));
         }
-        self.binary_get(&["artifacts", artifact_id, "content"], offset, if_range)
+        self.binary_get(
+            &["artifacts", artifact_id, "content"],
+            offset,
+            if_range,
+            false,
+        )
     }
 
     fn binary_get(
@@ -130,12 +135,16 @@ impl ApiClient {
         segments: &[&str],
         offset: Option<u64>,
         if_range: Option<&str>,
+        close_after_response: bool,
     ) -> Result<ureq::Response, ApiError> {
         let url = self.url(segments, None, None)?;
         let mut request = self
             .agent
             .get(url.as_str())
             .set("Accept", "application/octet-stream");
+        if close_after_response {
+            request = request.set("Connection", "close");
+        }
         if let Some(token) = &self.token {
             request = request.set("Authorization", &format!("Bearer {token}"));
         }
@@ -184,6 +193,7 @@ impl ApiClient {
         file_id: &str,
         offset: Option<u64>,
         if_range: Option<&str>,
+        expected_size: u64,
     ) -> Result<ureq::Response, ApiError> {
         if !valid_artifact_id(artifact_id)
             || !artifact_id.starts_with("adtree:v1:sha256:")
@@ -195,6 +205,7 @@ impl ApiClient {
             &["artifacts", artifact_id, "files", file_id],
             offset,
             if_range,
+            self.base.scheme() == "http" && expected_size <= 64 * 1024,
         )
     }
 

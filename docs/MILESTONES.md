@@ -18,6 +18,8 @@ M1.5 implements a native egui desktop app with Catalog grid/table and details, o
 
 M1.5.1 redesigns the desktop around first-run Server connection, guided personal-token setup, automatic offline-first catalog refresh, responsive App cards/details, an App-centric verified Library, readable durable Downloads and grouped Settings. System theme and compact presentation preferences persist locally without storing credentials. No automatic Artifact download, installation or launch is introduced.
 
+M1.5.2 adds bounded live transfer observations, measured speed and conditional ETA, Tree member counts/current path, clearer processing states and actionable errors in Downloads. It reduces small-file latency on the measured HTTP Dev/Test Server and avoids repeated full Tree progress scans and unnecessary small-member staging synchronizations. Recovery remains based on durable SQLite checkpoints and verified objects. Tree transfer remains sequential; Windows/macOS performance and desktop behavior remain unvalidated.
+
 Implement a shared core transport, declaration reader, transfer engine and local library; expose a small diagnostic CLI and an egui desktop browser on Linux. Windows/macOS paths and adapters must compile or be clearly tracked as later platform validation. All M1 operations use existing Server read APIs. No install, runtime preparation or launch implementation.
 
 Acceptance criteria:

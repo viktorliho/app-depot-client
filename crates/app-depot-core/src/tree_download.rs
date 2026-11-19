@@ -6,8 +6,8 @@ use crate::{
     library::{Library, LibraryError, now},
     models::InventoryEntry,
     transfer::{
-        BlobOutcome, BlobSpec, DownloadJob, existing_dir, hash_file, open_regular, private_dir,
-        receive_blob, safe_regular, sync_dir,
+        BlobOutcome, BlobSpec, DownloadJob, TransferObservation, TransferPhase, existing_dir,
+        hash_file, open_regular, private_dir, receive_blob, safe_regular, sync_dir,
     },
     tree::{identity, validate_destination},
 };
@@ -15,6 +15,7 @@ use rusqlite::params;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::{
+    collections::HashMap,
     fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
@@ -367,12 +368,59 @@ impl Library {
         etag: Option<&str>,
     ) -> Result<bool, LibraryError> {
         file.sync_all()?;
-        self.conn.execute("UPDATE tree_files SET progress=?3,checkpoint_hash=?4,etag=?5 WHERE job_id=?1 AND path=?2",params![job_id,path,len as i64,format!("{:x}",hash.clone().finalize()),etag])?;
-        self.conn.execute("UPDATE download_jobs SET progress=(SELECT COALESCE(sum(progress),0) FROM tree_files WHERE job_id=?1),updated_at=?2 WHERE id=?1",params![job_id,now()?])?;
+        sync_dir(&stage_root(self, job_id)?.join("files"))?;
+        let tx = self.conn.transaction()?;
+        let (previous, size): (i64, i64) = tx.query_row(
+            "SELECT progress,size FROM tree_files WHERE job_id=?1 AND path=?2",
+            params![job_id, path],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let next = i64::try_from(len).map_err(|_| invalid("Tree member progress overflow"))?;
+        if previous < 0 || previous > size || next > size {
+            return Err(invalid("invalid Tree member progress"));
+        }
+        tx.execute("UPDATE tree_files SET progress=?3,checkpoint_hash=?4,etag=?5 WHERE job_id=?1 AND path=?2",params![job_id,path,next,format!("{:x}",hash.clone().finalize()),etag])?;
+        if tx.execute("UPDATE download_jobs SET progress=progress+?2,updated_at=?3 WHERE id=?1 AND progress+?2 BETWEEN 0 AND expected_size",params![job_id,next-previous,now()?])? != 1 { return Err(invalid("invalid aggregate Tree progress")); }
+        tx.commit()?;
         Ok(matches!(
             self.job(job_id)?.state.as_str(),
             "Paused" | "Cancelled"
         ))
+    }
+
+    fn mark_tree_file_verified(&mut self, job_id: &str, path: &str) -> Result<(), LibraryError> {
+        let tx = self.conn.transaction()?;
+        let (size, previous): (i64, i64) = tx.query_row(
+            "SELECT size,progress FROM tree_files WHERE job_id=?1 AND path=?2",
+            params![job_id, path],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if previous < 0 || previous > size {
+            return Err(invalid("invalid Tree member progress"));
+        }
+        tx.execute(
+            "UPDATE tree_files SET verified=1,progress=size WHERE job_id=?1 AND path=?2",
+            params![job_id, path],
+        )?;
+        if tx.execute("UPDATE download_jobs SET progress=progress+?2,updated_at=?3 WHERE id=?1 AND progress+?2 BETWEEN 0 AND expected_size",params![job_id,size-previous,now()?])? != 1 { return Err(invalid("invalid aggregate Tree progress")); }
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn reset_missing_tree_file(&mut self, job_id: &str, path: &str) -> Result<(), LibraryError> {
+        let tx = self.conn.transaction()?;
+        let progress: i64 = tx.query_row(
+            "SELECT progress FROM tree_files WHERE job_id=?1 AND path=?2",
+            params![job_id, path],
+            |row| row.get(0),
+        )?;
+        if progress < 0 {
+            return Err(invalid("invalid Tree member progress"));
+        }
+        tx.execute("UPDATE tree_files SET verified=0,progress=0,checkpoint_hash=NULL,etag=NULL WHERE job_id=?1 AND path=?2", params![job_id,path])?;
+        if tx.execute("UPDATE download_jobs SET progress=progress-?2,updated_at=?3 WHERE id=?1 AND progress>=?2",params![job_id,progress,now()?])? != 1 { return Err(invalid("invalid aggregate Tree progress")); }
+        tx.commit()?;
+        Ok(())
     }
 
     fn prepare_tree_stage(
@@ -388,9 +436,22 @@ impl Library {
             OpenOptions::new()
                 .write(true)
                 .create_new(true)
-                .open(&stage)?
-                .sync_all()?;
-            sync_dir(stage.parent().unwrap())?;
+                .open(&stage)?;
+        }
+        // Promotion may have been interrupted after making staging immutable but before the
+        // object link became durable. Reopen by descriptor and restore write access for resume.
+        let existing = open_regular(&stage, false)?;
+        let mut permissions = existing.metadata()?.permissions();
+        if permissions.readonly() {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                permissions.set_mode(0o600);
+            }
+            #[cfg(not(unix))]
+            permissions.set_readonly(false);
+            existing.set_permissions(permissions)?;
+            existing.sync_all()?;
         }
         let mut file = open_regular(&stage, true)?;
         let (progress, checkpoint, etag): (i64, Option<String>, Option<String>) =
@@ -437,12 +498,17 @@ impl Library {
         Ok((file, len, hash, validator))
     }
 
+    #[allow(clippy::too_many_arguments)] // Transfer context and observation counters are kept separate from durable job state.
     fn obtain_tree_file(
         &mut self,
         client: &ApiClient,
         job_id: &str,
         entry: &InventoryEntry,
         pause_after: Option<u64>,
+        observer: &mut dyn FnMut(TransferObservation),
+        network_bytes: &mut u64,
+        files_done: usize,
+        files_total: usize,
     ) -> Result<bool, LibraryError> {
         let InventoryEntry::File {
             path,
@@ -460,22 +526,16 @@ impl Library {
             if hash_file(&object, *size)? != *sha256 {
                 return Err(invalid("existing object conflicts with Tree file identity"));
             }
-            self.conn.execute(
-                "UPDATE tree_files SET verified=1,progress=size WHERE job_id=?1 AND path=?2",
-                params![job_id, path],
-            )?;
-            self.conn.execute("UPDATE download_jobs SET progress=(SELECT COALESCE(sum(progress),0) FROM tree_files WHERE job_id=?1),updated_at=?2 WHERE id=?1",params![job_id,now()?])?;
+            self.mark_tree_file_verified(job_id, path)?;
             return Ok(false);
         }
         let free = fs2::available_space(&self.paths.content)?;
-        if free
-            < size.saturating_sub(
-                self.tree_files(job_id)?
-                    .iter()
-                    .find(|f| f.path == *path)
-                    .map_or(0, |f| f.progress),
-            )
-        {
+        let progress: i64 = self.conn.query_row(
+            "SELECT progress FROM tree_files WHERE job_id=?1 AND path=?2",
+            params![job_id, path],
+            |row| row.get(0),
+        )?;
+        if progress < 0 || free < size.saturating_sub(progress as u64) {
             return Err(invalid("insufficient content-root space"));
         }
         let (mut file, offset, hash, etag) =
@@ -498,11 +558,20 @@ impl Library {
                     self.prepare_tree_stage(job_id, path, file_id, *size)?
                 };
                 let result = (|| {
+                    observer(TransferObservation {
+                        phase: TransferPhase::WaitingForServer,
+                        network_bytes: *network_bytes,
+                        received_bytes: job.progress,
+                        current_file: Some(path.clone()),
+                        files_done,
+                        files_total,
+                    });
                     let response = client.tree_file_content(
                         &job.artifact_id,
                         file_id,
                         (offset > 0).then_some(offset),
                         etag.as_deref(),
+                        *size,
                     )?;
                     receive_blob(
                         response,
@@ -514,8 +583,23 @@ impl Library {
                             expected_digest: sha256,
                             prior_etag: etag.as_deref(),
                             pause_after: local_pause,
+                            checkpoint_on_complete: *size > 64 * 1024,
                         },
                         |f, n, h, e| self.tree_checkpoint(job_id, path, f, n, h, e),
+                        |count, received| {
+                            *network_bytes = network_bytes.saturating_add(count);
+                            observer(TransferObservation {
+                                phase: TransferPhase::Downloading,
+                                network_bytes: *network_bytes,
+                                received_bytes: job
+                                    .progress
+                                    .saturating_sub(offset)
+                                    .saturating_add(received),
+                                current_file: Some(path.clone()),
+                                files_done,
+                                files_total,
+                            });
+                        },
                     )
                 })();
                 match result {
@@ -545,29 +629,49 @@ impl Library {
             }
         }
         let stage = child_stage(self, job_id, file_id)?;
+        observer(TransferObservation {
+            phase: TransferPhase::Verifying,
+            network_bytes: *network_bytes,
+            received_bytes: job.progress.saturating_sub(offset).saturating_add(*size),
+            current_file: Some(path.clone()),
+            files_done,
+            files_total,
+        });
         if hash_file(&stage, *size)? != *sha256 {
             return Err(invalid("staging identity mismatch"));
         }
         private_dir(object.parent().unwrap())?;
-        open_regular(&stage, false)?.sync_all()?;
-        match fs::hard_link(&stage, &object) {
-            Ok(()) => sync_dir(object.parent().unwrap())?,
+        let verified_stage = open_regular(&stage, false)?;
+        let mut permissions = verified_stage.metadata()?.permissions();
+        permissions.set_readonly(true);
+        verified_stage.set_permissions(permissions)?;
+        verified_stage.sync_all()?;
+        let newly_linked = match fs::hard_link(&stage, &object) {
+            Ok(()) => {
+                sync_dir(object.parent().unwrap())?;
+                true
+            }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                 if hash_file(&object, *size)? != *sha256 {
                     return Err(invalid("existing object conflicts with Tree file identity"));
                 }
+                false
             }
             Err(error) => return Err(error.into()),
+        };
+        let linked = open_regular(&object, false)?;
+        #[cfg(unix)]
+        if newly_linked {
+            use std::os::unix::fs::MetadataExt;
+            let source = verified_stage.metadata()?;
+            let target = linked.metadata()?;
+            if source.dev() != target.dev() || source.ino() != target.ino() {
+                return Err(invalid("Tree object changed during promotion"));
+            }
         }
-        let mut permissions = fs::metadata(&object)?.permissions();
-        permissions.set_readonly(true);
-        fs::set_permissions(&object, permissions)?;
-        open_regular(&object, false)?.sync_all()?;
-        self.conn.execute(
-            "UPDATE tree_files SET verified=1,progress=size WHERE job_id=?1 AND path=?2",
-            params![job_id, path],
-        )?;
-        self.conn.execute("UPDATE download_jobs SET progress=(SELECT COALESCE(sum(progress),0) FROM tree_files WHERE job_id=?1),updated_at=?2 WHERE id=?1",params![job_id,now()?])?;
+        #[cfg(not(unix))]
+        let _ = newly_linked;
+        self.mark_tree_file_verified(job_id, path)?;
         Ok(false)
     }
 
@@ -856,6 +960,17 @@ impl Library {
         id: &str,
         pause_after: Option<u64>,
     ) -> Result<DownloadJob, LibraryError> {
+        self.run_tree_job_observed(client, id, pause_after, &mut |_| {})
+    }
+
+    pub fn run_tree_job_observed(
+        &mut self,
+        client: &ApiClient,
+        id: &str,
+        pause_after: Option<u64>,
+        observer: &mut dyn FnMut(TransferObservation),
+    ) -> Result<DownloadJob, LibraryError> {
+        let mut network_bytes = 0;
         let _lock = self.lock_job(id)?;
         let job = self.job(id)?;
         if !job.artifact_id.starts_with("adtree:v1:sha256:") {
@@ -880,7 +995,21 @@ impl Library {
             if artifact.kind != "Tree" {
                 return Err(invalid("remote Tree Artifact metadata changed"));
             }
+            observer(TransferObservation {
+                phase: TransferPhase::PreparingInventory,
+                network_bytes,
+                received_bytes: job.progress,
+                current_file: None,
+                files_done: 0,
+                files_total: 0,
+            });
             let entries = self.fetch_tree_inventory(client, &job)?;
+            let files_total = entries
+                .iter()
+                .filter(|entry| matches!(entry, InventoryEntry::File { .. }))
+                .count();
+            let total_bytes = self.job(id)?.expected_size;
+            let mut files_done = 0;
             if matches!(self.job(id)?.state.as_str(), "Queued" | "FetchingInventory") {
                 self.state(id, "Downloading", None)?;
             }
@@ -888,28 +1017,30 @@ impl Library {
                 "UPDATE download_jobs SET attempts=attempts+1,updated_at=?2 WHERE id=?1",
                 params![id, now()?],
             )?;
+            let completed: HashMap<String, bool> = self
+                .tree_files(id)?
+                .into_iter()
+                .map(|file| (file.path, file.verified))
+                .collect();
             for entry in &entries {
                 if self.job(id)?.state != "Downloading" {
                     return self.job(id);
                 }
-                let already = self
-                    .tree_files(id)?
-                    .iter()
-                    .find(|f| f.path == entry.path())
-                    .is_some_and(|f| f.verified);
+                let already = completed.get(entry.path()).copied().unwrap_or(false);
                 if already
                     && let InventoryEntry::File {
                         path, size, sha256, ..
                     } = entry
                 {
                     let object = self.object(&format!("adfile:sha256:{sha256}"))?;
-                    if safe_regular(&object)? && hash_file(&object, *size)? == *sha256 {
-                        continue;
+                    if safe_regular(&object)? {
+                        if hash_file(&object, *size)? == *sha256 {
+                            files_done += 1;
+                            continue;
+                        }
+                        return Err(invalid("existing object conflicts with Tree file identity"));
                     }
-                    self.conn.execute(
-                        "UPDATE tree_files SET verified=0 WHERE job_id=?1 AND path=?2",
-                        params![id, path],
-                    )?;
+                    self.reset_missing_tree_file(id, path)?;
                 }
                 let limit = pause_after
                     .map(|limit| limit.saturating_sub(self.job(id).map_or(0, |j| j.progress)));
@@ -917,8 +1048,20 @@ impl Library {
                     self.state(id, "Paused", None)?;
                     return self.job(id);
                 }
-                if self.obtain_tree_file(client, id, entry, limit)? {
+                if self.obtain_tree_file(
+                    client,
+                    id,
+                    entry,
+                    limit,
+                    observer,
+                    &mut network_bytes,
+                    files_done,
+                    files_total,
+                )? {
                     return self.job(id);
+                }
+                if matches!(entry, InventoryEntry::File { .. }) {
+                    files_done += 1;
                 }
             }
             if self
@@ -929,10 +1072,26 @@ impl Library {
                 return Err(invalid("Tree member incomplete"));
             }
             self.transition(id, "Downloading", "Verifying")?;
+            observer(TransferObservation {
+                phase: TransferPhase::Verifying,
+                network_bytes,
+                received_bytes: total_bytes,
+                current_file: None,
+                files_done,
+                files_total,
+            });
             if identity(&entries)? != job.artifact_id {
                 return Err(invalid("Tree identity mismatch"));
             }
             self.transition(id, "Verifying", "Committing")?;
+            observer(TransferObservation {
+                phase: TransferPhase::PreparingLocalFiles,
+                network_bytes,
+                received_bytes: total_bytes,
+                current_file: None,
+                files_done,
+                files_total,
+            });
             self.complete_tree(&self.job(id)?, &entries)?;
             self.job(id)
         })();
@@ -1077,6 +1236,98 @@ mod tests {
             fs::write(&object, bytes).unwrap();
         }
         (root, library, job, entries)
+    }
+    #[test]
+    fn tree_member_checkpoints_update_aggregate_by_exact_delta() {
+        let (_root, mut library, job, entries) = fixture();
+        for entry in &entries {
+            if let InventoryEntry::File {
+                path,
+                file_id,
+                size,
+                sha256,
+                executable,
+            } = entry
+            {
+                library.conn.execute("INSERT INTO tree_files(job_id,path,file_id,size,sha256,executable) VALUES (?1,?2,?3,?4,?5,?6)", params![job.id,path,file_id,*size as i64,sha256,i64::from(*executable)]).unwrap();
+            }
+        }
+        let (path, file_id) = match &entries[0] {
+            InventoryEntry::File { path, file_id, .. } => (path, file_id),
+            _ => unreachable!(),
+        };
+        let stage = child_stage(&library, &job.id, file_id).unwrap();
+        private_dir(&stage_root(&library, &job.id).unwrap()).unwrap();
+        private_dir(stage.parent().unwrap()).unwrap();
+        fs::write(&stage, b"A").unwrap();
+        let file = open_regular(&stage, true).unwrap();
+        let mut hash = Sha256::new();
+        hash.update(b"A");
+        library
+            .tree_checkpoint(&job.id, path, &file, 1, &hash, Some("\"validator\""))
+            .unwrap();
+        assert_eq!(library.job(&job.id).unwrap().progress, 1);
+        library
+            .tree_checkpoint(&job.id, path, &file, 1, &hash, Some("\"validator\""))
+            .unwrap();
+        assert_eq!(library.job(&job.id).unwrap().progress, 1);
+        library.mark_tree_file_verified(&job.id, path).unwrap();
+        assert_eq!(library.job(&job.id).unwrap().progress, 1);
+        assert!(library.tree_files(&job.id).unwrap()[0].verified);
+
+        let second_path = match &entries[2] {
+            InventoryEntry::File { path, .. } => path,
+            _ => unreachable!(),
+        };
+        library
+            .mark_tree_file_verified(&job.id, second_path)
+            .unwrap();
+        assert_eq!(library.job(&job.id).unwrap().progress, 2);
+        assert!(
+            library
+                .tree_checkpoint(&job.id, path, &file, 2, &hash, None)
+                .is_err()
+        );
+        assert_eq!(library.job(&job.id).unwrap().progress, 2);
+        library.reset_missing_tree_file(&job.id, path).unwrap();
+        assert_eq!(library.job(&job.id).unwrap().progress, 1);
+        let reset = library
+            .tree_files(&job.id)
+            .unwrap()
+            .into_iter()
+            .find(|member| member.path == *path)
+            .unwrap();
+        assert_eq!(reset.progress, 0);
+        assert!(!reset.verified);
+        library.mark_tree_file_verified(&job.id, path).unwrap();
+        assert_eq!(library.job(&job.id).unwrap().progress, 2);
+    }
+    #[test]
+    fn interrupted_readonly_tree_stage_is_writable_on_resume() {
+        let (_root, mut library, job, entries) = fixture();
+        let (path, file_id, digest) = match &entries[0] {
+            InventoryEntry::File {
+                path,
+                file_id,
+                sha256,
+                ..
+            } => (path, file_id, sha256),
+            _ => unreachable!(),
+        };
+        library.conn.execute("INSERT INTO tree_files(job_id,path,file_id,size,sha256,executable,progress,checkpoint_hash) VALUES (?1,?2,?3,1,?4,0,1,?4)", params![job.id,path,file_id,digest]).unwrap();
+        let stage = child_stage(&library, &job.id, file_id).unwrap();
+        private_dir(&stage_root(&library, &job.id).unwrap()).unwrap();
+        private_dir(stage.parent().unwrap()).unwrap();
+        fs::write(&stage, b"A").unwrap();
+        let file = open_regular(&stage, false).unwrap();
+        let mut permissions = file.metadata().unwrap().permissions();
+        permissions.set_readonly(true);
+        file.set_permissions(permissions).unwrap();
+        let (file, offset, _, _) = library
+            .prepare_tree_stage(&job.id, path, file_id, 1)
+            .unwrap();
+        assert_eq!(offset, 1);
+        assert!(!file.metadata().unwrap().permissions().readonly());
     }
     #[test]
     fn atomic_tree_completion_and_offline_verification() {

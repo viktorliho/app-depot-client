@@ -1,4 +1,5 @@
 use super::*;
+use app_depot_core::transfer::TransferPhase;
 
 impl Desktop {
     fn header(&self, ui: &mut egui::Ui, title: &str, subtitle: &str) {
@@ -727,6 +728,9 @@ impl Desktop {
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 for job in jobs.iter().rev() {
+                    let live = self.live_progress.get(&job.id).cloned().filter(|_| matches!(job.state.as_str(), "Downloading" | "FetchingInventory" | "Verifying" | "Committing"));
+                    let now = Instant::now();
+                    let received = live.as_ref().map_or(job.progress, |p| p.observation.received_bytes.max(job.progress)).min(job.expected_size);
                     let context = self
                         .snapshot
                         .apps
@@ -761,7 +765,7 @@ impl Desktop {
                                     ui.label(
                                         RichText::new(format!(
                                             "{release} · {kind} · {}",
-                                            friendly_job_state(&job.state)
+                                            live.as_ref().map_or(friendly_job_state(&job.state), |p| phase_label(p.observation.phase, &job.state))
                                         ))
                                         .small()
                                         .weak(),
@@ -776,13 +780,13 @@ impl Desktop {
                             ui.label(
                                 RichText::new(format!(
                                     "{} of {}",
-                                    format_bytes(job.progress),
+                                    format_bytes(received),
                                     format_bytes(job.expected_size)
                                 ))
                                 .small(),
                             );
                             if job.expected_size > 0 {
-                                let ratio = (job.progress as f64 / job.expected_size as f64)
+                                let ratio = (received as f64 / job.expected_size as f64)
                                     .clamp(0.0, 1.0)
                                     as f32;
                                 ui.add(
@@ -794,8 +798,30 @@ impl Desktop {
                                     .desired_width(ui.available_width().min(460.0)),
                                 );
                             }
+                            if let Some(live) = live.as_ref() {
+                                ui.horizontal_wrapped(|ui| {
+                                    if let Some(speed) = live.speed(now) {
+                                        ui.label(format!("{}/s", format_bytes(speed as u64)));
+                                        ui.label(live.eta(job.expected_size, now).map_or("Time remaining: estimating…".to_owned(), |eta| format!("About {} remaining", format_duration(eta))));
+                                    } else if live.stalled(now) {
+                                        ui.label("Waiting for activity — the server or local storage may be busy");
+                                    } else if live.observation.phase == TransferPhase::Downloading {
+                                        ui.label("Measuring transfer speed…");
+                                    }
+                                    if live.observation.files_total > 1 {
+                                        ui.label(format!("{} of {} files", live.observation.files_done, live.observation.files_total));
+                                    }
+                                });
+                                if let Some(path) = &live.observation.current_file {
+                                    ui.label(RichText::new(format!("Current file: {}", truncate(path, 100))).small().weak());
+                                }
+                            }
                             if let Some(e) = &job.last_error {
-                                ui.colored_label(Color32::from_rgb(210, 95, 95), e);
+                                if job.state == "Paused" && e.contains("interrupted") {
+                                    ui.label(RichText::new("Transfer was interrupted. Resume to validate saved bytes and continue.").small().weak());
+                                } else if job.state == "Failed" {
+                                    ui.colored_label(Color32::from_rgb(210, 95, 95), friendly_download_error(e));
+                                }
                             }
                             if kind == "Directory" {
                                 if ui
@@ -812,13 +838,14 @@ impl Desktop {
                                         self.selected_job = None;
                                     } else {
                                         self.selected_job = Some(job.id.clone());
+                                        self.last_tree_details_refresh = Instant::now();
                                         self.send(Command::TreeFiles(job.id.clone()));
                                     }
                                 }
                                 if self.selected_job.as_deref() == Some(&job.id)
                                     && let Some(files) = self.tree_progress.get(&job.id)
                                 {
-                                    for f in files {
+                                    egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| for f in files.iter().filter(|f| !f.verified).take(20) {
                                         ui.label(
                                             RichText::new(format!(
                                                 "{} · {} of {}{}",
@@ -829,7 +856,9 @@ impl Desktop {
                                             ))
                                             .small(),
                                         );
-                                    }
+                                    });
+                                    let complete = files.iter().filter(|f| f.verified).count();
+                                    ui.label(RichText::new(format!("{complete} of {} files verified; showing up to 20 unfinished members", files.len())).small().weak());
                                 }
                             }
                             egui::CollapsingHeader::new("Technical details")
@@ -838,6 +867,8 @@ impl Desktop {
                                     copy_line(ui, "Job ID", &job.id);
                                     copy_line(ui, "Artifact ID", &job.artifact_id);
                                     copy_line(ui, "Association ID", &job.association_id);
+                                    copy_line(ui, "Durable checkpoint", &format_bytes(job.progress));
+                                    if let Some(error) = &job.last_error { ui.label(RichText::new(error).small().monospace()); }
                                 });
                         });
                     ui.add_space(8.0);
@@ -1077,6 +1108,60 @@ fn format_bytes(bytes: u64) -> String {
         format!("{amount:.1} {unit}")
     }
 }
+fn format_duration(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+    if seconds < 60 {
+        format!("{} s", seconds.max(1))
+    } else if seconds < 3600 {
+        format!("{} min", (seconds + 30) / 60)
+    } else {
+        format!("{} h {} min", seconds / 3600, (seconds % 3600) / 60)
+    }
+}
+fn phase_label(phase: TransferPhase, state: &str) -> &'static str {
+    if state == "Completed" {
+        return "Downloaded and verified";
+    }
+    match phase {
+        TransferPhase::PreparingInventory => "Preparing file list",
+        TransferPhase::WaitingForServer => "Waiting for server",
+        TransferPhase::Downloading => "Downloading",
+        TransferPhase::Verifying => "Verifying content",
+        TransferPhase::PreparingLocalFiles => "Preparing local files",
+        TransferPhase::SavingVerifiedContent => "Saving verified content",
+    }
+}
+fn friendly_download_error(error: &str) -> &'static str {
+    let lower = error.to_ascii_lowercase();
+    if lower.contains("sha-256") || lower.contains("identity mismatch") || lower.contains("digest")
+    {
+        "Integrity check failed. Retry the download; the saved bytes were not accepted."
+    } else if lower.contains("insufficient") && lower.contains("space") {
+        "Not enough free space in the content library."
+    } else if lower.contains("401") || lower.contains("unauthorized") {
+        "Sign in again with a valid server token."
+    } else if lower.contains("403") || lower.contains("forbidden") {
+        "This account cannot access the artifact."
+    } else if lower.contains("429")
+        || lower.contains("503")
+        || lower.contains("502")
+        || lower.contains("504")
+    {
+        "The server is temporarily unavailable. Try again later."
+    } else if lower.contains("transport")
+        || lower.contains("connect")
+        || lower.contains("timed out")
+    {
+        "Connection interrupted. Retry when the server is reachable."
+    } else if lower.contains("unsafe")
+        || lower.contains("unsupported")
+        || lower.contains("invalid tree")
+    {
+        "This artifact cannot be saved safely on this filesystem."
+    } else {
+        "Download failed. Open Technical details for the diagnostic message."
+    }
+}
 fn truncate(text: &str, max_chars: usize) -> String {
     let mut chars = text.chars();
     let prefix: String = chars.by_ref().take(max_chars).collect();
@@ -1155,6 +1240,17 @@ fn open_account(ctx: &egui::Context, url: &str) {
 impl eframe::App for Desktop {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll(ctx);
+        if let Some(id) = self.selected_job.clone()
+            && self.last_tree_details_refresh.elapsed() >= Duration::from_secs(1)
+            && self
+                .snapshot
+                .jobs
+                .iter()
+                .any(|job| job.id == id && job.state == "Downloading")
+        {
+            self.send(Command::TreeFiles(id));
+            self.last_tree_details_refresh = Instant::now();
+        }
         let focused = ctx.input(|i| i.viewport().focused.unwrap_or(false));
         if focused && !self.last_focus && self.last_activation.elapsed() > Duration::from_secs(600)
         {

@@ -6,7 +6,7 @@ use app_depot_core::{
     library::{Library, LibraryPaths, Profile},
     models::{App, Artifact, Association, DeclarationSnapshot, Release},
     secrets::{NativeSecrets, SecretStore},
-    transfer::{DownloadJob, VerifiedFile},
+    transfer::{DownloadJob, TransferObservation, TransferPhase, VerifiedFile},
     tree_download::{TreeFileProgress, VerifiedTree},
 };
 use eframe::egui;
@@ -121,6 +121,11 @@ pub enum Event {
     TreeFiles {
         job: String,
         files: Vec<TreeFileProgress>,
+    },
+    Transfer {
+        job: String,
+        observation: TransferObservation,
+        at: Instant,
     },
     Artwork {
         profile: ServerProfileId,
@@ -693,11 +698,41 @@ fn start_job(
                 memory.insert(profile.id.0.clone(), token);
             }
             let api = client(&profile, &memory)?;
+            let mut last_sent = Instant::now() - Duration::from_secs(1);
+            let mut observe = |observation: TransferObservation| {
+                let at = Instant::now();
+                let important = matches!(
+                    observation.phase,
+                    TransferPhase::PreparingInventory
+                        | TransferPhase::PreparingLocalFiles
+                        | TransferPhase::SavingVerifiedContent
+                ) || (observation.phase == TransferPhase::Verifying
+                    && observation.files_done == observation.files_total);
+                let interval = if observation.phase == TransferPhase::Downloading {
+                    Duration::from_millis(150)
+                } else if observation.phase == TransferPhase::WaitingForServer {
+                    Duration::from_secs(2)
+                } else {
+                    Duration::from_millis(500)
+                };
+                if important || at.duration_since(last_sent) >= interval {
+                    last_sent = at;
+                    send(
+                        &tx,
+                        &ctx,
+                        Event::Transfer {
+                            job: job.id.clone(),
+                            observation,
+                            at,
+                        },
+                    );
+                }
+            };
             if job.artifact_id.starts_with("adtree:") {
-                lib.run_tree_job(&api, &job.id, None)
+                lib.run_tree_job_observed(&api, &job.id, None, &mut observe)
                     .map_err(|e| e.to_string())?;
             } else {
-                lib.run_file_job(&api, &job.id, None)
+                lib.run_file_job_observed(&api, &job.id, None, &mut observe)
                     .map_err(|e| e.to_string())?;
             }
             Ok(())

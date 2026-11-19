@@ -21,6 +21,27 @@ use uuid::Uuid;
 const CHUNK: usize = 64 * 1024;
 const CHECKPOINT: u64 = 4 * 1024 * 1024;
 
+/// Ephemeral observations. They are never recovery checkpoints or proof of verification.
+#[derive(Clone, Debug)]
+pub struct TransferObservation {
+    pub phase: TransferPhase,
+    pub network_bytes: u64,
+    pub received_bytes: u64,
+    pub current_file: Option<String>,
+    pub files_done: usize,
+    pub files_total: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransferPhase {
+    PreparingInventory,
+    WaitingForServer,
+    Downloading,
+    Verifying,
+    PreparingLocalFiles,
+    SavingVerifiedContent,
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DownloadJob {
@@ -175,6 +196,7 @@ pub(crate) struct BlobSpec<'a> {
     pub expected_digest: &'a str,
     pub prior_etag: Option<&'a str>,
     pub pause_after: Option<u64>,
+    pub checkpoint_on_complete: bool,
 }
 
 /// Shared bounded Range/If-Range receiver for standalone and Tree member files.
@@ -185,12 +207,14 @@ pub(crate) fn receive_blob(
     mut hash: Sha256,
     spec: BlobSpec<'_>,
     mut checkpoint: impl FnMut(&File, u64, &Sha256, Option<&str>) -> Result<bool, LibraryError>,
+    mut observe_bytes: impl FnMut(u64, u64),
 ) -> Result<BlobOutcome, LibraryError> {
     let BlobSpec {
         expected_size,
         expected_digest,
         prior_etag,
         pause_after,
+        checkpoint_on_complete,
     } = spec;
     let status = response.status();
     if status == 416 {
@@ -266,6 +290,7 @@ pub(crate) fn receive_blob(
         hash.update(&buf[..count]);
         offset += count as u64;
         since += count as u64;
+        observe_bytes(count as u64, offset);
         if since >= CHECKPOINT || pause_after.is_some_and(|limit| offset >= limit) {
             let stopped = checkpoint(file, offset, &hash, Some(&etag))?;
             since = 0;
@@ -274,7 +299,9 @@ pub(crate) fn receive_blob(
             }
         }
     }
-    checkpoint(file, offset, &hash, Some(&etag))?;
+    if checkpoint_on_complete {
+        checkpoint(file, offset, &hash, Some(&etag))?;
+    }
     let mut extra = [0u8; 1];
     if reader
         .read(&mut extra)
@@ -616,10 +643,20 @@ impl Library {
         client: &ApiClient,
         id: &str,
         pause_after: Option<u64>,
+        observer: &mut dyn FnMut(TransferObservation),
+        network_bytes: &mut u64,
     ) -> Result<(), LibraryError> {
         let job = self.job(id)?;
         let (mut file, offset, hash) = self.prepare_stage(&job)?;
         if offset == job.expected_size {
+            observer(TransferObservation {
+                phase: TransferPhase::Verifying,
+                network_bytes: *network_bytes,
+                received_bytes: job.progress,
+                current_file: None,
+                files_done: 0,
+                files_total: 1,
+            });
             if !self.transition(id, "Downloading", "Verifying")? {
                 return Ok(());
             }
@@ -630,8 +667,24 @@ impl Library {
                 return Err(invalid("SHA-256 mismatch"));
             }
             self.transition(id, "Verifying", "Committing")?;
+            observer(TransferObservation {
+                phase: TransferPhase::SavingVerifiedContent,
+                network_bytes: *network_bytes,
+                received_bytes: job.progress,
+                current_file: None,
+                files_done: 1,
+                files_total: 1,
+            });
             return self.commit_file(&job);
         }
+        observer(TransferObservation {
+            phase: TransferPhase::WaitingForServer,
+            network_bytes: *network_bytes,
+            received_bytes: job.progress,
+            current_file: None,
+            files_done: 0,
+            files_total: 1,
+        });
         let response = client.file_content(
             &job.artifact_id,
             (offset > 0).then_some(offset),
@@ -647,6 +700,7 @@ impl Library {
                 expected_digest: digest(&job.artifact_id)?,
                 prior_etag: job.etag.as_deref(),
                 pause_after,
+                checkpoint_on_complete: true,
             },
             |file, len, hash, etag| {
                 self.checkpoint(id, file, len, hash, etag)?;
@@ -654,6 +708,17 @@ impl Library {
                     self.job(id)?.state.as_str(),
                     "Paused" | "Cancelled"
                 ))
+            },
+            |count, received| {
+                *network_bytes = network_bytes.saturating_add(count);
+                observer(TransferObservation {
+                    phase: TransferPhase::Downloading,
+                    network_bytes: *network_bytes,
+                    received_bytes: received,
+                    current_file: None,
+                    files_done: 0,
+                    files_total: 1,
+                });
             },
         )?;
         if matches!(result, BlobOutcome::Stopped) {
@@ -668,7 +733,23 @@ impl Library {
         if !self.transition(id, "Downloading", "Verifying")? {
             return Ok(());
         }
+        observer(TransferObservation {
+            phase: TransferPhase::Verifying,
+            network_bytes: *network_bytes,
+            received_bytes: job.expected_size,
+            current_file: None,
+            files_done: 1,
+            files_total: 1,
+        });
         self.transition(id, "Verifying", "Committing")?;
+        observer(TransferObservation {
+            phase: TransferPhase::SavingVerifiedContent,
+            network_bytes: *network_bytes,
+            received_bytes: job.expected_size,
+            current_file: None,
+            files_done: 1,
+            files_total: 1,
+        });
         self.commit_file(&job)
     }
     pub fn run_file_job(
@@ -677,6 +758,17 @@ impl Library {
         id: &str,
         pause_after: Option<u64>,
     ) -> Result<DownloadJob, LibraryError> {
+        self.run_file_job_observed(client, id, pause_after, &mut |_| {})
+    }
+
+    pub fn run_file_job_observed(
+        &mut self,
+        client: &ApiClient,
+        id: &str,
+        pause_after: Option<u64>,
+        observer: &mut dyn FnMut(TransferObservation),
+    ) -> Result<DownloadJob, LibraryError> {
+        let mut network_bytes = 0;
         let _lock = self.lock_job(id)?;
         let job = self.job(id)?;
         let profile = self.profile(&job.profile_id)?;
@@ -735,7 +827,7 @@ impl Library {
         }
         let mut retries = 0;
         loop {
-            match self.transfer_once(client, id, pause_after) {
+            match self.transfer_once(client, id, pause_after, observer, &mut network_bytes) {
                 Ok(()) => return self.job(id),
                 Err(error)
                     if (matches!(error, LibraryError::Api(ApiError::Transport(_)))
@@ -1046,6 +1138,66 @@ mod tests {
             .unwrap();
         assert_eq!(seen, 42);
     }
+    #[test]
+    fn live_observations_count_only_network_bytes_and_not_completion() {
+        let data = vec![7u8; 256 * 1024];
+        let mut fixture = fixture(data.clone(), "normal");
+        let job = queue(&mut fixture);
+        let mut first = Vec::new();
+        let paused = fixture
+            .library
+            .run_file_job_observed(&fixture.client, &job.id, Some(1), &mut |event| {
+                first.push(event)
+            })
+            .unwrap();
+        assert_eq!(paused.state, "Paused");
+        assert!(
+            fixture
+                .library
+                .verified_files(Some(&fixture.profile))
+                .unwrap()
+                .is_empty()
+        );
+        let first_bytes = first
+            .iter()
+            .filter(|event| event.phase == TransferPhase::Downloading)
+            .map(|event| event.network_bytes)
+            .max()
+            .unwrap();
+        assert!(first_bytes > 0 && first_bytes < data.len() as u64);
+        assert_eq!(first_bytes, paused.progress);
+        fixture.library.retry_job(&job.id).unwrap();
+        let mut resumed = Vec::new();
+        let completed = fixture
+            .library
+            .run_file_job_observed(&fixture.client, &job.id, None, &mut |event| {
+                resumed.push(event)
+            })
+            .unwrap();
+        assert_eq!(completed.state, "Completed");
+        let transferred = resumed
+            .iter()
+            .map(|event| event.network_bytes)
+            .max()
+            .unwrap();
+        assert_eq!(transferred, data.len() as u64 - first_bytes);
+        assert!(
+            resumed
+                .iter()
+                .any(|event| event.phase == TransferPhase::WaitingForServer)
+        );
+        assert!(
+            resumed
+                .iter()
+                .any(|event| event.phase == TransferPhase::Verifying)
+        );
+        assert!(
+            resumed
+                .iter()
+                .any(|event| event.phase == TransferPhase::SavingVerifiedContent)
+        );
+    }
+
     #[test]
     fn zero_and_normal_files_complete_with_offline_materialization() {
         for data in [vec![], b"download me".to_vec()] {
