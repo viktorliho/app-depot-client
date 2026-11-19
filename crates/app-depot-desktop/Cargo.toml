@@ -10,6 +10,7 @@ app-depot-core = { path = "../app-depot-core" }
 eframe = { version = "0.37", default-features = false, features = ["glow", "wayland", "x11", "default_fonts", "clipboard"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 serde_json = { version = "1", features = ["arbitrary_precision"] }
+serde = { version = "1", features = ["derive"] }
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]

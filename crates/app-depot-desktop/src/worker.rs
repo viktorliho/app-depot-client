@@ -15,9 +15,13 @@ use std::{
     collections::HashMap,
     io::Cursor,
     path::PathBuf,
-    sync::mpsc::{self, Receiver, Sender},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+        mpsc::{self, Receiver, Sender},
+    },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -48,6 +52,7 @@ pub struct AppView {
 
 #[derive(Clone, Default)]
 pub struct Snapshot {
+    pub selected: Option<ServerProfileId>,
     pub profiles: Vec<Profile>,
     pub apps: Vec<AppView>,
     pub jobs: Vec<DownloadJob>,
@@ -57,16 +62,19 @@ pub struct Snapshot {
     pub library_content: PathBuf,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub enum Command {
     Refresh(Option<ServerProfileId>),
     Sync(ServerProfileId),
-    Check(ServerProfileId),
-    AddProfile {
+    Connect {
         name: String,
         url: String,
         allow_http: bool,
+        token: Option<String>,
+        persist: bool,
+        attempt: u64,
     },
+    CancelConnect(u64),
     RenameProfile {
         id: ServerProfileId,
         name: String,
@@ -104,7 +112,12 @@ pub enum Command {
 
 pub enum Event {
     Snapshot(Snapshot),
-    Jobs(Vec<DownloadJob>),
+    Jobs {
+        profile: ServerProfileId,
+        jobs: Vec<DownloadJob>,
+    },
+    JobChanged,
+    CatalogChanged(ServerProfileId),
     TreeFiles {
         job: String,
         files: Vec<TreeFileProgress>,
@@ -124,12 +137,106 @@ pub enum Event {
     Notice(String),
     Error(String),
     SelectProfile(ServerProfileId),
-    Synced,
+    SyncState {
+        profile: ServerProfileId,
+        running: bool,
+    },
+    RefreshError {
+        profile: ServerProfileId,
+        message: String,
+    },
+    ConnectionResult {
+        connected: bool,
+        needs_token: bool,
+        message: String,
+    },
+}
+
+enum Background {
+    Synced {
+        profile: ServerProfileId,
+        result: Result<(), String>,
+        retryable: bool,
+        rate_limited: bool,
+    },
+    Connected {
+        attempt: u64,
+        name: String,
+        url: String,
+        allow_http: bool,
+        token: Option<String>,
+        persist: bool,
+        result: Result<(), app_depot_core::api::ApiError>,
+    },
+}
+
+const REFRESH_INTERVAL: Duration = Duration::from_secs(600);
+struct RefreshState {
+    running: bool,
+    pending_force: bool,
+    failures: u32,
+    next: Instant,
+    blocked: bool,
+}
+impl RefreshState {
+    fn new() -> Self {
+        Self {
+            running: false,
+            pending_force: false,
+            failures: 0,
+            next: Instant::now(),
+            blocked: false,
+        }
+    }
+    fn finish(&mut self, success: bool, retryable: bool, rate_limited: bool, jitter: u64) {
+        self.running = false;
+        if success {
+            self.failures = 0;
+            self.blocked = false;
+            self.next = Instant::now() + REFRESH_INTERVAL;
+        } else if retryable {
+            self.failures = self.failures.saturating_add(1);
+            let seconds = (5_u64 << self.failures.min(7))
+                .min(600)
+                .max(if rate_limited { 60 } else { 0 })
+                + jitter;
+            self.next = Instant::now() + Duration::from_secs(seconds);
+        } else {
+            self.blocked = true;
+        }
+    }
+    fn credential_changed(&mut self) -> bool {
+        if self.running {
+            self.pending_force = true;
+            false
+        } else {
+            self.blocked = false;
+            self.failures = 0;
+            true
+        }
+    }
+}
+fn refresh_due(
+    state: &RefreshState,
+    last_sync: Option<i64>,
+    at: Instant,
+    epoch: i64,
+    force: bool,
+) -> bool {
+    !state.running
+        && (force
+            || (!state.blocked
+                && at >= state.next
+                && !last_sync.is_some_and(|last| {
+                    state.failures == 0
+                        && epoch.saturating_sub(last) < REFRESH_INTERVAL.as_millis() as i64
+                })))
 }
 
 pub struct Worker {
     pub commands: Sender<Command>,
     pub events: Receiver<Event>,
+    cancelled_connect: Arc<AtomicU64>,
 }
 
 struct ArtTask {
@@ -143,8 +250,20 @@ impl Worker {
     pub fn start(paths: LibraryPaths, ctx: egui::Context) -> Self {
         let (commands, rx) = mpsc::channel();
         let (tx, events) = mpsc::channel();
-        thread::spawn(move || run(paths, rx, tx, ctx));
-        Self { commands, events }
+        let cancelled_connect = Arc::new(AtomicU64::new(0));
+        let cancelled = cancelled_connect.clone();
+        thread::spawn(move || run(paths, rx, tx, ctx, cancelled));
+        Self {
+            commands,
+            events,
+            cancelled_connect,
+        }
+    }
+    pub fn send(&self, command: Command) {
+        if let Command::CancelConnect(attempt) = &command {
+            self.cancelled_connect.store(*attempt, Ordering::SeqCst);
+        }
+        let _ = self.commands.send(command);
     }
 }
 
@@ -177,6 +296,7 @@ pub(crate) fn snapshot(
     selected: Option<&ServerProfileId>,
 ) -> Result<Snapshot, String> {
     let mut result = Snapshot {
+        selected: selected.cloned(),
         profiles: lib.profiles(true).map_err(|e| e.to_string())?,
         library_data: lib.paths.metadata.clone(),
         library_content: lib.paths.content.clone(),
@@ -225,18 +345,6 @@ pub(crate) fn snapshot(
     Ok(result)
 }
 
-fn status(error: &app_depot_core::api::ApiError) -> &'static str {
-    use app_depot_core::api::ApiError;
-    match error {
-        ApiError::Transport(_) => "unreachable",
-        ApiError::Authentication(_) => "authentication-required",
-        ApiError::Authorization(_) => "forbidden",
-        ApiError::Incompatible(_) => "incompatible",
-        ApiError::Protocol(_) => "protocol-error",
-        _ => "http-error",
-    }
-}
-
 #[expect(
     clippy::too_many_arguments,
     reason = "one worker operation needs library, command, and event channels"
@@ -254,17 +362,6 @@ fn operation(
     match cmd {
         Command::Refresh(id) => {
             *selected = id;
-        }
-        Command::AddProfile {
-            name,
-            url,
-            allow_http,
-        } => {
-            let profile = lib
-                .add_profile(&name, &url, allow_http)
-                .map_err(|e| e.to_string())?;
-            *selected = Some(profile.id.clone());
-            send(tx, ctx, Event::SelectProfile(profile.id));
         }
         Command::RenameProfile { id, name } => {
             lib.rename_profile(&id, &name).map_err(|e| e.to_string())?
@@ -305,14 +402,26 @@ fn operation(
             if profile.archived {
                 return Err("cannot edit archived profile".into());
             }
+            let candidate = ApiClient::new(
+                &profile.origin,
+                Some(token.clone()),
+                profile.origin.starts_with("http://"),
+            )
+            .map_err(|e| e.to_string())?;
+            let caps = candidate
+                .ensure_read_compatible()
+                .map_err(|e| e.to_string())?;
+            candidate
+                .list_apps(caps.page_size().map_err(|e| e.to_string())?)
+                .map_err(|e| e.to_string())?;
             if persist {
                 let mut secrets = NativeSecrets;
                 if let Some(reference) = profile.credential_ref {
                     secrets
                         .replace(&reference, &token)
-                        .map_err(|e| e.to_string())?;
+                        .map_err(|e| format!("Secure storage is unavailable: {e}. Choose session-only access or restore the credential service."))?;
                 } else {
-                    let reference = secrets.put(&token).map_err(|e| e.to_string())?;
+                    let reference = secrets.put(&token).map_err(|e| format!("Secure storage is unavailable: {e}. Choose session-only access or restore the credential service."))?;
                     if let Err(e) = lib.set_credential_ref(&id, Some(&reference)) {
                         let _ = secrets.delete(&reference);
                         return Err(e.to_string());
@@ -351,47 +460,8 @@ fn operation(
             memory.remove(&id.0);
             send(tx, ctx, Event::Notice("Profile token removed".into()));
         }
-        Command::Check(id) => {
-            let profile = lib.profile(&id).map_err(|e| e.to_string())?;
-            let api = client(&profile, memory)?;
-            match api.capabilities() {
-                Ok(caps) => {
-                    lib.connection_result(&id, Some(&caps), "connected")
-                        .map_err(|e| e.to_string())?;
-                    let issues = caps.incompatibilities();
-                    send(
-                        tx,
-                        ctx,
-                        Event::Notice(if issues.is_empty() {
-                            "Server connected".into()
-                        } else {
-                            format!(
-                                "Server connected with compatibility limits: {}",
-                                issues.join(", ")
-                            )
-                        }),
-                    );
-                }
-                Err(e) => {
-                    lib.connection_result(&id, None, status(&e))
-                        .map_err(|e| e.to_string())?;
-                    return Err(e.to_string());
-                }
-            }
-        }
-        Command::Sync(id) => {
-            let profile = lib.profile(&id).map_err(|e| e.to_string())?;
-            let api = client(&profile, memory)?;
-            let summary = lib.sync(&id, &api).map_err(|e| e.to_string())?;
-            send(
-                tx,
-                ctx,
-                Event::Notice(format!(
-                    "Synchronized {} apps, {} releases and {} associations",
-                    summary.apps, summary.releases, summary.associations
-                )),
-            );
-            send(tx, ctx, Event::Synced);
+        Command::Sync(_) | Command::Connect { .. } | Command::CancelConnect(_) => {
+            unreachable!("handled by worker scheduler")
         }
         Command::Download {
             profile,
@@ -478,17 +548,14 @@ fn operation(
                     .ok_or("invalid local content path")?
                     .to_path_buf()
             };
-            let status = if cfg!(target_os = "windows") {
-                std::process::Command::new("explorer").arg(&folder).status()
+            if cfg!(target_os = "windows") {
+                std::process::Command::new("explorer").arg(&folder).spawn()
             } else if cfg!(target_os = "macos") {
-                std::process::Command::new("open").arg(&folder).status()
+                std::process::Command::new("open").arg(&folder).spawn()
             } else {
-                std::process::Command::new("xdg-open").arg(&folder).status()
+                std::process::Command::new("xdg-open").arg(&folder).spawn()
             }
             .map_err(|e| e.to_string())?;
-            if !status.success() {
-                return Err("file manager could not open the folder".into());
-            }
             return Ok(false);
         }
     }
@@ -515,10 +582,10 @@ fn artwork_loop(rx: Receiver<ArtTask>, tx: Sender<Event>, ctx: egui::Context) {
             };
             let roles: &[&str] = match usage {
                 ArtUse::Grid => &[
-                    "steam.grid.vertical",
-                    "icon",
-                    "logo",
                     "steam.grid.horizontal",
+                    "icon",
+                    "steam.grid.vertical",
+                    "logo",
                 ],
                 ArtUse::Detail => &["steam.hero", "steam.grid.horizontal", "icon", "logo"],
             };
@@ -558,7 +625,7 @@ fn artwork_loop(rx: Receiver<ArtTask>, tx: Sender<Event>, ctx: egui::Context) {
                     usage,
                 },
             ),
-            Err(error) => {
+            Err(_) => {
                 send(
                     &tx,
                     &ctx,
@@ -568,13 +635,6 @@ fn artwork_loop(rx: Receiver<ArtTask>, tx: Sender<Event>, ctx: egui::Context) {
                         usage,
                     },
                 );
-                if !error.contains("HTTP 404") && !error.starts_with("transport:") {
-                    send(
-                        &tx,
-                        &ctx,
-                        Event::Notice(format!("Artwork unavailable: {error}")),
-                    );
-                }
             }
         }
     }
@@ -643,22 +703,21 @@ fn start_job(
             Ok(())
         })();
         match result {
-            Ok(()) => send(
-                &tx,
-                &ctx,
-                Event::Notice(format!("Download job {} finished", job.id)),
-            ),
-            Err(e) => send(
-                &tx,
-                &ctx,
-                Event::Error(format!("Download job {}: {e}", job.id)),
-            ),
+            Ok(()) => {}
+            Err(e) => send(&tx, &ctx, Event::Error(format!("Download failed: {e}"))),
         }
-        send(&tx, &ctx, Event::Synced);
+        send(&tx, &ctx, Event::JobChanged);
     });
 }
 
-fn run(paths: LibraryPaths, rx: Receiver<Command>, tx: Sender<Event>, ctx: egui::Context) {
+fn run(
+    paths: LibraryPaths,
+    rx: Receiver<Command>,
+    tx: Sender<Event>,
+    ctx: egui::Context,
+    cancelled_connect: Arc<AtomicU64>,
+) {
+    let (background_tx, background_rx) = mpsc::channel::<Background>();
     let (art_tx, art_rx) = mpsc::channel();
     thread::spawn({
         let tx = tx.clone();
@@ -686,41 +745,337 @@ fn run(paths: LibraryPaths, rx: Receiver<Command>, tx: Sender<Event>, ctx: egui:
     };
     let mut selected = None;
     let mut memory = HashMap::new();
+    let mut refreshes: HashMap<String, RefreshState> = HashMap::new();
+    let mut pending_connect: Option<u64> = None;
     if let Ok(value) = snapshot(&lib, None) {
         send(&tx, &ctx, Event::Snapshot(value));
     }
     loop {
-        match rx.recv_timeout(Duration::from_millis(650)) {
-            Ok(cmd) => match operation(
-                &mut lib,
-                &mut selected,
-                &mut memory,
-                &paths,
-                cmd,
-                &tx,
-                &art_tx,
-                &ctx,
-            ) {
-                Ok(refresh) => {
-                    if refresh {
-                        match snapshot(&lib, selected.as_ref()) {
-                            Ok(value) => send(&tx, &ctx, Event::Snapshot(value)),
-                            Err(e) => send(&tx, &ctx, Event::Error(e)),
-                        }
+        while let Ok(done) = background_rx.try_recv() {
+            match done {
+                Background::Synced {
+                    profile,
+                    result,
+                    retryable,
+                    rate_limited,
+                } => {
+                    let jitter = profile
+                        .0
+                        .bytes()
+                        .fold(0_u64, |sum, b| sum.wrapping_add(u64::from(b)))
+                        % 7;
+                    let state = refreshes
+                        .entry(profile.0.clone())
+                        .or_insert_with(RefreshState::new);
+                    let pending_force = state.pending_force;
+                    state.pending_force = false;
+                    state.finish(result.is_ok(), retryable, rate_limited, jitter);
+                    send(
+                        &tx,
+                        &ctx,
+                        Event::SyncState {
+                            profile: profile.clone(),
+                            running: false,
+                        },
+                    );
+                    if result.is_ok() {
+                        send(&tx, &ctx, Event::CatalogChanged(profile.clone()));
                     }
-                }
-                Err(e) => {
-                    send(&tx, &ctx, Event::Error(e));
+                    if let Err(error) = result
+                        && selected.as_ref() == Some(&profile)
+                    {
+                        send(
+                            &tx,
+                            &ctx,
+                            Event::RefreshError {
+                                profile: profile.clone(),
+                                message: error,
+                            },
+                        );
+                    }
                     if let Ok(value) = snapshot(&lib, selected.as_ref()) {
                         send(&tx, &ctx, Event::Snapshot(value));
                     }
+                    if pending_force {
+                        schedule_sync(
+                            &paths,
+                            &lib,
+                            &memory,
+                            &mut refreshes,
+                            &profile,
+                            true,
+                            &background_tx,
+                            &tx,
+                            &ctx,
+                        );
+                    }
                 }
-            },
+                Background::Connected {
+                    attempt,
+                    name,
+                    url,
+                    allow_http,
+                    token,
+                    persist,
+                    result,
+                } => {
+                    if pending_connect != Some(attempt)
+                        || cancelled_connect.load(Ordering::SeqCst) == attempt
+                    {
+                        continue;
+                    }
+                    pending_connect = None;
+                    match result {
+                        Ok(()) => {
+                            let credential_requested = token.is_some();
+                            let created = (|| -> Result<Profile, String> {
+                                let reference = if persist {
+                                    token
+                                        .as_ref()
+                                        .map(|value| {
+                                            NativeSecrets.put(value).map_err(|e| e.to_string())
+                                        })
+                                        .transpose()?
+                                } else {
+                                    None
+                                };
+                                let profile = match lib.add_profile(&name, &url, allow_http) {
+                                    Ok(profile) => profile,
+                                    Err(error) => {
+                                        if let Some(reference) = reference {
+                                            let _ = NativeSecrets.delete(&reference);
+                                        }
+                                        return Err(error.to_string());
+                                    }
+                                };
+                                if let Some(reference) = reference {
+                                    lib.set_credential_ref(&profile.id, Some(&reference))
+                                        .map_err(|e| e.to_string())?;
+                                } else if let Some(token) = token {
+                                    memory.insert(profile.id.0.clone(), token);
+                                }
+                                lib.profile(&profile.id).map_err(|e| e.to_string())
+                            })();
+                            match created {
+                                Ok(profile) => {
+                                    selected = Some(profile.id.clone());
+                                    send(&tx, &ctx, Event::SelectProfile(profile.id.clone()));
+                                    send(
+                                        &tx,
+                                        &ctx,
+                                        Event::ConnectionResult {
+                                            connected: true,
+                                            needs_token: false,
+                                            message: "Server connected. Loading catalog…".into(),
+                                        },
+                                    );
+                                    if let Ok(value) = snapshot(&lib, selected.as_ref()) {
+                                        send(&tx, &ctx, Event::Snapshot(value));
+                                    }
+                                    schedule_sync(
+                                        &paths,
+                                        &lib,
+                                        &memory,
+                                        &mut refreshes,
+                                        &profile.id,
+                                        true,
+                                        &background_tx,
+                                        &tx,
+                                        &ctx,
+                                    );
+                                }
+                                Err(error) => send(
+                                    &tx,
+                                    &ctx,
+                                    Event::ConnectionResult {
+                                        connected: false,
+                                        needs_token: credential_requested,
+                                        message: if credential_requested && persist {
+                                            format!(
+                                                "Could not save this credential securely: {error}. Choose Session only or make the system credential service available."
+                                            )
+                                        } else {
+                                            error
+                                        },
+                                    },
+                                ),
+                            }
+                        }
+                        Err(error) => {
+                            let needs_token = matches!(
+                                error,
+                                app_depot_core::api::ApiError::Authentication(_)
+                                    | app_depot_core::api::ApiError::Authorization(_)
+                            );
+                            send(
+                                &tx,
+                                &ctx,
+                                Event::ConnectionResult {
+                                    connected: false,
+                                    needs_token,
+                                    message: if matches!(
+                                        error,
+                                        app_depot_core::api::ApiError::Authorization(_)
+                                    ) {
+                                        "This account cannot browse the catalog. Use a token with catalog access or ask the Server administrator for permission.".into()
+                                    } else if needs_token {
+                                        if token.is_some() {
+                                            "The token was not accepted. Check it or create a new personal API token on the Server Account page.".into()
+                                        } else {
+                                            "This catalog requires a personal API token.".into()
+                                        }
+                                    } else {
+                                        connection_guidance(&error)
+                                    },
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        match rx.recv_timeout(Duration::from_millis(250)) {
+            Ok(Command::Connect {
+                name,
+                url,
+                allow_http,
+                token,
+                persist,
+                attempt,
+            }) => {
+                pending_connect = Some(attempt);
+                let out = background_tx.clone();
+                thread::spawn(move || {
+                    let result = ApiClient::new(&url, token.clone(), allow_http).and_then(|api| {
+                        let caps = api.ensure_read_compatible()?;
+                        api.list_apps(
+                            caps.page_size()
+                                .map_err(app_depot_core::api::ApiError::Incompatible)?,
+                        )?;
+                        Ok(())
+                    });
+                    let _ = out.send(Background::Connected {
+                        attempt,
+                        name,
+                        url,
+                        allow_http,
+                        token,
+                        persist,
+                        result,
+                    });
+                });
+            }
+            Ok(Command::CancelConnect(attempt)) => {
+                if pending_connect == Some(attempt) {
+                    pending_connect = None;
+                }
+            }
+            Ok(Command::Sync(id)) => {
+                schedule_sync(
+                    &paths,
+                    &lib,
+                    &memory,
+                    &mut refreshes,
+                    &id,
+                    true,
+                    &background_tx,
+                    &tx,
+                    &ctx,
+                );
+            }
+            Ok(cmd) => {
+                let activate = match &cmd {
+                    Command::Refresh(Some(id)) => Some(id.clone()),
+                    _ => None,
+                };
+                let token_change = match &cmd {
+                    Command::SetToken { id, .. } | Command::RemoveToken(id) => Some(id.clone()),
+                    _ => None,
+                };
+                let succeeded = match operation(
+                    &mut lib,
+                    &mut selected,
+                    &mut memory,
+                    &paths,
+                    cmd,
+                    &tx,
+                    &art_tx,
+                    &ctx,
+                ) {
+                    Ok(refresh) => {
+                        if refresh {
+                            match snapshot(&lib, selected.as_ref()) {
+                                Ok(value) => send(&tx, &ctx, Event::Snapshot(value)),
+                                Err(e) => send(&tx, &ctx, Event::Error(e)),
+                            }
+                        }
+                        true
+                    }
+                    Err(e) => {
+                        send(&tx, &ctx, Event::Error(e));
+                        if let Ok(value) = snapshot(&lib, selected.as_ref()) {
+                            send(&tx, &ctx, Event::Snapshot(value));
+                        }
+                        false
+                    }
+                };
+                if let Some(id) = token_change.filter(|_| succeeded) {
+                    let state = refreshes
+                        .entry(id.0.clone())
+                        .or_insert_with(RefreshState::new);
+                    if state.credential_changed() {
+                        schedule_sync(
+                            &paths,
+                            &lib,
+                            &memory,
+                            &mut refreshes,
+                            &id,
+                            true,
+                            &background_tx,
+                            &tx,
+                            &ctx,
+                        );
+                    }
+                }
+                if let Some(id) = activate {
+                    schedule_sync(
+                        &paths,
+                        &lib,
+                        &memory,
+                        &mut refreshes,
+                        &id,
+                        false,
+                        &background_tx,
+                        &tx,
+                        &ctx,
+                    );
+                }
+            }
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 if let Some(id) = selected.as_ref()
                     && let Ok(jobs) = lib.jobs(Some(id))
                 {
-                    send(&tx, &ctx, Event::Jobs(jobs));
+                    send(
+                        &tx,
+                        &ctx,
+                        Event::Jobs {
+                            profile: id.clone(),
+                            jobs,
+                        },
+                    );
+                }
+                if let Some(id) = selected.as_ref() {
+                    schedule_sync(
+                        &paths,
+                        &lib,
+                        &memory,
+                        &mut refreshes,
+                        id,
+                        false,
+                        &background_tx,
+                        &tx,
+                        &ctx,
+                    );
                 }
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -728,9 +1083,160 @@ fn run(paths: LibraryPaths, rx: Receiver<Command>, tx: Sender<Event>, ctx: egui:
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn schedule_sync(
+    paths: &LibraryPaths,
+    lib: &Library,
+    memory: &HashMap<String, String>,
+    states: &mut HashMap<String, RefreshState>,
+    id: &ServerProfileId,
+    force: bool,
+    out: &Sender<Background>,
+    events: &Sender<Event>,
+    ctx: &egui::Context,
+) {
+    let Ok(profile) = lib.profile(id) else { return };
+    if profile.archived {
+        return;
+    }
+    let state = states.entry(id.0.clone()).or_insert_with(RefreshState::new);
+    if !refresh_due(
+        state,
+        profile.last_sync,
+        Instant::now(),
+        unix_now_millis(),
+        force,
+    ) {
+        return;
+    }
+    if force {
+        state.blocked = false;
+        state.failures = 0;
+    }
+    state.running = true;
+    send(
+        events,
+        ctx,
+        Event::SyncState {
+            profile: id.clone(),
+            running: true,
+        },
+    );
+    let paths = paths.clone();
+    let id = id.clone();
+    let token = memory.get(&id.0).cloned();
+    let out = out.clone();
+    thread::spawn(move || {
+        let result = (|| -> Result<(), app_depot_core::library::LibraryError> {
+            let mut library = Library::open(paths)?;
+            let mut memory = HashMap::new();
+            if let Some(token) = token {
+                memory.insert(id.0.clone(), token);
+            }
+            let api = client(&profile, &memory)
+                .map_err(app_depot_core::library::LibraryError::Invalid)?;
+            library.sync(&id, &api)?;
+            Ok(())
+        })();
+        let retryable = matches!(
+            &result,
+            Err(app_depot_core::library::LibraryError::Api(
+                app_depot_core::api::ApiError::Transport(_)
+                    | app_depot_core::api::ApiError::Http {
+                        status: 429 | 500..=599,
+                        ..
+                    }
+            ))
+        );
+        let rate_limited = matches!(
+            &result,
+            Err(app_depot_core::library::LibraryError::Api(
+                app_depot_core::api::ApiError::Http { status: 429, .. }
+            ))
+        );
+        let _ = out.send(Background::Synced {
+            profile: id,
+            result: result.map_err(|e| e.to_string()),
+            retryable,
+            rate_limited,
+        });
+    });
+}
+
+fn unix_now_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as i64)
+}
+
+fn connection_guidance(error: &app_depot_core::api::ApiError) -> String {
+    use app_depot_core::api::ApiError;
+    match error {
+        ApiError::Config(_) => "Enter the Server origin URL, without a path or credentials.".into(),
+        ApiError::Transport(_) => "Could not reach this Server. Check its address and your network connection, then try again.".into(),
+        ApiError::Authorization(_) => "This account cannot browse the catalog. Check its Server permissions.".into(),
+        ApiError::Incompatible(_) => "This Server's API is not compatible with this client. Check the Server API version.".into(),
+        ApiError::Protocol(_) => "The Server returned an invalid response. Check that this is an App Depot Server and try again.".into(),
+        ApiError::Http { status: 429, .. } => "The Server is limiting requests. Wait a moment before trying again.".into(),
+        ApiError::Http { status, .. } => format!("The Server could not complete this request (HTTP {status}). Try again later."),
+        ApiError::Authentication(_) => "This catalog requires a personal API token.".into(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn refresh_policy_deduplicates_and_backs_off() {
+        let mut state = RefreshState::new();
+        let now = Instant::now();
+        assert!(refresh_due(&state, None, now, 1000, false));
+        state.running = true;
+        assert!(!refresh_due(&state, None, now, 1000, true));
+        state.finish(false, true, false, 3);
+        assert!(!refresh_due(&state, None, Instant::now(), 1000, false));
+        assert!(!state.blocked);
+        state.finish(false, false, false, 0);
+        assert!(state.blocked);
+        assert!(!refresh_due(&state, None, Instant::now(), 1000, false));
+        assert!(refresh_due(&state, None, Instant::now(), 1000, true));
+        state.finish(true, false, false, 0);
+        assert!(!refresh_due(
+            &state,
+            Some(1000),
+            Instant::now(),
+            1001,
+            false
+        ));
+        assert!(refresh_due(&state, Some(1000), Instant::now(), 1001, true));
+        let fresh = RefreshState::new();
+        assert!(!refresh_due(
+            &fresh,
+            Some(1_000_000),
+            Instant::now(),
+            1_001_000,
+            false
+        ));
+        assert!(refresh_due(
+            &fresh,
+            Some(1_000_000),
+            Instant::now(),
+            1_601_000,
+            false
+        ));
+        let mut limited = RefreshState::new();
+        limited.finish(false, true, true, 0);
+        assert!(limited.next > Instant::now() + Duration::from_secs(59));
+        let mut changing = RefreshState::new();
+        changing.running = true;
+        assert!(!changing.credential_changed());
+        assert!(changing.pending_force);
+        assert!(!refresh_due(&changing, None, Instant::now(), 0, true));
+        changing.finish(false, false, false, 0);
+        assert!(changing.pending_force);
+        changing.pending_force = false;
+        assert!(refresh_due(&changing, None, Instant::now(), 0, true));
+    }
     #[test]
     fn malformed_and_oversized_artwork_is_rejected() {
         assert!(decode_image(b"not an image", 1, 1, "image/png").is_err());
@@ -742,5 +1248,17 @@ mod tests {
         ];
         assert!(decode_image(encoded, 100_000, 100_000, "image/png").is_err());
         assert!(decode_image(encoded, 1, 1, "image/jpeg").is_err());
+    }
+    #[test]
+    fn connection_errors_offer_distinct_recovery() {
+        use app_depot_core::api::ApiError;
+        assert!(connection_guidance(&ApiError::Transport("offline".into())).contains("network"));
+        assert!(connection_guidance(&ApiError::Authorization(None)).contains("permissions"));
+        assert!(
+            connection_guidance(&ApiError::Incompatible("version".into())).contains("compatible")
+        );
+        assert!(
+            connection_guidance(&ApiError::Protocol("bad".into())).contains("invalid response")
+        );
     }
 }

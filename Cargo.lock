@@ -104,6 +104,7 @@ dependencies = [
  "app-depot-core",
  "eframe",
  "image",
+ "serde",
  "serde_json",
  "tempfile",
  "uuid",

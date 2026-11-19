@@ -16,6 +16,8 @@ M1.4 implements Tree Artifact inventory traversal, canonical Tree Identity v1, p
 
 M1.5 implements a native egui desktop app with Catalog grid/table and details, offline Library, durable Downloads and profile/credential Settings. It shares the existing core with the CLI; HTTP, SQLite, image decoding and hashing run outside the UI thread. Artwork comes only from bounded Server artwork endpoints. File and Tree associations remain separate download choices. Linux Wayland/X11 desktop smoke checks use an isolated Dev/Test catalog and a disposable library. There is no Install or Launch action, background daemon or release packaging. Windows/macOS desktop behavior remains to be validated on those hosts.
 
+M1.5.1 redesigns the desktop around first-run Server connection, guided personal-token setup, automatic offline-first catalog refresh, responsive App cards/details, an App-centric verified Library, readable durable Downloads and grouped Settings. System theme and compact presentation preferences persist locally without storing credentials. No automatic Artifact download, installation or launch is introduced.
+
 Implement a shared core transport, declaration reader, transfer engine and local library; expose a small diagnostic CLI and an egui desktop browser on Linux. Windows/macOS paths and adapters must compile or be clearly tracked as later platform validation. All M1 operations use existing Server read APIs. No install, runtime preparation or launch implementation.
 
 Acceptance criteria:
