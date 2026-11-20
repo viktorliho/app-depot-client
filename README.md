@@ -2,7 +2,7 @@
 
 Native reference client for the open [App Depot Server](https://github.com/viktorliho/app-depot-server) protocol. The client is optional: independent clients can implement the documented Server API without using this code.
 
-The native egui desktop browser shares the CLI's HTTP core, profiles, offline cache, verified File/Tree downloads and Linux NativePortableV1 launch operation. It does not install software. See [milestones](docs/MILESTONES.md) and the [server API audit](docs/SERVER_API_AUDIT.md).
+The native egui desktop browser shares the CLI's HTTP core, profiles, offline cache, verified File/Tree downloads and Linux NativePortableV1 launch operation. Native portable programs use a separate writable local working copy; download-only Artifacts remain valid. See [milestones](docs/MILESTONES.md) and the [server API audit](docs/SERVER_API_AUDIT.md).
 
 ## Build and use
 
@@ -18,7 +18,7 @@ cargo run -p app-depot -- --server http://127.0.0.1:8787 declarations RELEASE_ID
 
 On first launch, choose **Add Server**, enter its URL and connect. The desktop checks capabilities and catalog access before saving a profile. If the catalog requires a personal API token, use **Open Server Account page** to create one, paste it, then choose secure native storage or a session-only token. Explicit LAN HTTP requires its warning checkbox. The catalog loads automatically after connection. Existing profiles reopen from cache immediately and refresh in the background when stale; routine refresh is at most every 10 minutes per active profile, with bounded backoff after transient failures and no automatic retry loop for rejected credentials. **Refresh** remains available in Browse. Switching servers changes the visible catalog immediately. Offline metadata stays visible, and verified local files and trees remain available in **My library**.
 
-Browse offers responsive grid/list views, search, App details, all Releases and every Artifact association. Download actions apply to the selected association only. My library shows each verified download with its saved App and Release context and opens its containing folder. A verified, compatible NativePortableV1 entry point shows Play on Linux; multiple candidates have separate explicit actions. The worker checks the local target and displayed declaration revision again before starting a direct process and reports Starting, Running, Exited or Launch failed. Downloads shows durable jobs, live received bytes, measured transfer speed, an ETA when enough data exists, Tree file counts and available pause/resume/retry/cancel actions. Technical IDs and exact raw declarations remain available in Advanced sections. Artwork is loaded asynchronously from bounded Server artwork routes. Installation remains unavailable. `APP_DEPOT_LIBRARY_DATA_DIR` and `APP_DEPOT_LIBRARY_CONTENT_DIR` choose disposable or separate roots for the desktop app. Appearance preferences stay in `desktop-preferences.json` without credentials. Linux Wayland and X11 have been exercised with a synthetic native launch; Windows/macOS native launch is not implemented. The GUI requires Rust 1.95 or newer.
+Browse offers responsive grid/list views, search, App details, all Releases and every Artifact association. Download actions apply to the selected association only. My library shows each verified download with its saved App and Release context and opens its containing folder. A verified, compatible NativePortableV1 entry point shows Play on Linux after a separate writable copy is prepared; multiple candidates have separate explicit actions. The worker checks the local target and displayed declaration revision again before starting a direct process and reports Starting, Running, Exited or Launch failed. Downloads shows durable jobs, live received bytes, measured transfer speed, an ETA when enough data exists, Tree file counts and available pause/resume/retry/cancel actions. Technical IDs and exact raw declarations remain available in Advanced sections. Artwork is loaded asynchronously from bounded Server artwork routes. Server-declared installation procedures remain unsupported. `APP_DEPOT_LIBRARY_DATA_DIR` and `APP_DEPOT_LIBRARY_CONTENT_DIR` choose disposable or separate roots for the desktop app. Appearance preferences stay in `desktop-preferences.json` without credentials. Linux Wayland and X11 have been exercised with a synthetic native launch; Windows/macOS native launch is not implemented. The GUI requires Rust 1.95 or newer.
 
 Also available: `app APP_ID` and `release RELEASE_ID`. `--json` produces machine-readable JSON with exact integer values. Set `APP_DEPOT_TOKEN` for a temporary Bearer token; it is never stored. `APP_DEPOT_SERVER_URL` can provide the URL instead of `--server`. Remote HTTP requires `--allow-insecure-http`; HTTPS does not. The client refuses redirects. Exit codes: 2 configuration, 3 authentication, 4 authorization, 5 transport, 6 incompatible capabilities, 7 malformed protocol response, 8 other HTTP error.
 
@@ -39,7 +39,7 @@ app-depot profile remove PROFILE_ID --confirm
 
 `profile move` creates a new profile ID and archives the old profile and its cache; remove a stored token first with `profile token-remove PROFILE_ID`. `profile remove --confirm` archives the profile, removes its stored token, and retains cached metadata for offline reading through `--profile PROFILE_ID`; `profile list --all` shows archived profiles. There is no cache purge command in M1.2. Profiles with the same URL remain separate. `sync` retrieves all accessible Apps, Releases, associations, Artifact metadata and declaration snapshots before writing a SQLite transaction. A failed sync keeps the previous cache. A successful sync marks unseen older records stale but retains them. Cached output always says `source: cache` in JSON and includes last-sync and stale fields; it does not claim a globally atomic Server catalog snapshot.
 
-To store a profile token, pipe it to `app-depot profile token-set PROFILE_ID --token-stdin`; replacement updates that profile's existing secure-store entry. On Linux the native backend is Secret Service, with Credential Manager and Keychain selected on Windows and macOS. If unavailable, use anonymous access or `APP_DEPOT_TOKEN` for one process; there is no plaintext fallback. `--library-data ABSOLUTE_PATH` or `APP_DEPOT_LIBRARY_DATA_DIR` selects the metadata root. `--library-content ABSOLUTE_PATH` or `APP_DEPOT_LIBRARY_CONTENT_DIR` selects the content root separately. With only `--library-data`, both roots use that path. Defaults are the OS user data directory under `app-depot-client`. Local-library failures exit 9 and native credential failures exit 10.
+To store a profile token, pipe it to `app-depot profile token-set PROFILE_ID --token-stdin`; replacement updates that profile's existing secure-store entry. On Linux the native backend is Secret Service, with Credential Manager and Keychain selected on Windows and macOS. If unavailable, use anonymous access or `APP_DEPOT_TOKEN` for one process; there is no plaintext fallback. `--library-data ABSOLUTE_PATH` or `APP_DEPOT_LIBRARY_DATA_DIR` selects the metadata root. `--library-content ABSOLUTE_PATH` or `APP_DEPOT_LIBRARY_CONTENT_DIR` selects the content root separately. With only `--library-data`, both roots use that path. New Linux libraries default to `~/.appdepot`; marked older XDG libraries stay active until explicit migration. Windows and macOS retain their OS user-data defaults. Local-library failures exit 9 and native credential failures exit 10.
 
 ## Artifact downloads
 
@@ -65,11 +65,45 @@ The client treats Server declarations and downloaded content as untrusted. A dow
 
 ## Native portable launch on Linux
 
-After synchronizing a Server with the M2.0 declaration contract and downloading the selected File or Tree Artifact, inspect every cached launch choice offline:
+After synchronizing a Server with the M2.0 declaration contract and downloading the selected File or Tree Artifact, inspect every cached launch choice offline. A supported verified choice first needs a separate writable runtime copy:
 
 ```sh
 app-depot --profile PROFILE_ID launch list RELEASE_ID
+app-depot --profile PROFILE_ID runtime prepare ASSOCIATION_ID
 app-depot --profile PROFILE_ID launch play RELEASE_ID ASSOCIATION_ID ENTRY_POINT_ID
 ```
 
-The second command is an explicit request to run the declared program and waits for its exit; a nonzero exit is reported as an error. It uses the cached Release declaration snapshot and verified local bytes, so an archived profile or unavailable Server does not prevent an otherwise safe offline launch. Unsupported, malformed and legacy target-only declarations remain inert; multiple eligible candidates require explicit selection. The desktop offers Play only for locally ready candidates and never guesses a target. A direct Linux child process uses the declared Artifact-relative working directory and literal argv; no shell or Dolphin is involved. The opened target is rehashed immediately before execution, but this is not a claim that the entire Tree is reverified at that instant. The client strips App Depot token and secret variables from the child's inherited environment. Closing the desktop does not intentionally stop a running child. See [the lifecycle contract](docs/DECLARATIVE_LIFECYCLE.md) for precise limits.
+`runtime prepare` uses verified local objects without contacting the Server. Linux tries reflinks and falls back to independent copies. The launch command is an explicit request to run the declared program and waits for its exit; a nonzero exit is reported as an error. It uses the cached Release declaration snapshot and the prepared local runtime, so an archived profile or unavailable Server does not prevent an otherwise safe offline launch. Unsupported, malformed and legacy target-only declarations remain inert; multiple eligible candidates require explicit selection. The desktop offers Prepare and then Play only for locally ready candidates and never guesses a target. A direct Linux child process uses the declared Artifact-relative working directory and literal argv; no shell or Dolphin is involved. The opened runtime target is rehashed immediately before execution; the mutable working copy is not claimed to be byte-for-byte verified. The client strips App Depot token and secret variables from the child's inherited environment. Closing the desktop does not intentionally stop a running child. See [the lifecycle contract](docs/DECLARATIVE_LIFECYCLE.md) for precise limits.
+
+
+## Managed local library on Linux
+
+The immutable verified download remains under `objects/` and `artifacts/`. `runtime prepare` creates a separate writable copy under `apps/<local-id>/` and a managed `userdata/<local-id>/` directory. A game may change files in its working copy without invalidating the original Tree identity. App Depot does not sandbox native programs: files they create outside the managed library are not removed automatically.
+
+```sh
+app-depot library info
+app-depot library usage
+app-depot --profile PROFILE_ID runtime list
+app-depot --profile PROFILE_ID runtime preview INSTALLATION_ID
+app-depot --profile PROFILE_ID runtime preview-complete INSTALLATION_ID
+app-depot --profile PROFILE_ID runtime remove INSTALLATION_ID --confirm
+app-depot --profile PROFILE_ID runtime remove-complete INSTALLATION_ID --confirm
+app-depot --profile PROFILE_ID runtime remove-artifact ASSOCIATION_ID --confirm
+app-depot --profile PROFILE_ID runtime remove-app APP_ID --confirm
+app-depot --profile PROFILE_ID runtime remove-app-complete APP_ID --confirm
+app-depot --profile PROFILE_ID runtime repair INSTALLATION_ID --confirm
+app-depot --profile PROFILE_ID runtime repair-source ASSOCIATION_ID --confirm
+app-depot library gc --confirm
+```
+
+The read-only previews list the selected local identity and logical sizes before deletion. Normal removal deletes writable copies and retains verified downloads and managed data. Complete removal deletes the selected local references and managed data, while preserving content shared by other Apps, Releases, Associations or profiles. It never deletes Server resources or the profile token. Repairing a damaged Tree source from verified local objects preserves the former directory, including extra files, in `staging/source-quarantine-<job-id>` until complete removal. `library usage` reports logical sizes; reflinks and compression mean physical space reclaimed may differ.
+
+For an older marked XDG library, close the desktop and pause active downloads before an explicit copy to the new default. The source is preserved:
+
+```sh
+app-depot library info
+app-depot library migration-preview "$HOME/.appdepot"
+app-depot library migrate "$HOME/.appdepot" --confirm
+```
+
+If metadata and content use separate roots, pass their absolute paths through `--library-data` and `--library-content` before `library migrate`. Inspect the new library with `app-depot library info` and `app-depot --profile PROFILE_ID runtime list`; the old root is not removed automatically. A failed migration leaves the source usable and may leave a `.appdepot-migrating-<UUID>` directory for manual inspection. Do not delete an old root merely because its name resembles a test library.

@@ -60,7 +60,10 @@ fn child_stage(library: &Library, id: &str, file_id: &str) -> Result<PathBuf, Li
         .join("files")
         .join(format!("{file_id}.part")))
 }
-fn tree_destination(library: &Library, job: &DownloadJob) -> Result<PathBuf, LibraryError> {
+pub(crate) fn tree_destination(
+    library: &Library,
+    job: &DownloadJob,
+) -> Result<PathBuf, LibraryError> {
     Uuid::parse_str(&job.profile_id.0).map_err(|_| invalid("invalid profile ID"))?;
     Uuid::parse_str(&job.association_id).map_err(|_| invalid("invalid association ID"))?;
     let digest = job
@@ -84,7 +87,7 @@ fn tree_destination(library: &Library, job: &DownloadJob) -> Result<PathBuf, Lib
 }
 
 #[cfg(unix)]
-fn open_dir_nofollow(path: &Path) -> Result<File, LibraryError> {
+pub(crate) fn open_dir_nofollow(path: &Path) -> Result<File, LibraryError> {
     use std::os::unix::fs::OpenOptionsExt;
     let file = OpenOptions::new()
         .read(true)
@@ -125,7 +128,7 @@ fn child_dir(parent: &File, name: &str, create: bool) -> Result<File, LibraryErr
     Ok(file)
 }
 #[cfg(unix)]
-fn dir_beneath(root: &File, path: &str, create: bool) -> Result<File, LibraryError> {
+pub(crate) fn dir_beneath(root: &File, path: &str, create: bool) -> Result<File, LibraryError> {
     let mut current = root.try_clone()?;
     for component in path.split('/') {
         current = child_dir(&current, component, create)?;
@@ -133,7 +136,7 @@ fn dir_beneath(root: &File, path: &str, create: bool) -> Result<File, LibraryErr
     Ok(current)
 }
 #[cfg(unix)]
-fn create_file_beneath(root: &File, path: &str) -> Result<File, LibraryError> {
+pub(crate) fn create_file_beneath(root: &File, path: &str) -> Result<File, LibraryError> {
     use std::{
         ffi::CString,
         os::fd::{AsRawFd, FromRawFd},
@@ -189,7 +192,7 @@ fn unlink_beneath(root: &File, path: &str, directory: bool) -> Result<(), Librar
     Ok(())
 }
 
-fn rename_tree_noreplace(from: &Path, to: &Path) -> Result<(), LibraryError> {
+pub(crate) fn rename_tree_noreplace(from: &Path, to: &Path) -> Result<(), LibraryError> {
     #[cfg(target_os = "linux")]
     {
         use std::{ffi::CString, os::unix::ffi::OsStrExt};
@@ -1145,6 +1148,17 @@ impl Library {
         &self,
         profile: Option<&ServerProfileId>,
     ) -> Result<Vec<VerifiedTree>, LibraryError> {
+        let (valid, issues) = self.inspect_trees(profile)?;
+        if let Some(issue) = issues.first() {
+            return Err(invalid(format!("{}: {}", issue.artifact_id, issue.reason)));
+        }
+        Ok(valid)
+    }
+
+    pub fn inspect_trees(
+        &self,
+        profile: Option<&ServerProfileId>,
+    ) -> Result<(Vec<VerifiedTree>, Vec<crate::library::LocalIssue>), LibraryError> {
         let mut stmt=self.conn.prepare("SELECT profile_id,artifact_id,association_id,verified_at FROM verified_content WHERE artifact_id LIKE 'adtree:v1:sha256:%' AND (?1 IS NULL OR profile_id=?1) ORDER BY verified_at")?;
         let rows = stmt
             .query_map([profile.map(|p| p.0.as_str())], |r| {
@@ -1156,16 +1170,47 @@ impl Library {
                 ))
             })?
             .collect::<Result<Vec<_>, _>>()?;
-        rows.into_iter().map(|(profile_id,artifact_id,association_id,verified_at)|{
-            let association_id=association_id.ok_or_else(||invalid("verified Tree lacks Association"))?;
-            let job_id:String=self.conn.query_row("SELECT id FROM download_jobs WHERE profile_id=?1 AND artifact_id=?2 AND association_id=?3 AND state='Completed' ORDER BY updated_at DESC LIMIT 1",params![profile_id,artifact_id,association_id],|r|r.get(0))?;
-            let entries=self.tree_inventory(&job_id)?.ok_or_else(||invalid("verified Tree inventory missing"))?;
-            if identity(&entries)?!=artifact_id{return Err(invalid("verified Tree identity mismatch"));}
-            let job=self.job(&job_id)?;
-            let path=tree_destination(self,&job)?;
-            self.verify_tree_directory(&path,&entries)?;
-            Ok(VerifiedTree{profile_id:ServerProfileId(profile_id),association_id,artifact_id,path,file_count:entries.iter().filter(|e|matches!(e,InventoryEntry::File{..})).count(),verified_at})
-        }).collect()
+        let mut valid = Vec::new();
+        let mut issues = Vec::new();
+        for (profile_id, artifact_id, association_id, verified_at) in rows {
+            let result = (|| -> Result<VerifiedTree, LibraryError> {
+                let association_id = association_id
+                    .clone()
+                    .ok_or_else(|| invalid("verified Tree lacks Association"))?;
+                let job_id:String=self.conn.query_row("SELECT id FROM download_jobs WHERE profile_id=?1 AND artifact_id=?2 AND association_id=?3 AND state='Completed' ORDER BY updated_at DESC LIMIT 1",params![profile_id,artifact_id,association_id],|r|r.get(0))?;
+                let entries = self
+                    .tree_inventory(&job_id)?
+                    .ok_or_else(|| invalid("verified Tree inventory missing"))?;
+                if identity(&entries)? != artifact_id {
+                    return Err(invalid("verified Tree identity mismatch"));
+                }
+                let job = self.job(&job_id)?;
+                let path = tree_destination(self, &job)?;
+                self.verify_tree_directory(&path, &entries)?;
+                Ok(VerifiedTree {
+                    profile_id: ServerProfileId(profile_id.clone()),
+                    association_id,
+                    artifact_id: artifact_id.clone(),
+                    path,
+                    file_count: entries
+                        .iter()
+                        .filter(|e| matches!(e, InventoryEntry::File { .. }))
+                        .count(),
+                    verified_at,
+                })
+            })();
+            match result {
+                Ok(item) => valid.push(item),
+                Err(error) => issues.push(crate::library::LocalIssue {
+                    profile_id: ServerProfileId(profile_id),
+                    association_id,
+                    artifact_id,
+                    kind: "Tree".into(),
+                    reason: error.to_string(),
+                }),
+            }
+        }
+        Ok((valid, issues))
     }
 }
 

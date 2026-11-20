@@ -4,7 +4,8 @@ use app_depot_core::{
     ServerProfileId,
     api::ApiClient,
     launch::LaunchCandidate,
-    library::{Library, LibraryPaths, Profile},
+    library::{Library, LibraryPaths, LocalIssue, Profile},
+    managed::{Installation, StorageUsage},
     models::{App, Artifact, Association, DeclarationSnapshot, Release},
     secrets::{NativeSecrets, SecretStore},
     transfer::{DownloadJob, TransferObservation, TransferPhase, VerifiedFile},
@@ -59,6 +60,8 @@ pub struct Snapshot {
     pub jobs: Vec<DownloadJob>,
     pub files: Vec<VerifiedFile>,
     pub trees: Vec<VerifiedTree>,
+    pub local_issues: Vec<LocalIssue>,
+    pub installations: Vec<Installation>,
     pub launches: Vec<LaunchCandidate>,
     pub library_data: PathBuf,
     pub library_content: PathBuf,
@@ -110,6 +113,28 @@ pub enum Command {
         usage: ArtUse,
     },
     Reveal(PathBuf),
+    StorageUsage,
+    Prepare {
+        profile: ServerProfileId,
+        association: String,
+    },
+    RemoveInstallation {
+        id: String,
+        complete: bool,
+    },
+    RemoveArtifact {
+        profile: ServerProfileId,
+        association: String,
+    },
+    RemoveApp {
+        profile: ServerProfileId,
+        app: String,
+        complete: bool,
+    },
+    RepairSource {
+        profile: ServerProfileId,
+        association: String,
+    },
     Play {
         profile: ServerProfileId,
         release: String,
@@ -121,6 +146,7 @@ pub enum Command {
 
 pub enum Event {
     Snapshot(Snapshot),
+    StorageUsage(StorageUsage),
     Jobs {
         profile: ServerProfileId,
         jobs: Vec<DownloadJob>,
@@ -360,8 +386,13 @@ pub(crate) fn snapshot(
             });
         }
         result.jobs = lib.jobs(Some(id)).map_err(|e| e.to_string())?;
-        result.files = lib.verified_files(Some(id)).map_err(|e| e.to_string())?;
-        result.trees = lib.verified_trees(Some(id)).map_err(|e| e.to_string())?;
+        let (files, file_issues) = lib.inspect_files(Some(id)).map_err(|e| e.to_string())?;
+        let (trees, tree_issues) = lib.inspect_trees(Some(id)).map_err(|e| e.to_string())?;
+        result.files = files;
+        result.trees = trees;
+        result.local_issues.extend(file_issues);
+        result.local_issues.extend(tree_issues);
+        result.installations = lib.installations(Some(id)).map_err(|e| e.to_string())?;
         for app in &result.apps {
             for release in &app.releases {
                 if release.declaration.is_some() {
@@ -594,6 +625,132 @@ fn operation(
             .map_err(|e| e.to_string())?;
             return Ok(false);
         }
+        Command::StorageUsage => {
+            let paths = paths.clone();
+            let tx = tx.clone();
+            let ctx = ctx.clone();
+            thread::spawn(
+                move || match Library::open(paths).and_then(|lib| lib.storage_usage()) {
+                    Ok(usage) => send(&tx, &ctx, Event::StorageUsage(usage)),
+                    Err(error) => send(&tx, &ctx, Event::Error(error.to_string())),
+                },
+            );
+            return Ok(false);
+        }
+        Command::Prepare {
+            profile,
+            association,
+        } => {
+            let paths = paths.clone();
+            let tx = tx.clone();
+            let ctx = ctx.clone();
+            thread::spawn(move || {
+                let result = Library::open(paths)
+                    .and_then(|mut lib| lib.prepare_portable(&profile, &association));
+                match result {
+                    Ok(_) => send(
+                        &tx,
+                        &ctx,
+                        Event::Notice("Writable application copy is ready".into()),
+                    ),
+                    Err(error) => send(&tx, &ctx, Event::Error(error.to_string())),
+                }
+                send(&tx, &ctx, Event::JobChanged);
+            });
+            return Ok(false);
+        }
+        Command::RemoveInstallation { id, complete } => {
+            let paths = paths.clone();
+            let tx = tx.clone();
+            let ctx = ctx.clone();
+            thread::spawn(move || {
+                let result =
+                    Library::open(paths).and_then(|mut lib| lib.remove_installation(&id, complete));
+                match result {
+                    Ok(())=>send(&tx,&ctx,Event::Notice(if complete{"Managed application data and local download reference removed"}else{"Writable application copy removed; verified download and managed data kept"}.into())),
+                    Err(error)=>send(&tx,&ctx,Event::Error(error.to_string())),
+                }
+                send(&tx, &ctx, Event::JobChanged);
+            });
+            return Ok(false);
+        }
+        Command::RemoveArtifact {
+            profile,
+            association,
+        } => {
+            let paths = paths.clone();
+            let tx = tx.clone();
+            let ctx = ctx.clone();
+            thread::spawn(move || {
+                let result = Library::open(paths)
+                    .and_then(|mut lib| lib.remove_local_artifact(&profile, &association));
+                match result {
+                    Ok(()) => send(
+                        &tx,
+                        &ctx,
+                        Event::Notice("Selected local download removed".into()),
+                    ),
+                    Err(error) => send(&tx, &ctx, Event::Error(error.to_string())),
+                };
+                send(&tx, &ctx, Event::JobChanged);
+            });
+            return Ok(false);
+        }
+        Command::RemoveApp {
+            profile,
+            app,
+            complete,
+        } => {
+            let paths = paths.clone();
+            let tx = tx.clone();
+            let ctx = ctx.clone();
+            thread::spawn(move || {
+                let result = Library::open(paths)
+                    .and_then(|mut lib| lib.remove_local_app(&profile, &app, complete));
+                match result {
+                    Ok(count) => send(
+                        &tx,
+                        &ctx,
+                        Event::Notice(format!(
+                            "Processed {count} local application item(s); Server catalog and account remain"
+                        )),
+                    ),
+                    Err(error) => send(&tx, &ctx, Event::Error(error.to_string())),
+                };
+                send(&tx, &ctx, Event::JobChanged);
+            });
+            return Ok(false);
+        }
+        Command::RepairSource {
+            profile,
+            association,
+        } => {
+            let paths = paths.clone();
+            let tx = tx.clone();
+            let ctx = ctx.clone();
+            thread::spawn(move || {
+                let result = Library::open(paths)
+                    .and_then(|mut lib| lib.repair_verified_tree(&profile, &association));
+                match result {
+                    Ok((_, quarantine)) => {
+                        let detail = quarantine
+                            .map_or("No previous directory was present.".into(), |p| {
+                                format!("Previous files are preserved at {}", p.display())
+                            });
+                        send(
+                            &tx,
+                            &ctx,
+                            Event::Notice(format!(
+                                "Verified source restored from local objects. {detail}"
+                            )),
+                        );
+                    }
+                    Err(error) => send(&tx, &ctx, Event::Error(error.to_string())),
+                }
+                send(&tx, &ctx, Event::JobChanged);
+            });
+            return Ok(false);
+        }
         Command::Play {
             profile,
             release,
@@ -646,7 +803,15 @@ fn operation(
                     if candidate.status != "Ready" {
                         return Err(format!("{}: {}", candidate.status, candidate.reason));
                     }
-                    let mut child = candidate.spawn().map_err(|e| e.to_string())?;
+                    let mut child = lib
+                        .play_declared(
+                            &profile,
+                            &release,
+                            &association,
+                            &entry,
+                            &declaration_revision,
+                        )
+                        .map_err(|e| e.to_string())?;
                     let pid = child.id();
                     if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
                         announce(

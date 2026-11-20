@@ -546,6 +546,22 @@ impl Desktop {
                         .small(),
                     );
                 });
+            } else if candidate.status == "PreparationRequired" {
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("Prepare to play").clicked() {
+                        self.send(Command::Prepare {
+                            profile: candidate.profile_id.clone(),
+                            association: candidate.association_id.clone(),
+                        });
+                    }
+                    ui.label(
+                        RichText::new(
+                            "Creates a separate writable copy from the verified download.",
+                        )
+                        .small()
+                        .weak(),
+                    );
+                });
             } else if candidate.status != "NoLaunch" {
                 ui.label(
                     RichText::new(format!(
@@ -584,6 +600,11 @@ impl Desktop {
                     }
                     let count=view.releases.iter().flat_map(|r|&r.associations).filter(|a|self.is_verified(&a.association.id)).count();
                     ui.label(RichText::new(if count>0 { format!("{count} artifact{} verified locally",if count==1{""}else{"s"}) }else if view.stale { "Saved metadata".into() } else { "Available to download".into() }).small().weak());
+                    if count>0 && let Some(profile)=self.active.clone() {
+                        let prepared=self.snapshot.installations.iter().any(|item|item.app_id==view.app.id && item.state=="Ready");
+                        if prepared && ui.button("Remove local application…").clicked(){self.remove_app_target=Some((profile.clone(),view.app.id.clone(),view.app.name.clone(),false));self.confirmation=Some(Confirmation::RemoveApp);}
+                        if ui.button("Remove all local content and managed data…").clicked(){self.remove_app_target=Some((profile,view.app.id.clone(),view.app.name.clone(),true));self.confirmation=Some(Confirmation::RemoveApp);}
+                    }
                     if view.stale { ui.label(RichText::new("Saved metadata; this app was absent from the latest catalog refresh.").small().weak()); }
                 });
             }); ui.add_space(18.0);
@@ -656,7 +677,11 @@ impl Desktop {
             );
             return;
         }
-        if self.snapshot.files.is_empty() && self.snapshot.trees.is_empty() {
+        if self.snapshot.files.is_empty()
+            && self.snapshot.trees.is_empty()
+            && self.snapshot.local_issues.is_empty()
+            && self.snapshot.installations.is_empty()
+        {
             self.empty_panel(
                 ui,
                 "No downloads yet",
@@ -694,6 +719,39 @@ impl Desktop {
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
+                for issue in &self.snapshot.local_issues {
+                    ui.group(|ui| {
+                        ui.label(
+                            egui::RichText::new(format!("{} download needs repair", issue.kind))
+                                .strong(),
+                        );
+                        ui.label(&issue.reason);
+                        if issue.kind=="Tree" && let Some(association)=&issue.association_id {
+                            if ui.button("Repair from verified local files…").clicked(){
+                                self.repair_target=Some((issue.profile_id.clone(),association.clone()));
+                                self.confirmation=Some(Confirmation::RepairSource);
+                            }
+                            ui.label(RichText::new("The existing directory will be kept in staging so its extra files can be inspected.").small().weak());
+                        }
+                        egui::CollapsingHeader::new("Technical identity").show(ui, |ui| {
+                            ui.label(&issue.artifact_id);
+                        });
+                    });
+                    ui.add_space(8.0);
+                }
+                let isolated:Vec<_>=self.snapshot.installations.iter().filter(|installation|installation.state=="Ready" && !self.snapshot.files.iter().any(|file|file.association_id==installation.association_id) && !self.snapshot.trees.iter().any(|tree|tree.association_id==installation.association_id)).cloned().collect();
+                for installation in isolated {
+                    let name=self.snapshot.apps.iter().find(|app|app.app.id==installation.app_id).map_or("Saved application",|app|app.app.name.as_str()).to_owned();
+                    ui.group(|ui|{
+                        ui.label(RichText::new(name.clone()).strong());
+                        ui.label("Writable application copy remains available. Its original verified download needs inspection or repair.");
+                        if ui.button("Open working copy").clicked(){self.send(Command::Reveal(installation.path.clone()));}
+                        self.play_controls(ui,&installation.association_id);
+                        if ui.button("Remove working copy…").clicked(){self.remove_target=Some((installation.id.clone(),false,name.clone()));self.confirmation=Some(Confirmation::RemoveInstallation);}
+                        if ui.button("Remove completely…").clicked(){self.remove_target=Some((installation.id.clone(),true,name.clone()));self.confirmation=Some(Confirmation::RemoveInstallation);}
+                    });
+                    ui.add_space(8.0);
+                }
                 for (kind, association, artifact, path, size, file_count) in items {
                     let context = self
                         .snapshot
@@ -755,7 +813,7 @@ impl Desktop {
                                     );
                                 }
                                 ui.vertical(|ui| {
-                                    ui.label(RichText::new(title).size(16.0).strong());
+                                    ui.label(RichText::new(&title).size(16.0).strong());
                                     ui.label(RichText::new(subtitle).small().weak());
                                     ui.label(
                                         RichText::new(format!(
@@ -775,6 +833,33 @@ impl Desktop {
                                 }
                                 self.play_controls(ui, &association);
                             });
+                            if let Some(installation) = self
+                                .snapshot
+                                .installations
+                                .iter()
+                                .find(|i| {
+                                    i.association_id == association && i.artifact_id == artifact
+                                })
+                                .cloned()
+                            {
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.label(format!("Working copy: {}", installation.state));
+                                    if ui.button("Remove application…").clicked() {
+                                        self.remove_target =
+                                            Some((installation.id.clone(), false, title.clone()));
+                                        self.confirmation = Some(Confirmation::RemoveInstallation);
+                                    }
+                                    if ui.button("Remove completely…").clicked() {
+                                        self.remove_target =
+                                            Some((installation.id.clone(), true, title.clone()));
+                                        self.confirmation = Some(Confirmation::RemoveInstallation);
+                                    }
+                                });
+                            } else if let Some(profile)=self.active.clone()
+                                && ui.button("Remove local download…").clicked() {
+                                self.remove_artifact_target=Some((profile,association.clone(),title.clone()));
+                                self.confirmation=Some(Confirmation::RemoveArtifact);
+                            }
                             egui::CollapsingHeader::new("Technical details")
                                 .id_salt(&association)
                                 .show(ui, |ui| {
@@ -969,6 +1054,9 @@ impl Desktop {
                     .clicked()
                 {
                     self.settings_tab = tab;
+                    if tab == SettingsTab::Storage {
+                        self.send(Command::StorageUsage);
+                    }
                 }
             }
         });
@@ -1004,9 +1092,26 @@ impl Desktop {
             }); }
             if self.settings_tab==SettingsTab::Storage {
             section(ui,"Storage",|ui| {
+                ui.label("New Linux libraries use ~/.appdepot. An existing marked XDG library remains active until you migrate it explicitly.");
                 ui.label("Metadata, profiles and preferences"); ui.label(RichText::new(self.snapshot.library_data.display().to_string()).small().weak());
                 ui.add_space(5.0); ui.label("Verified downloads and staging"); ui.label(RichText::new(self.snapshot.library_content.display().to_string()).small().weak());
-                egui::CollapsingHeader::new("Advanced location setup").show(ui,|ui| { ui.label("Set APP_DEPOT_LIBRARY_DATA_DIR and APP_DEPOT_LIBRARY_CONTENT_DIR before starting the app. Location changes are not performed from this screen."); });
+                ui.add_space(10.0);
+                if ui.button("Refresh storage usage").clicked(){self.send(Command::StorageUsage);}
+                if let Some(usage)=&self.storage_usage {
+                    for (label,bytes) in [
+                        ("Immutable verified objects",usage.immutable_objects_logical_bytes),
+                        ("Verified materializations",usage.verified_materializations_logical_bytes),
+                        ("Writable application copies",usage.writable_installations_logical_bytes),
+                        ("Managed application data",usage.managed_userdata_logical_bytes),
+                        ("Staging and recovery",usage.staging_logical_bytes),
+                        ("Artwork cache",usage.artwork_logical_bytes),
+                    ] {ui.label(format!("{label}: {}",format_bytes(bytes)));}
+                    ui.label(RichText::new("These are logical sizes. Reflinks, compression and shared objects make physical reclaimable space different.").small().weak());
+                }
+                egui::CollapsingHeader::new("Migration and advanced locations").show(ui,|ui| {
+                    ui.label("Close App Depot and pause active downloads, then use `app-depot library migrate \"$HOME/.appdepot\" --confirm` from the existing library. The old root stays intact for review.");
+                    ui.label("APP_DEPOT_LIBRARY_DATA_DIR and APP_DEPOT_LIBRARY_CONTENT_DIR can select explicitly managed roots before starting the app. A location change is never made by merely editing this screen.");
+                });
             }); }
             if self.settings_tab==SettingsTab::Appearance {
             section(ui,"Appearance",|ui| {
@@ -1081,13 +1186,83 @@ impl Desktop {
                 "Changing the origin creates a separate profile. Existing cache and downloads remain with the archived origin."
             }
             Confirmation::RemoveToken => "Remove this server's saved or session token?",
+            Confirmation::RemoveInstallation => {
+                if self
+                    .remove_target
+                    .as_ref()
+                    .is_some_and(|(_, complete, _)| *complete)
+                {
+                    "Remove this local working copy, its managed user data and its selected verified download? Shared content used elsewhere remains. This does not remove anything from the Server or external application data."
+                } else {
+                    "Remove this writable working copy? The verified download and managed user data remain for later preparation. Files written inside the working copy will be removed."
+                }
+            }
+            Confirmation::RemoveArtifact => {
+                "Remove this selected local download? Its Server entry and other local owners remain. The local bytes are discarded when no longer shared."
+            }
+            Confirmation::RemoveApp => {
+                if self
+                    .remove_app_target
+                    .as_ref()
+                    .is_some_and(|(_, _, _, complete)| *complete)
+                {
+                    "Remove all local downloads and writable copies for this App, including App Depot-managed user data? Other Apps, Server data and external application files remain."
+                } else {
+                    "Remove this App's writable working copies? Verified downloads and managed user data remain for later preparation."
+                }
+            }
+            Confirmation::RepairSource => {
+                "Rebuild this downloaded directory from verified local objects? The current directory, including any files added by an application, will be preserved in staging."
+            }
             Confirmation::Exit => {
                 "Downloads are active. Closing interrupts them; incomplete jobs can be resumed after restart."
             }
         };
         egui::Modal::new(egui::Id::unique("confirm-action")).show(ctx, |ui| {
             ui.set_width(400.0);
+            let selected = match kind {
+                Confirmation::RemoveInstallation => self
+                    .remove_target
+                    .as_ref()
+                    .map(|(_, _, name)| name.as_str()),
+                Confirmation::RemoveArtifact => self
+                    .remove_artifact_target
+                    .as_ref()
+                    .map(|(_, _, name)| name.as_str()),
+                Confirmation::RemoveApp => self
+                    .remove_app_target
+                    .as_ref()
+                    .map(|(_, _, name, _)| name.as_str()),
+                _ => None,
+            };
+            if let Some(name) = selected {
+                ui.label(RichText::new(name).strong());
+                ui.add_space(6.0);
+            }
             ui.label(text);
+            if kind == Confirmation::RemoveInstallation
+                && let Some((id, complete, _)) = &self.remove_target
+                && let Some(item) = self.snapshot.installations.iter().find(|item| &item.id == id)
+            {
+                ui.add_space(6.0);
+                ui.label(format!("Working copy: {}", item.path.display()));
+                if *complete {
+                    ui.label(format!("Managed data: {}", item.userdata.display()));
+                    ui.label("This Association's verified download and jobs will also be removed.");
+                }
+            }
+            if kind == Confirmation::RemoveApp
+                && let Some((profile, app, _, complete)) = &self.remove_app_target
+            {
+                let copies = self.snapshot.installations.iter().filter(|item| {
+                    &item.profile_id == profile && &item.app_id == app && item.state != "Removed"
+                }).count();
+                ui.add_space(6.0);
+                ui.label(format!("Writable copies in scope: {copies}"));
+                if *complete {
+                    ui.label("Every locally saved Association of this App is in scope, including managed data. Shared immutable objects stay while another local item uses them.");
+                }
+            }
             ui.add_space(12.0);
             ui.horizontal(|ui| {
                 if ui.button("Keep").clicked() {
@@ -1107,6 +1282,44 @@ impl Desktop {
                                 self.edit_allow_http = false;
                             }
                             Confirmation::RemoveToken => self.send(Command::RemoveToken(id)),
+                            Confirmation::RemoveInstallation => {
+                                if let Some((installation, complete, _)) = self.remove_target.take()
+                                {
+                                    self.send(Command::RemoveInstallation {
+                                        id: installation,
+                                        complete,
+                                    });
+                                }
+                            }
+                            Confirmation::RemoveArtifact => {
+                                if let Some((profile, association, _)) =
+                                    self.remove_artifact_target.take()
+                                {
+                                    self.send(Command::RemoveArtifact {
+                                        profile,
+                                        association,
+                                    });
+                                }
+                            }
+                            Confirmation::RemoveApp => {
+                                if let Some((profile, app, _, complete)) =
+                                    self.remove_app_target.take()
+                                {
+                                    self.send(Command::RemoveApp {
+                                        profile,
+                                        app,
+                                        complete,
+                                    });
+                                }
+                            }
+                            Confirmation::RepairSource => {
+                                if let Some((profile, association)) = self.repair_target.take() {
+                                    self.send(Command::RepairSource {
+                                        profile,
+                                        association,
+                                    });
+                                }
+                            }
                             Confirmation::Exit => {
                                 self.exit_allowed = true;
                                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -1115,6 +1328,18 @@ impl Desktop {
                     } else if kind == Confirmation::Exit {
                         self.exit_allowed = true;
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                    if kind == Confirmation::RemoveInstallation {
+                        self.remove_target = None;
+                    }
+                    if kind == Confirmation::RemoveArtifact {
+                        self.remove_artifact_target = None;
+                    }
+                    if kind == Confirmation::RemoveApp {
+                        self.remove_app_target = None;
+                    }
+                    if kind == Confirmation::RepairSource {
+                        self.repair_target = None;
                     }
                     self.confirmation = None;
                 }

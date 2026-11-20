@@ -13,7 +13,7 @@ use std::{
 };
 use uuid::Uuid;
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 const MARKER: &str = ".app-depot-library-id";
 
 #[derive(Debug)]
@@ -66,10 +66,27 @@ pub struct LibraryPaths {
 
 impl LibraryPaths {
     pub fn default_for_user() -> Result<Self, LibraryError> {
-        let base = BaseDirs::new()
-            .ok_or_else(|| LibraryError::Invalid("user data directory unavailable".into()))?
-            .data_dir()
-            .join("app-depot-client");
+        let dirs = BaseDirs::new()
+            .ok_or_else(|| LibraryError::Invalid("user data directory unavailable".into()))?;
+        #[cfg(target_os = "linux")]
+        let base = {
+            let legacy = dirs.data_dir().join("app-depot-client");
+            let current = dirs.home_dir().join(".appdepot");
+            let legacy_id = read_marker(&legacy)?;
+            let current_id = read_marker(&current)?;
+            match (current_id, legacy_id) {
+                (Some(current_id), Some(legacy_id)) if current_id != legacy_id => {
+                    return Err(invalid(
+                        "two distinct default-location libraries exist; select one explicitly",
+                    ));
+                }
+                (Some(_), _) => current,
+                (None, Some(_)) => legacy,
+                (None, None) => current,
+            }
+        };
+        #[cfg(not(target_os = "linux"))]
+        let base = dirs.data_dir().join("app-depot-client");
         Ok(Self {
             metadata: base.clone(),
             content: base,
@@ -104,10 +121,21 @@ pub struct Cached<T> {
     pub source: &'static str,
 }
 
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalIssue {
+    pub profile_id: ServerProfileId,
+    pub association_id: Option<String>,
+    pub artifact_id: String,
+    pub kind: String,
+    pub reason: String,
+}
+
 pub struct Library {
     pub(crate) conn: Connection,
     pub paths: LibraryPaths,
     pub id: String,
+    _access_lock: fs::File,
 }
 
 pub(crate) fn now() -> Result<i64, LibraryError> {
@@ -121,7 +149,7 @@ fn invalid(message: &str) -> LibraryError {
     LibraryError::Invalid(message.into())
 }
 
-fn ensure_directory(path: &Path) -> Result<(), LibraryError> {
+pub(crate) fn ensure_directory(path: &Path) -> Result<(), LibraryError> {
     let path_text = path.as_os_str().to_string_lossy();
     if !path.is_absolute()
         || path_text
@@ -175,7 +203,38 @@ fn ensure_private_root(path: &Path) -> Result<(), LibraryError> {
     Ok(())
 }
 
-fn read_marker(path: &Path) -> Result<Option<String>, LibraryError> {
+pub(crate) fn access_lock(root: &Path, exclusive: bool) -> Result<fs::File, LibraryError> {
+    use fs2::FileExt;
+    let mut options = fs::OpenOptions::new();
+    options.read(true).write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let file = options.open(root.join(".app-depot-access.lock"))?;
+    if !file.metadata()?.is_file() {
+        return Err(invalid("unsafe library access lock"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if file.metadata()?.permissions().mode() & 0o077 != 0 {
+            return Err(invalid("library access lock must be private"));
+        }
+    }
+    let locked = if exclusive {
+        FileExt::try_lock_exclusive(&file)
+    } else {
+        FileExt::try_lock_shared(&file)
+    };
+    locked.map_err(|_| invalid("library is in use by another operation"))?;
+    Ok(file)
+}
+
+pub(crate) fn read_marker(path: &Path) -> Result<Option<String>, LibraryError> {
     let marker = path.join(MARKER);
     match fs::symlink_metadata(&marker) {
         Ok(metadata) if !metadata.is_file() || metadata.file_type().is_symlink() => {
@@ -195,7 +254,7 @@ fn read_marker(path: &Path) -> Result<Option<String>, LibraryError> {
     }
 }
 
-fn write_marker(path: &Path, id: &str) -> Result<(), LibraryError> {
+pub(crate) fn write_marker(path: &Path, id: &str) -> Result<(), LibraryError> {
     use std::fs::OpenOptions;
     let mut file = OpenOptions::new()
         .write(true)
@@ -210,6 +269,7 @@ impl Library {
     pub fn open(paths: LibraryPaths) -> Result<Self, LibraryError> {
         ensure_private_root(&paths.metadata)?;
         ensure_private_root(&paths.content)?;
+        let access = access_lock(&paths.metadata, false)?;
         let metadata_id = read_marker(&paths.metadata)?;
         let content_id = read_marker(&paths.content)?;
         if metadata_id.is_none() && paths.metadata.join("library.sqlite").exists() {
@@ -229,7 +289,14 @@ impl Library {
         if paths.content != paths.metadata && read_marker(&paths.content)?.is_none() {
             write_marker(&paths.content, &id)?;
         }
-        for directory in ["objects", "artifacts", "staging", "artwork"] {
+        for directory in [
+            "objects",
+            "artifacts",
+            "staging",
+            "artwork",
+            "apps",
+            "userdata",
+        ] {
             ensure_directory(&paths.content.join(directory))?;
         }
         let db = paths.metadata.join("library.sqlite");
@@ -273,11 +340,16 @@ impl Library {
             conn.execute_batch(SCHEMA)?;
             conn.execute_batch(MIGRATE_V2)?;
             conn.execute_batch(MIGRATE_V3)?;
+            conn.execute_batch(MIGRATE_V4)?;
         } else if version == 1 {
             conn.execute_batch(MIGRATE_V2)?;
             conn.execute_batch(MIGRATE_V3)?;
+            conn.execute_batch(MIGRATE_V4)?;
         } else if version == 2 {
             conn.execute_batch(MIGRATE_V3)?;
+            conn.execute_batch(MIGRATE_V4)?;
+        } else if version == 3 {
+            conn.execute_batch(MIGRATE_V4)?;
         } else if version != SCHEMA_VERSION {
             return Err(invalid("library schema migration is required"));
         }
@@ -301,7 +373,14 @@ impl Library {
             _ => {}
         }
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;")?;
-        Ok(Self { conn, paths, id })
+        let mut library = Self {
+            conn,
+            paths,
+            id,
+            _access_lock: access,
+        };
+        library.recover_removals()?;
+        Ok(library)
     }
 
     pub fn add_profile(
@@ -738,6 +817,29 @@ CREATE TABLE tree_files (
   PRIMARY KEY(job_id,path), UNIQUE(job_id,file_id)
 );
 PRAGMA user_version=3;
+COMMIT;
+"#;
+
+const MIGRATE_V4: &str = r#"
+BEGIN IMMEDIATE;
+CREATE TABLE installations (
+  id TEXT PRIMARY KEY,
+  profile_id TEXT NOT NULL,
+  app_id TEXT NOT NULL,
+  release_id TEXT NOT NULL,
+  association_id TEXT NOT NULL,
+  artifact_id TEXT NOT NULL,
+  state TEXT NOT NULL CHECK(state IN ('Preparing','Ready','Removing','Removed','NeedsRepair')),
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  last_error TEXT,
+  process_id INTEGER,
+  process_start TEXT,
+  remove_complete INTEGER NOT NULL DEFAULT 0 CHECK(remove_complete IN (0,1)),
+  UNIQUE(profile_id,association_id,artifact_id),
+  FOREIGN KEY(profile_id,association_id) REFERENCES associations(profile_id,id)
+);
+PRAGMA user_version=4;
 COMMIT;
 "#;
 

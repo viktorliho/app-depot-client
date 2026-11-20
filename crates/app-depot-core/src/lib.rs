@@ -5,6 +5,8 @@
 pub mod api;
 pub mod launch;
 pub mod library;
+pub mod managed;
+pub mod migration;
 pub mod models;
 pub mod secrets;
 pub mod transfer;

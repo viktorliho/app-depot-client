@@ -8,6 +8,7 @@ use app_depot_core::{
     ServerProfileId,
     api::ApiClient,
     library::LibraryPaths,
+    managed::StorageUsage,
     models::{AppConvention, AssociationConvention, ReleaseConvention},
     transfer::DownloadJob,
 };
@@ -34,6 +35,10 @@ enum Confirmation {
     Archive,
     Move,
     RemoveToken,
+    RemoveInstallation,
+    RemoveArtifact,
+    RemoveApp,
+    RepairSource,
     Exit,
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -65,6 +70,7 @@ struct ArtTexture {
 struct Desktop {
     worker: Worker,
     snapshot: Snapshot,
+    storage_usage: Option<StorageUsage>,
     active: Option<ServerProfileId>,
     screen: Screen,
     settings_tab: SettingsTab,
@@ -93,6 +99,10 @@ struct Desktop {
     token_persist: bool,
     token_visible: bool,
     confirmation: Option<Confirmation>,
+    remove_target: Option<(String, bool, String)>,
+    remove_artifact_target: Option<(ServerProfileId, String, String)>,
+    remove_app_target: Option<(ServerProfileId, String, String, bool)>,
+    repair_target: Option<(ServerProfileId, String)>,
     exit_allowed: bool,
     syncing: HashSet<String>,
     sync_errors: HashMap<String, String>,
@@ -113,6 +123,7 @@ impl Desktop {
         let this = Self {
             worker: Worker::start(paths, ctx.clone()),
             snapshot: Snapshot::default(),
+            storage_usage: None,
             active: None,
             screen: Screen::Catalog,
             settings_tab: SettingsTab::Servers,
@@ -141,6 +152,10 @@ impl Desktop {
             token_persist: true,
             token_visible: false,
             confirmation: None,
+            remove_target: None,
+            remove_artifact_target: None,
+            remove_app_target: None,
+            repair_target: None,
             exit_allowed: false,
             syncing: HashSet::new(),
             sync_errors: HashMap::new(),
@@ -210,6 +225,8 @@ impl Desktop {
         self.snapshot.apps.clear();
         self.snapshot.files.clear();
         self.snapshot.trees.clear();
+        self.snapshot.local_issues.clear();
+        self.snapshot.installations.clear();
         self.snapshot.jobs.clear();
         self.snapshot.launches.clear();
         self.launch_states.clear();
@@ -248,9 +265,12 @@ impl Desktop {
                         self.snapshot.jobs = s.jobs;
                         self.snapshot.files = s.files;
                         self.snapshot.trees = s.trees;
+                        self.snapshot.local_issues = s.local_issues;
+                        self.snapshot.installations = s.installations;
                         self.snapshot.launches = s.launches;
                     }
                 }
+                Event::StorageUsage(usage) => self.storage_usage = Some(usage),
                 Event::Jobs { profile, jobs } => {
                     if self.active.as_ref() == Some(&profile) {
                         self.snapshot.jobs = jobs;
@@ -439,11 +459,14 @@ impl Desktop {
     }
 }
 fn library_paths() -> Result<LibraryPaths, String> {
-    let mut p = LibraryPaths::default_for_user().map_err(|e| e.to_string())?;
     if let Some(v) = env::var_os("APP_DEPOT_LIBRARY_DATA_DIR") {
-        p.metadata = PathBuf::from(v);
-        p.content = p.metadata.clone();
+        let metadata = PathBuf::from(v);
+        let content = env::var_os("APP_DEPOT_LIBRARY_CONTENT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| metadata.clone());
+        return Ok(LibraryPaths { metadata, content });
     }
+    let mut p = LibraryPaths::default_for_user().map_err(|e| e.to_string())?;
     if let Some(v) = env::var_os("APP_DEPOT_LIBRARY_CONTENT_DIR") {
         p.content = PathBuf::from(v);
     }

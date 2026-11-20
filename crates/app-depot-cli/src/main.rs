@@ -36,6 +36,8 @@ fn usage() -> &'static str {
      sync/offline: --profile ID sync | cached-apps | cached-releases APP_ID | cached-declarations RELEASE_ID\n\
      download: --profile ID download start RELEASE_ID ASSOCIATION_ID [--pause-after-bytes N] | jobs | files | trees | tree-files JOB_ID | pause JOB_ID | resume JOB_ID | retry JOB_ID | cancel JOB_ID\n\
      launch: --profile ID launch list RELEASE_ID | launch play RELEASE_ID ASSOCIATION_ID ENTRY_POINT_ID\n\
+     runtime: --profile ID runtime list | runtime prepare ASSOCIATION_ID | runtime inspect INSTALLATION_ID | runtime preview INSTALLATION_ID | runtime preview-complete INSTALLATION_ID | runtime remove INSTALLATION_ID --confirm | runtime remove-complete INSTALLATION_ID --confirm | runtime remove-artifact ASSOCIATION_ID --confirm | runtime remove-app APP_ID --confirm | runtime remove-app-complete APP_ID --confirm | runtime repair INSTALLATION_ID --confirm | runtime repair-source ASSOCIATION_ID --confirm\n\
+     library: library info | library usage | library gc --confirm | library migration-preview DESTINATION_ROOT | library migrate DESTINATION_ROOT --confirm (source selected by --library-data/--library-content)\n\
      optional APP_DEPOT_TOKEN overrides stored token for this process; --library-data/--library-content select local roots"
 }
 
@@ -268,18 +270,25 @@ impl std::fmt::Display for CliError {
     }
 }
 
-fn open_library(options: &Options) -> Result<Library, CliError> {
-    let mut paths = LibraryPaths::default_for_user()?;
+fn selected_library_paths(options: &Options) -> Result<LibraryPaths, CliError> {
     if let Some(path) = &options.library_data {
-        paths.metadata = path.clone();
-        if options.library_content.is_none() {
-            paths.content = path.clone();
-        }
+        return Ok(LibraryPaths {
+            metadata: path.clone(),
+            content: options
+                .library_content
+                .clone()
+                .unwrap_or_else(|| path.clone()),
+        });
     }
+    let mut paths = LibraryPaths::default_for_user()?;
     if let Some(path) = &options.library_content {
         paths.content = path.clone();
     }
-    Ok(Library::open(paths)?)
+    Ok(paths)
+}
+
+fn open_library(options: &Options) -> Result<Library, CliError> {
+    Ok(Library::open(selected_library_paths(options)?)?)
 }
 
 fn selected_token(profile: &app_depot_core::library::Profile) -> Result<Option<String>, CliError> {
@@ -655,7 +664,13 @@ fn run_launch(options: &Options) -> Result<(), CliError> {
         ))
         .into());
     }
-    let mut child = selected.spawn()?;
+    let mut child = library.play_declared(
+        profile,
+        &args[2],
+        &args[3],
+        &args[4],
+        &selected.declaration_revision,
+    )?;
     eprintln!("started process {}", child.id());
     let status = child.wait().map_err(LibraryError::Io)?;
     if status.success() {
@@ -664,6 +679,243 @@ fn run_launch(options: &Options) -> Result<(), CliError> {
     } else {
         Err(LibraryError::Invalid(format!("process exited with {status}")).into())
     }
+}
+
+fn run_runtime(options: &Options) -> Result<(), CliError> {
+    let profile = options
+        .profile
+        .as_ref()
+        .ok_or_else(|| ApiError::Config("runtime requires --profile ID".into()))?;
+    let args = &options.positional;
+    let mut library = open_library(options)?;
+    match (args.get(1).map(String::as_str), args.len()) {
+        (Some("list"), 2) => {
+            let items = library.installations(Some(profile))?;
+            if options.json {
+                print_json(&items)?
+            } else {
+                for item in items {
+                    println!(
+                        "{}  {}  {}  {}",
+                        item.id,
+                        item.app_id,
+                        item.state,
+                        item.path.display()
+                    );
+                }
+            }
+        }
+        (Some("inspect"), 3) => {
+            let item = library.installation(&args[2])?;
+            if &item.profile_id != profile {
+                return Err(LibraryError::Invalid(
+                    "installation belongs to another profile".into(),
+                )
+                .into());
+            }
+            if options.json {
+                print_json(&item)?
+            } else {
+                println!(
+                    "{}  {}  {}  {}",
+                    item.id,
+                    item.app_id,
+                    item.state,
+                    item.path.display()
+                );
+            }
+        }
+        (Some("preview" | "preview-complete"), 3) => {
+            let preview = library.removal_preview(&args[2], args[1] == "preview-complete")?;
+            if &preview.installation.profile_id != profile {
+                return Err(LibraryError::Invalid(
+                    "installation belongs to another profile".into(),
+                )
+                .into());
+            }
+            if options.json {
+                print_json(&preview)?;
+            } else {
+                println!(
+                    "Selected: {} / {} / {}\nWorking copy: {} ({} logical bytes)",
+                    preview.installation.app_id,
+                    preview.installation.release_id,
+                    preview.installation.association_id,
+                    preview.installation.path.display(),
+                    preview.working_copy_logical_bytes
+                );
+                if preview.complete {
+                    println!(
+                        "Managed user data: {} ({} logical bytes)\nVerified materialization: {} logical bytes\nOther verified references to this Artifact: {}",
+                        preview.installation.userdata.display(),
+                        preview.managed_data_logical_bytes,
+                        preview.verified_materialization_logical_bytes,
+                        preview.other_verified_references
+                    );
+                } else {
+                    println!("Managed user data and verified download remain.");
+                }
+                println!(
+                    "This is a preview. Physical disk space reclaimed may differ; the Server is unchanged."
+                );
+            }
+        }
+        (Some("prepare"), 3) => {
+            let item = library.prepare_portable(profile, &args[2])?;
+            if options.json {
+                print_json(&item)?
+            } else {
+                println!("prepared {} at {}", item.id, item.path.display());
+            }
+        }
+        (Some("repair-source"), 3) => {
+            if !options.confirm {
+                return Err(LibraryError::Invalid(
+                    "source repair requires --confirm; the old directory is preserved in staging"
+                        .into(),
+                )
+                .into());
+            }
+            let (path, quarantine) = library.repair_verified_tree(profile, &args[2])?;
+            println!("verified source repaired at {}", path.display());
+            if let Some(quarantine) = quarantine {
+                println!("previous directory preserved at {}", quarantine.display());
+            }
+        }
+        (Some("remove-artifact"), 3) => {
+            if !options.confirm {
+                return Err(LibraryError::Invalid(
+                    "local Artifact removal requires --confirm".into(),
+                )
+                .into());
+            }
+            library.remove_local_artifact(profile, &args[2])?;
+            println!("local Association download removed; Server and other local owners unchanged");
+        }
+        (Some("remove-app" | "remove-app-complete"), 3) => {
+            if !options.confirm {
+                return Err(
+                    LibraryError::Invalid("local App removal requires --confirm".into()).into(),
+                );
+            }
+            let count =
+                library.remove_local_app(profile, &args[2], args[1] == "remove-app-complete")?;
+            println!("processed {count} local Association(s); Server catalog and profile retained");
+        }
+        (Some("remove" | "remove-complete" | "repair"), 3) => {
+            if !options.confirm {
+                return Err(
+                    LibraryError::Invalid("this operation requires --confirm".into()).into(),
+                );
+            }
+            let item = library.installation(&args[2])?;
+            if &item.profile_id != profile {
+                return Err(LibraryError::Invalid(
+                    "installation belongs to another profile".into(),
+                )
+                .into());
+            }
+            let action = args[1].as_str();
+            library.remove_installation(&item.id, action == "remove-complete")?;
+            if action == "repair" {
+                let repaired = library.prepare_portable(profile, &item.association_id)?;
+                if options.json {
+                    print_json(&repaired)?
+                } else {
+                    println!("repaired {}", repaired.id);
+                }
+            } else if !options.json {
+                println!("removed local installation {}", item.id);
+            }
+        }
+        _ => return Err(ApiError::Config(usage().into()).into()),
+    }
+    Ok(())
+}
+
+fn run_library(options: &Options) -> Result<(), CliError> {
+    match (
+        options.positional.get(1).map(String::as_str),
+        options.positional.len(),
+    ) {
+        (Some("info"), 2) => {
+            let library = open_library(options)?;
+            println!(
+                "Library ID: {}\nMetadata: {}\nContent: {}",
+                library.id,
+                library.paths.metadata.display(),
+                library.paths.content.display()
+            );
+        }
+        (Some("usage"), 2) => {
+            let library = open_library(options)?;
+            let usage = library.storage_usage()?;
+            if options.json {
+                print_json(&usage)?
+            } else {
+                println!(
+                    "Immutable objects: {} logical bytes\nVerified materializations: {} logical bytes\nWritable applications: {} logical bytes\nManaged user data: {} logical bytes\nStaging: {} logical bytes\nArtwork: {} logical bytes",
+                    usage.immutable_objects_logical_bytes,
+                    usage.verified_materializations_logical_bytes,
+                    usage.writable_installations_logical_bytes,
+                    usage.managed_userdata_logical_bytes,
+                    usage.staging_logical_bytes,
+                    usage.artwork_logical_bytes
+                );
+                println!(
+                    "Physical reclaimable space may differ because of reflinks, compression and shared content."
+                );
+            }
+        }
+        (Some("gc"), 2) => {
+            if !options.confirm {
+                return Err(LibraryError::Invalid(
+                    "immutable-object cleanup requires --confirm".into(),
+                )
+                .into());
+            }
+            let mut library = open_library(options)?;
+            let bytes = library.collect_unreferenced_objects()?;
+            println!(
+                "Removed {bytes} logical bytes of unreferenced verified objects; physical free space may differ."
+            );
+        }
+        (Some("migration-preview"), 3) => {
+            let source = selected_library_paths(options)?;
+            let destination = PathBuf::from(&options.positional[2]);
+            let estimate = app_depot_core::migration::migration_estimate(&source, &destination)?;
+            if options.json {
+                print_json(&estimate)?
+            } else {
+                println!(
+                    "Source logical bytes: {}\nDestination free bytes: {}\nDestination: {}",
+                    estimate.source_logical_bytes,
+                    estimate.destination_available_bytes,
+                    estimate.destination.display()
+                );
+                println!(
+                    "Copy-on-write sharing may reduce the actual space needed; the source stays intact until you inspect the migrated copy."
+                );
+            }
+        }
+        (Some("migrate"), 3) => {
+            if !options.confirm {
+                return Err(LibraryError::Invalid(
+                    "migration requires --confirm; the source is preserved".into(),
+                )
+                .into());
+            }
+            let source = selected_library_paths(options)?;
+            let destination = PathBuf::from(&options.positional[2]);
+            let result = app_depot_core::migration::migrate_library(&source, &destination)?;
+            println!(
+                "Migrated library to {}. The source remains untouched; inspect the destination before cleaning up the old root.",
+                result.display()
+            );
+        }
+        _ => return Err(ApiError::Config(usage().into()).into()),
+    }
+    Ok(())
 }
 
 fn run() -> Result<(), CliError> {
@@ -676,6 +928,12 @@ fn run() -> Result<(), CliError> {
     }
     if options.positional[0] == "launch" {
         return run_launch(&options);
+    }
+    if options.positional[0] == "runtime" {
+        return run_runtime(&options);
+    }
+    if options.positional[0] == "library" {
+        return run_library(&options);
     }
     if let Some(profile_id) = &options.profile
         && options.positional[0].starts_with("cached-")

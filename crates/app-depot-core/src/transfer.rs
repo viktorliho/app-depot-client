@@ -883,6 +883,17 @@ impl Library {
         &self,
         profile: Option<&ServerProfileId>,
     ) -> Result<Vec<VerifiedFile>, LibraryError> {
+        let (valid, issues) = self.inspect_files(profile)?;
+        if let Some(issue) = issues.first() {
+            return Err(invalid(format!("{}: {}", issue.artifact_id, issue.reason)));
+        }
+        Ok(valid)
+    }
+
+    pub fn inspect_files(
+        &self,
+        profile: Option<&ServerProfileId>,
+    ) -> Result<(Vec<VerifiedFile>, Vec<crate::library::LocalIssue>), LibraryError> {
         let mut stmt=self.conn.prepare("SELECT profile_id,artifact_id,association_id,local_ref,verified_at FROM verified_content WHERE artifact_id LIKE 'adfile:sha256:%' AND (?1 IS NULL OR profile_id=?1) ORDER BY verified_at")?;
         let rows = stmt
             .query_map([profile.map(|p| p.0.as_str())], |r| {
@@ -895,21 +906,60 @@ impl Library {
                 ))
             })?
             .collect::<Result<Vec<_>, _>>()?;
-        rows.into_iter().map(|(profile_id,artifact_id,association_id,relative,verified_at)| {
-            let association=association_id.ok_or_else(||invalid("verified file lacks association identity"))?;
-            Uuid::parse_str(&profile_id).map_err(|_|invalid("invalid verified profile ID"))?;
-            Uuid::parse_str(&association).map_err(|_|invalid("invalid verified association ID"))?;
-            let expected_relative=PathBuf::from("artifacts").join(&profile_id).join(&association).join(digest(&artifact_id)?);
-            if Path::new(&relative)!=expected_relative { return Err(invalid("unsafe verified content path")); }
-            let path=self.paths.content.join(&expected_relative);
-            existing_dir(&self.paths.content.join("artifacts"))?;
-            existing_dir(&self.paths.content.join("artifacts").join(&profile_id))?;
-            existing_dir(&self.paths.content.join("artifacts").join(&profile_id).join(&association))?;
-            let expected=digest(&artifact_id)?;
-            let size:i64=self.conn.query_row("SELECT json_extract(metadata_json,'$.size') FROM artifacts WHERE profile_id=?1 AND id=?2",params![profile_id,artifact_id],|r|r.get(0))?;
-            if size<0 || hash_file(&path,size as u64)?!=expected { return Err(invalid("verified content missing or modified")); }
-            Ok(VerifiedFile{profile_id:ServerProfileId(profile_id),association_id:association,artifact_id,path,size:size as u64,verified_at})
-        }).collect()
+        let mut valid = Vec::new();
+        let mut issues = Vec::new();
+        for (profile_id, artifact_id, association_id, relative, verified_at) in rows {
+            let result = (|| -> Result<VerifiedFile, LibraryError> {
+                let association = association_id
+                    .clone()
+                    .ok_or_else(|| invalid("verified file lacks association identity"))?;
+                Uuid::parse_str(&profile_id).map_err(|_| invalid("invalid verified profile ID"))?;
+                Uuid::parse_str(&association)
+                    .map_err(|_| invalid("invalid verified association ID"))?;
+                let expected_relative = PathBuf::from("artifacts")
+                    .join(&profile_id)
+                    .join(&association)
+                    .join(digest(&artifact_id)?);
+                if Path::new(&relative) != expected_relative {
+                    return Err(invalid("unsafe verified content path"));
+                }
+                let path = self.paths.content.join(&expected_relative);
+                existing_dir(&self.paths.content.join("artifacts"))?;
+                existing_dir(&self.paths.content.join("artifacts").join(&profile_id))?;
+                existing_dir(
+                    &self
+                        .paths
+                        .content
+                        .join("artifacts")
+                        .join(&profile_id)
+                        .join(&association),
+                )?;
+                let expected = digest(&artifact_id)?;
+                let size:i64=self.conn.query_row("SELECT json_extract(metadata_json,'$.size') FROM artifacts WHERE profile_id=?1 AND id=?2",params![profile_id,artifact_id],|r|r.get(0))?;
+                if size < 0 || hash_file(&path, size as u64)? != expected {
+                    return Err(invalid("verified content missing or modified"));
+                }
+                Ok(VerifiedFile {
+                    profile_id: ServerProfileId(profile_id.clone()),
+                    association_id: association,
+                    artifact_id: artifact_id.clone(),
+                    path,
+                    size: size as u64,
+                    verified_at,
+                })
+            })();
+            match result {
+                Ok(item) => valid.push(item),
+                Err(error) => issues.push(crate::library::LocalIssue {
+                    profile_id: ServerProfileId(profile_id),
+                    association_id,
+                    artifact_id,
+                    kind: "File".into(),
+                    reason: error.to_string(),
+                }),
+            }
+        }
+        Ok((valid, issues))
     }
 }
 
@@ -1438,7 +1488,7 @@ mod tests {
         let f = fixture(vec![1], "normal");
         let paths = f.library.paths.clone();
         let id = f.profile.clone();
-        f.library.conn.execute_batch("PRAGMA user_version=1; DROP TABLE tree_files; DROP INDEX download_jobs_active; ALTER TABLE download_jobs DROP COLUMN inventory_json; ALTER TABLE download_jobs DROP COLUMN inventory_etag; ALTER TABLE download_jobs DROP COLUMN association_id; ALTER TABLE download_jobs DROP COLUMN expected_size; ALTER TABLE download_jobs DROP COLUMN etag; ALTER TABLE download_jobs DROP COLUMN progress; ALTER TABLE download_jobs DROP COLUMN checkpoint_hash; ALTER TABLE download_jobs DROP COLUMN last_error; ALTER TABLE download_jobs DROP COLUMN updated_at; ALTER TABLE download_jobs DROP COLUMN attempts; ALTER TABLE verified_content DROP COLUMN association_id;").unwrap();
+        f.library.conn.execute_batch("PRAGMA user_version=1; DROP TABLE installations; DROP TABLE tree_files; DROP INDEX download_jobs_active; ALTER TABLE download_jobs DROP COLUMN inventory_json; ALTER TABLE download_jobs DROP COLUMN inventory_etag; ALTER TABLE download_jobs DROP COLUMN association_id; ALTER TABLE download_jobs DROP COLUMN expected_size; ALTER TABLE download_jobs DROP COLUMN etag; ALTER TABLE download_jobs DROP COLUMN progress; ALTER TABLE download_jobs DROP COLUMN checkpoint_hash; ALTER TABLE download_jobs DROP COLUMN last_error; ALTER TABLE download_jobs DROP COLUMN updated_at; ALTER TABLE download_jobs DROP COLUMN attempts; ALTER TABLE verified_content DROP COLUMN association_id;").unwrap();
         let library = Library::open(paths).unwrap();
         assert_eq!(library.profile(&id).unwrap().name, "fixture");
     }
@@ -1447,7 +1497,7 @@ mod tests {
         let mut f = fixture(vec![1], "normal");
         let job = queue(&mut f);
         let paths = f.library.paths.clone();
-        f.library.conn.execute_batch("PRAGMA user_version=2; DROP TABLE tree_files; DROP INDEX download_jobs_active; ALTER TABLE download_jobs DROP COLUMN inventory_json; ALTER TABLE download_jobs DROP COLUMN inventory_etag; CREATE UNIQUE INDEX download_jobs_active ON download_jobs(profile_id,artifact_id,association_id) WHERE state IN ('Queued','Downloading','Verifying','Committing','Paused');").unwrap();
+        f.library.conn.execute_batch("PRAGMA user_version=2; DROP TABLE installations; DROP TABLE tree_files; DROP INDEX download_jobs_active; ALTER TABLE download_jobs DROP COLUMN inventory_json; ALTER TABLE download_jobs DROP COLUMN inventory_etag; CREATE UNIQUE INDEX download_jobs_active ON download_jobs(profile_id,artifact_id,association_id) WHERE state IN ('Queued','Downloading','Verifying','Committing','Paused');").unwrap();
         let library = Library::open(paths).unwrap();
         assert_eq!(library.job(&job.id).unwrap().artifact_id, job.artifact_id);
         assert_eq!(library.job(&job.id).unwrap().state, "Queued");

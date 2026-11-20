@@ -125,16 +125,16 @@ impl Library {
         profile: &ServerProfileId,
         release: &str,
     ) -> Result<Vec<LaunchCandidate>, LibraryError> {
-        let files = self.verified_files(Some(profile))?;
-        let trees = self.verified_trees(Some(profile))?;
+        let (files, _) = self.inspect_files(Some(profile))?;
+        let (trees, _) = self.inspect_trees(Some(profile))?;
         self.launch_candidates_with_verified(profile, release, &files, &trees)
     }
     pub fn launch_candidates_with_verified(
         &self,
         profile: &ServerProfileId,
         release: &str,
-        file_items: &[VerifiedFile],
-        tree_items: &[VerifiedTree],
+        _file_items: &[VerifiedFile],
+        _tree_items: &[VerifiedTree],
     ) -> Result<Vec<LaunchCandidate>, LibraryError> {
         let snapshot = self
             .cached_snapshot(profile, release)?
@@ -345,23 +345,22 @@ impl Library {
                 }
                 c.target = Some(target_path.clone());
                 c.working_directory = Some(work.clone());
+                let referenced: i64 = self.conn.query_row(
+                    "SELECT count(*) FROM verified_content WHERE profile_id=?1 AND association_id=?2 AND artifact_id=?3",
+                    rusqlite::params![profile.0,a.id,a.artifact_id],|r|r.get(0))?;
+                let installation = self.installation_for(profile, &a.id, &a.artifact_id)?;
+                let runtime = installation.as_ref().filter(|item| item.state == "Ready");
                 if file {
-                    if let Some(v) = file_items
-                        .iter()
-                        .find(|v| v.association_id == a.id && v.artifact_id == a.artifact_id)
-                    {
-                        c.local_root = v.path.parent().map(Path::to_path_buf);
-                        c.expected_size = Some(v.size);
+                    if let Some(runtime) = runtime {
+                        c.local_root = Some(runtime.path.clone());
+                        c.expected_size = artifact.value.size;
                         c.expected_hash = a
                             .artifact_id
                             .strip_prefix("adfile:sha256:")
                             .map(str::to_owned);
-                        c.target = v.path.file_name().map(|n| n.to_string_lossy().into_owned());
+                        c.target = Some("payload".into());
                     }
-                } else if let Some(v) = tree_items
-                    .iter()
-                    .find(|v| v.association_id == a.id && v.artifact_id == a.artifact_id)
-                {
+                } else if let Some(runtime) = runtime {
                     let job_id:String=self.conn.query_row("SELECT id FROM download_jobs WHERE profile_id=?1 AND association_id=?2 AND artifact_id=?3 AND state='Completed' ORDER BY updated_at DESC LIMIT 1",rusqlite::params![profile.0,a.id,a.artifact_id],|r|r.get(0))?;
                     let inventory = self
                         .tree_inventory(&job_id)?
@@ -374,7 +373,7 @@ impl Library {
                                 .iter()
                                 .any(|e| matches!(e,InventoryEntry::Directory{path} if path==&work))
                         {
-                            c.local_root = Some(v.path.clone());
+                            c.local_root = Some(runtime.path.clone());
                             c.expected_size = Some(*size);
                             c.expected_hash = Some(sha256.clone());
                         } else {
@@ -408,6 +407,12 @@ impl Library {
                         "UnsupportedPlatform",
                         "Native portable execution is implemented only on Linux",
                     );
+                } else if c.reason.is_empty() && referenced == 1 {
+                    issue(
+                        &mut c,
+                        "PreparationRequired",
+                        "Verified download is available; prepare a writable local copy before Play",
+                    );
                 } else if c.reason.is_empty() {
                     issue(
                         &mut c,
@@ -431,7 +436,11 @@ impl Library {
 }
 
 #[cfg(target_os = "linux")]
-fn open_nofollow(root: &Path, relative: &str, directory: bool) -> Result<File, LibraryError> {
+pub(crate) fn open_nofollow(
+    root: &Path,
+    relative: &str,
+    directory: bool,
+) -> Result<File, LibraryError> {
     use std::os::unix::ffi::OsStrExt;
     use std::{
         ffi::CString,
