@@ -9,11 +9,11 @@ use std::{
     fmt, fs,
     io::{Read, Write},
     path::{Component, Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use uuid::Uuid;
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 const MARKER: &str = ".app-depot-library-id";
 
 #[derive(Debug)]
@@ -234,6 +234,32 @@ pub(crate) fn access_lock(root: &Path, exclusive: bool) -> Result<fs::File, Libr
     Ok(file)
 }
 
+fn schema_open_lock(root: &Path) -> Result<fs::File, LibraryError> {
+    use fs2::FileExt;
+    let mut options = fs::OpenOptions::new();
+    options.read(true).write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let file = options.open(root.join(".app-depot-schema.lock"))?;
+    if !file.metadata()?.is_file() {
+        return Err(invalid("unsafe schema lock"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if file.metadata()?.permissions().mode() & 0o077 != 0 {
+            return Err(invalid("schema lock must be private"));
+        }
+    }
+    FileExt::lock_exclusive(&file)?;
+    Ok(file)
+}
+
 pub(crate) fn read_marker(path: &Path) -> Result<Option<String>, LibraryError> {
     let marker = path.join(MARKER);
     match fs::symlink_metadata(&marker) {
@@ -269,6 +295,7 @@ impl Library {
     pub fn open(paths: LibraryPaths) -> Result<Self, LibraryError> {
         ensure_private_root(&paths.metadata)?;
         ensure_private_root(&paths.content)?;
+        let schema_lock = schema_open_lock(&paths.metadata)?;
         let access = access_lock(&paths.metadata, false)?;
         let metadata_id = read_marker(&paths.metadata)?;
         let content_id = read_marker(&paths.content)?;
@@ -327,6 +354,7 @@ impl Library {
                 fs::set_permissions(&db, fs::Permissions::from_mode(0o600))?;
             }
         }
+        conn.busy_timeout(Duration::from_secs(5))?;
         conn.execute_batch("PRAGMA foreign_keys=ON;")?;
         let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         if version > SCHEMA_VERSION {
@@ -341,15 +369,21 @@ impl Library {
             conn.execute_batch(MIGRATE_V2)?;
             conn.execute_batch(MIGRATE_V3)?;
             conn.execute_batch(MIGRATE_V4)?;
+            conn.execute_batch(MIGRATE_V5)?;
         } else if version == 1 {
             conn.execute_batch(MIGRATE_V2)?;
             conn.execute_batch(MIGRATE_V3)?;
             conn.execute_batch(MIGRATE_V4)?;
+            conn.execute_batch(MIGRATE_V5)?;
         } else if version == 2 {
             conn.execute_batch(MIGRATE_V3)?;
             conn.execute_batch(MIGRATE_V4)?;
+            conn.execute_batch(MIGRATE_V5)?;
         } else if version == 3 {
             conn.execute_batch(MIGRATE_V4)?;
+            conn.execute_batch(MIGRATE_V5)?;
+        } else if version == 4 {
+            conn.execute_batch(MIGRATE_V5)?;
         } else if version != SCHEMA_VERSION {
             return Err(invalid("library schema migration is required"));
         }
@@ -372,7 +406,11 @@ impl Library {
             }
             _ => {}
         }
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;")?;
+        if !existing_db {
+            conn.execute_batch("PRAGMA journal_mode=WAL;")?;
+        }
+        conn.execute_batch("PRAGMA synchronous=FULL;")?;
+        drop(schema_lock);
         let mut library = Self {
             conn,
             paths,
@@ -418,6 +456,46 @@ impl Library {
             compatibility_issues: serde_json::from_str(&raw.8)?,
             archived: raw.9,
         })
+    }
+
+    pub fn release_for_association(
+        &self,
+        profile: &ServerProfileId,
+        association: &str,
+    ) -> Result<Option<String>, LibraryError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT release_id FROM associations WHERE profile_id=?1 AND id=?2",
+                params![profile.0, association],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    pub fn display_context_for_association(
+        &self,
+        profile: &ServerProfileId,
+        association: &str,
+    ) -> Result<Option<(String, String, String)>, LibraryError> {
+        let raw:Option<(String,String,String)>=self.conn.query_row("SELECT apps.metadata_json,releases.metadata_json,profiles.name FROM associations JOIN releases ON releases.profile_id=associations.profile_id AND releases.id=associations.release_id JOIN apps ON apps.profile_id=releases.profile_id AND apps.id=releases.app_id JOIN profiles ON profiles.id=associations.profile_id WHERE associations.profile_id=?1 AND associations.id=?2",params![profile.0,association],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
+        raw.map(|(app, release, server)| {
+            let app: serde_json::Value = serde_json::from_str(&app)?;
+            let release: serde_json::Value = serde_json::from_str(&release)?;
+            Ok((
+                app.get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Saved application")
+                    .to_owned(),
+                release
+                    .get("version")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Release")
+                    .to_owned(),
+                server,
+            ))
+        })
+        .transpose()
     }
 
     pub fn profiles(&self, include_archived: bool) -> Result<Vec<Profile>, LibraryError> {
@@ -843,6 +921,15 @@ PRAGMA user_version=4;
 COMMIT;
 "#;
 
+const MIGRATE_V5: &str = r#"
+BEGIN IMMEDIATE;
+ALTER TABLE download_jobs ADD COLUMN queue_rank INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE download_jobs ADD COLUMN auto_resume INTEGER NOT NULL DEFAULT 0 CHECK(auto_resume IN (0,1));
+UPDATE download_jobs SET queue_rank=rowid;
+PRAGMA user_version=5;
+COMMIT;
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -929,6 +1016,52 @@ mod tests {
             Library::open(paths),
             Err(LibraryError::Invalid(_))
         ));
+    }
+
+    #[test]
+    fn concurrent_open_migrates_version_four_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let roots = paths(&dir);
+        ensure_private_root(&roots.metadata).unwrap();
+        ensure_private_root(&roots.content).unwrap();
+        let id = Uuid::new_v4().to_string();
+        write_marker(&roots.metadata, &id).unwrap();
+        write_marker(&roots.content, &id).unwrap();
+        let db = roots.metadata.join("library.sqlite");
+        let old = Connection::open(&db).unwrap();
+        old.execute_batch(SCHEMA).unwrap();
+        old.execute_batch(MIGRATE_V2).unwrap();
+        old.execute_batch(MIGRATE_V3).unwrap();
+        old.execute_batch(MIGRATE_V4).unwrap();
+        old.execute(
+            "INSERT INTO library_meta(key,value) VALUES ('library_id',?1)",
+            [&id],
+        )
+        .unwrap();
+        drop(old);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&db, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let roots = roots.clone();
+                thread::spawn(move || {
+                    let lib = Library::open(roots).unwrap();
+                    assert_eq!(
+                        lib.conn
+                            .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+                            .unwrap(),
+                        5
+                    );
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        assert_eq!(Library::open(roots).unwrap().id, id);
     }
 
     #[test]

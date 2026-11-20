@@ -10,8 +10,11 @@ use crate::{
 use fs2::FileExt;
 use rusqlite::{OptionalExtension, params};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::{
+    collections::BTreeSet,
     fs::{self, File},
+    io::Read,
     os::fd::AsRawFd,
     path::{Path, PathBuf},
 };
@@ -265,6 +268,71 @@ pub struct Installation {
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct InstallationIntegrity {
+    pub installation_id: String,
+    pub missing: Vec<String>,
+    pub modified: Vec<String>,
+    pub unexpected: Vec<String>,
+}
+
+impl InstallationIntegrity {
+    pub fn matches_original(&self) -> bool {
+        self.missing.is_empty() && self.modified.is_empty() && self.unexpected.is_empty()
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn hash_open(mut file: File) -> Result<String, LibraryError> {
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&buffer[..count]);
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+#[cfg(target_os = "linux")]
+fn runtime_paths(root: &Path) -> Result<BTreeSet<String>, LibraryError> {
+    fn visit(
+        root: &Path,
+        relative: &str,
+        mount: u64,
+        paths: &mut BTreeSet<String>,
+    ) -> Result<(), LibraryError> {
+        let dir = crate::launch::open_nofollow(root, relative, true)?;
+        if statx_handle(&dir)?.stx_mnt_id != mount {
+            return Err(invalid("runtime contains a nested mount"));
+        }
+        for item in fs::read_dir(format!("/proc/self/fd/{}", dir.as_raw_fd()))? {
+            let item = item?;
+            let name = item
+                .file_name()
+                .into_string()
+                .map_err(|_| invalid("runtime contains a non-UTF-8 name"))?;
+            let path = if relative.is_empty() {
+                name
+            } else {
+                format!("{relative}/{name}")
+            };
+            paths.insert(path.clone());
+            if item.file_type()?.is_dir() {
+                visit(root, &path, mount, paths)?;
+            }
+        }
+        Ok(())
+    }
+    let handle = crate::launch::open_nofollow(root, "", true)?;
+    let mut paths = BTreeSet::new();
+    visit(root, "", statx_handle(&handle)?.stx_mnt_id, &mut paths)?;
+    Ok(paths)
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct StorageUsage {
     pub immutable_objects_logical_bytes: u64,
     pub verified_materializations_logical_bytes: u64,
@@ -426,13 +494,26 @@ impl Library {
         app: &str,
         complete: bool,
     ) -> Result<usize, LibraryError> {
+        self.remove_local_app_observed(profile, app, complete, &mut |_, _| {})
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn remove_local_app_observed(
+        &mut self,
+        profile: &ServerProfileId,
+        app: &str,
+        complete: bool,
+        observer: &mut dyn FnMut(usize, usize),
+    ) -> Result<usize, LibraryError> {
         let associations: Vec<(String, String)> = {
             let mut stmt=self.conn.prepare("SELECT a.id,a.artifact_id FROM associations a JOIN releases r ON r.profile_id=a.profile_id AND r.id=a.release_id WHERE r.profile_id=?1 AND r.app_id=?2 ORDER BY a.id")?;
             stmt.query_map(params![profile.0, app], |r| Ok((r.get(0)?, r.get(1)?)))?
                 .collect::<Result<_, _>>()?
         };
         let mut removed = 0;
-        for (association, artifact) in associations {
+        let total = associations.len();
+        for (index, (association, artifact)) in associations.into_iter().enumerate() {
+            observer(index + 1, total);
             if complete {
                 let owned:i64=self.conn.query_row("SELECT (SELECT count(*) FROM verified_content WHERE profile_id=?1 AND association_id=?2 AND artifact_id=?3)+(SELECT count(*) FROM download_jobs WHERE profile_id=?1 AND association_id=?2 AND artifact_id=?3)",params![profile.0,association,artifact],|r|r.get(0))?;
                 if owned != 0
@@ -459,6 +540,19 @@ impl Library {
         _profile: &ServerProfileId,
         _app: &str,
         _complete: bool,
+    ) -> Result<usize, LibraryError> {
+        Err(invalid(
+            "managed removal is currently available only on Linux",
+        ))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn remove_local_app_observed(
+        &mut self,
+        _profile: &ServerProfileId,
+        _app: &str,
+        _complete: bool,
+        _observer: &mut dyn FnMut(usize, usize),
     ) -> Result<usize, LibraryError> {
         Err(invalid(
             "managed removal is currently available only on Linux",
@@ -666,6 +760,15 @@ impl Library {
 
     #[cfg(target_os = "linux")]
     pub(crate) fn recover_removals(&mut self) -> Result<(), LibraryError> {
+        match self.lifecycle_lock() {
+            Ok(lock) => drop(lock),
+            Err(LibraryError::Invalid(message))
+                if message == "another library lifecycle operation is active" =>
+            {
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        }
         let rows: Vec<(String, bool)> = {
             let mut stmt = self
                 .conn
@@ -677,6 +780,10 @@ impl Library {
         };
         for (id, complete) in rows {
             if let Err(error) = self.remove_installation(&id, complete) {
+                if matches!(&error,LibraryError::Invalid(message) if message=="another library lifecycle operation is active")
+                {
+                    continue;
+                }
                 self.conn.execute(
                     "UPDATE installations SET last_error=?2,updated_at=?3 WHERE id=?1",
                     params![id, error.to_string(), now()?],
@@ -694,7 +801,18 @@ impl Library {
     /// A durable Removing record makes interruption retryable.
     #[cfg(target_os = "linux")]
     pub fn remove_installation(&mut self, id: &str, complete: bool) -> Result<(), LibraryError> {
+        self.remove_installation_observed(id, complete, &mut |_| {})
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn remove_installation_observed(
+        &mut self,
+        id: &str,
+        complete: bool,
+        observer: &mut dyn FnMut(&str),
+    ) -> Result<(), LibraryError> {
         let _lock = self.lifecycle_lock()?;
+        observer("Checking active processes");
         let item = self.installation(id)?;
         let tracked: (Option<i64>, Option<String>) = self.conn.query_row(
             "SELECT process_id,process_start FROM installations WHERE id=?1",
@@ -723,13 +841,20 @@ impl Library {
         } else {
             self.conn.execute("UPDATE installations SET state='Removing',remove_complete=?2,updated_at=?3 WHERE id=?1",params![id,i64::from(complete),now()?])?;
         }
+        observer("Removing working data");
         delete_owned(&self.paths.content, &self.paths.content.join("apps"), id)?;
         delete_owned(
             &self.paths.content,
             &self.paths.content.join("staging"),
             &format!("runtime-{id}"),
         )?;
+        delete_owned(
+            &self.paths.content,
+            &self.paths.content.join("staging"),
+            &format!("runtime-quarantine-{id}"),
+        )?;
         if complete {
+            observer("Removing local verified references");
             delete_owned(
                 &self.paths.content,
                 &self.paths.content.join("userdata"),
@@ -792,8 +917,10 @@ impl Library {
                 [id],
             )?;
             tx.commit()?;
+            observer("Reclaiming unreferenced content");
             self.collect_unreferenced_objects()?;
         } else {
+            observer("Finalizing removal");
             self.conn.execute("UPDATE installations SET state='Removed',updated_at=?2,last_error=NULL WHERE id=?1 AND state='Removing'",params![id,now()?])?;
         }
         Ok(())
@@ -801,6 +928,18 @@ impl Library {
 
     #[cfg(not(target_os = "linux"))]
     pub fn remove_installation(&mut self, _id: &str, _complete: bool) -> Result<(), LibraryError> {
+        Err(invalid(
+            "managed removal is currently available only on Linux",
+        ))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn remove_installation_observed(
+        &mut self,
+        _id: &str,
+        _complete: bool,
+        _observer: &mut dyn FnMut(&str),
+    ) -> Result<(), LibraryError> {
         Err(invalid(
             "managed removal is currently available only on Linux",
         ))
@@ -839,6 +978,151 @@ impl Library {
             userdata: self.paths.content.join("userdata").join(id),
             last_error: fields.6,
         })
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn verify_installation(&self, id: &str) -> Result<InstallationIntegrity, LibraryError> {
+        let item = self.installation(id)?;
+        if item.state != "Ready" {
+            return Err(invalid("installation is not ready"));
+        }
+        let mut expected = BTreeSet::new();
+        let mut files = Vec::new();
+        let mut directories = Vec::new();
+        if let Some(digest) = item.artifact_id.strip_prefix("adfile:sha256:") {
+            let size = self
+                .cached_artifact(&item.profile_id, &item.artifact_id)?
+                .and_then(|value| value.value.size)
+                .ok_or_else(|| invalid("cached File size missing"))?;
+            expected.insert("payload".to_owned());
+            files.push(("payload".to_owned(), size, digest.to_owned()));
+        } else {
+            let completed:String=self.conn.query_row("SELECT id FROM download_jobs WHERE profile_id=?1 AND association_id=?2 AND artifact_id=?3 AND state='Completed' ORDER BY updated_at DESC LIMIT 1",params![item.profile_id.0,item.association_id,item.artifact_id],|r|r.get(0))?;
+            let inventory = self
+                .tree_inventory(&completed)?
+                .ok_or_else(|| invalid("verified Tree inventory missing"))?;
+            if identity(&inventory)? != item.artifact_id {
+                return Err(invalid("verified Tree identity mismatch"));
+            }
+            for entry in inventory {
+                expected.insert(entry.path().to_owned());
+                match entry {
+                    InventoryEntry::File {
+                        path, size, sha256, ..
+                    } => files.push((path, size, sha256)),
+                    InventoryEntry::Directory { path } => directories.push(path),
+                }
+            }
+        }
+        let actual = runtime_paths(&item.path)?;
+        let mut result = InstallationIntegrity {
+            installation_id: id.to_owned(),
+            missing: Vec::new(),
+            modified: Vec::new(),
+            unexpected: actual.difference(&expected).cloned().collect(),
+        };
+        for path in expected.difference(&actual) {
+            result.missing.push(path.clone());
+        }
+        for path in directories {
+            if actual.contains(&path)
+                && crate::launch::open_nofollow(&item.path, &path, true).is_err()
+            {
+                result.modified.push(path);
+            }
+        }
+        for (path, size, digest) in files {
+            if !actual.contains(&path) {
+                continue;
+            }
+            let matches = match crate::launch::open_nofollow(&item.path, &path, false) {
+                Ok(file) if file.metadata()?.is_file() && file.metadata()?.len() == size => {
+                    hash_open(file)? == digest
+                }
+                _ => false,
+            };
+            if !matches {
+                result.modified.push(path);
+            }
+        }
+        Ok(result)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn verify_installation(&self, _id: &str) -> Result<InstallationIntegrity, LibraryError> {
+        Err(invalid(
+            "installation verification is currently available only on Linux",
+        ))
+    }
+
+    /// Explicit repair preserves the previous writable installation in staging. It never
+    /// rewrites immutable objects or managed user data. The caller must obtain confirmation.
+    #[cfg(target_os = "linux")]
+    pub fn repair_installation(
+        &mut self,
+        id: &str,
+    ) -> Result<(Installation, Option<PathBuf>), LibraryError> {
+        safe_id(id)?;
+        let quarantine = self
+            .paths
+            .content
+            .join("staging")
+            .join(format!("runtime-quarantine-{id}"));
+        {
+            let _guard = self.lifecycle_lock()?;
+            let item = self.installation(id)?;
+            let tracked: (Option<i64>, Option<String>) = self.conn.query_row(
+                "SELECT process_id,process_start FROM installations WHERE id=?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            if runtime_busy(&item.path, tracked.0, tracked.1.as_deref())? {
+                return Err(invalid("application is running from this managed runtime"));
+            }
+            let old_exists = fs::symlink_metadata(&item.path).is_ok();
+            let backup_exists = fs::symlink_metadata(&quarantine).is_ok();
+            if old_exists && backup_exists {
+                return Err(invalid(
+                    "previous repair backup still exists; inspect it before repairing again",
+                ));
+            }
+            if old_exists {
+                crate::transfer::existing_dir(&item.path)?;
+                rename_tree_noreplace(&item.path, &quarantine)?;
+                sync_dir(&self.paths.content.join("apps"))?;
+                sync_dir(&self.paths.content.join("staging"))?;
+            } else if !backup_exists
+                && !matches!(item.state.as_str(), "NeedsRepair" | "Preparing" | "Removed")
+            {
+                return Err(invalid(
+                    "writable installation and repair backup are both missing",
+                ));
+            }
+            delete_owned(
+                &self.paths.content,
+                &self.paths.content.join("staging"),
+                &format!("runtime-{id}"),
+            )?;
+            self.conn.execute("UPDATE installations SET state='Removed',last_error=NULL,updated_at=?2 WHERE id=?1",params![id,now()?])?;
+        }
+        let item = self.installation(id)?;
+        let prepared = self.prepare_portable(&item.profile_id, &item.association_id)?;
+        Ok((
+            prepared,
+            fs::symlink_metadata(&quarantine)
+                .is_ok()
+                .then_some(quarantine),
+        ))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn repair_installation(
+        &mut self,
+        _id: &str,
+    ) -> Result<(Installation, Option<PathBuf>), LibraryError> {
+        Err(invalid(
+            "installation repair is currently available only on Linux",
+        ))
     }
 
     /// Read-only logical deletion preview. Reflinks, compression and shared objects mean
@@ -1475,6 +1759,51 @@ mod tests {
         assert_eq!(
             fs::read(original.join("System/config.ini")).unwrap(),
             b"original"
+        );
+        let changed = lib.verify_installation(&install.id).unwrap();
+        assert!(changed.modified.contains(&"System/config.ini".to_owned()));
+        assert!(changed.unexpected.contains(&"System/23.log".to_owned()));
+        fs::copy("/bin/true", install.path.join("System/game")).unwrap();
+        assert_eq!(
+            lib.launch_candidates(&profile, "release").unwrap()[0].status,
+            "Ready"
+        );
+        assert!(
+            lib.play_declared(&profile, "release", &association, "game", "rev")
+                .unwrap()
+                .wait()
+                .unwrap()
+                .success()
+        );
+        let changed = lib.verify_installation(&install.id).unwrap();
+        assert!(changed.modified.contains(&"System/game".to_owned()));
+        let (_, runtime_backup) = lib.repair_installation(&install.id).unwrap();
+        assert_eq!(
+            fs::read(runtime_backup.unwrap().join("System/23.log")).unwrap(),
+            b"runtime log"
+        );
+        assert_eq!(
+            fs::read(
+                lib.paths
+                    .content
+                    .join("staging")
+                    .join(format!("runtime-quarantine-{}", install.id))
+                    .join("System/config.ini")
+            )
+            .unwrap(),
+            b"modified"
+        );
+        assert!(
+            lib.verify_installation(&install.id)
+                .unwrap()
+                .matches_original()
+        );
+        assert!(
+            lib.play_declared(&profile, "release", &association, "game", "rev")
+                .unwrap()
+                .wait()
+                .unwrap()
+                .success()
         );
         assert!(lib.verified_trees(Some(&profile)).is_ok());
         assert_eq!(lib.collect_unreferenced_objects().unwrap(), 0);

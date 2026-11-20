@@ -237,6 +237,9 @@ impl Library {
             return Err(invalid("active profile and client origin must match"));
         }
         Uuid::parse_str(association_id).map_err(|_| invalid("invalid Association ID"))?;
+        if let Some(job) = self.active_association_job(profile_id, association_id)? {
+            return Ok(job);
+        }
         let caps = client.capabilities()?;
         if caps.api_version != "1.0.0"
             || caps.tree_identity != "adtree:v1:sha256"
@@ -268,7 +271,13 @@ impl Library {
         tx.execute("INSERT INTO releases(profile_id,id,app_id,metadata_json,last_seen) VALUES (?1,?2,?3,?4,0) ON CONFLICT(profile_id,id) DO UPDATE SET app_id=excluded.app_id,metadata_json=excluded.metadata_json",params![profile_id.0,release.id,release.app_id,serde_json::to_string(&release)?])?;
         tx.execute("INSERT INTO artifacts(profile_id,id,metadata_json,last_seen) VALUES (?1,?2,?3,0) ON CONFLICT(profile_id,id) DO UPDATE SET metadata_json=excluded.metadata_json",params![profile_id.0,artifact.id,serde_json::to_string(&artifact)?])?;
         tx.execute("INSERT INTO associations(profile_id,id,release_id,artifact_id,metadata_json,last_seen) VALUES (?1,?2,?3,?4,?5,0) ON CONFLICT(profile_id,id) DO UPDATE SET release_id=excluded.release_id,artifact_id=excluded.artifact_id,metadata_json=excluded.metadata_json",params![profile_id.0,association.id,association.release_id,association.artifact_id,serde_json::to_string(&association)?])?;
-        tx.execute("INSERT INTO download_jobs(id,profile_id,artifact_id,association_id,state,created_at,updated_at,expected_size) VALUES (?1,?2,?3,?4,'Queued',?5,?5,0)",params![id,profile_id.0,artifact.id,association.id,time])?;
+        if let Err(error) = tx.execute("INSERT INTO download_jobs(id,profile_id,artifact_id,association_id,state,created_at,updated_at,expected_size,queue_rank) VALUES (?1,?2,?3,?4,'Queued',?5,?5,0,(SELECT COALESCE(MAX(queue_rank),0)+1 FROM download_jobs))",params![id,profile_id.0,artifact.id,association.id,time]) {
+            drop(tx);
+            if let Some(job) = self.active_association_job(profile_id, association_id)? {
+                return Ok(job);
+            }
+            return Err(error.into());
+        }
         tx.commit()?;
         self.job(&id)
     }
@@ -340,7 +349,9 @@ impl Library {
                 tx.execute("INSERT INTO tree_files(job_id,path,file_id,size,sha256,executable) VALUES (?1,?2,?3,?4,?5,?6)",params![job.id,path,file_id,*size as i64,sha256,i64::from(*executable)])?;
             }
         }
-        tx.execute("UPDATE download_jobs SET inventory_json=?2,inventory_etag=?3,expected_size=?4,state='Downloading',updated_at=?5 WHERE id=?1 AND state='FetchingInventory'",params![job.id,serde_json::to_string(&entries)?,etag,total as i64,now()?])?;
+        if tx.execute("UPDATE download_jobs SET inventory_json=?2,inventory_etag=?3,expected_size=?4,state='Downloading',updated_at=?5 WHERE id=?1 AND state='FetchingInventory'",params![job.id,serde_json::to_string(&entries)?,etag,total as i64,now()?])? != 1 {
+            return Err(invalid("Tree inventory request was paused or cancelled"));
+        }
         tx.commit()?;
         Ok(entries)
     }
@@ -976,6 +987,7 @@ impl Library {
         pause_after: Option<u64>,
         observer: &mut dyn FnMut(TransferObservation),
     ) -> Result<DownloadJob, LibraryError> {
+        let _slot = self.lock_download_slot()?;
         let mut network_bytes = 0;
         let _lock = self.lock_job(id)?;
         let job = self.job(id)?;
@@ -1139,6 +1151,8 @@ impl Library {
                     "Paused",
                     Some("interrupted; resume to validate Tree staging"),
                 )?;
+                self.conn
+                    .execute("UPDATE download_jobs SET auto_resume=1 WHERE id=?1", [&id])?;
             }
         }
         Ok(())

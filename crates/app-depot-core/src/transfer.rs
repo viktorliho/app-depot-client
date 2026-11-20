@@ -57,6 +57,8 @@ pub struct DownloadJob {
     pub created_at: i64,
     pub updated_at: i64,
     pub attempts: u32,
+    pub queue_rank: i64,
+    pub auto_resume: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -320,6 +322,86 @@ pub(crate) fn receive_blob(
 }
 
 impl Library {
+    pub fn active_association_job(
+        &self,
+        profile: &ServerProfileId,
+        association: &str,
+    ) -> Result<Option<DownloadJob>, LibraryError> {
+        let id: Option<String> = self.conn.query_row(
+            "SELECT id FROM download_jobs WHERE profile_id=?1 AND association_id=?2 AND state IN ('Queued','FetchingInventory','Downloading','Verifying','Committing','Paused') ORDER BY created_at DESC LIMIT 1",
+            params![profile.0, association], |r| r.get(0),
+        ).optional()?;
+        id.map(|id| self.job(&id)).transpose()
+    }
+
+    pub fn next_queued_job(&self) -> Result<Option<DownloadJob>, LibraryError> {
+        let id: Option<String> = self.conn.query_row(
+            "SELECT j.id FROM download_jobs j JOIN profiles p ON p.id=j.profile_id WHERE j.state='Queued' AND p.archived=0 ORDER BY j.queue_rank DESC,j.created_at,j.id LIMIT 1",
+            [], |r| r.get(0),
+        ).optional()?;
+        id.map(|id| self.job(&id)).transpose()
+    }
+
+    pub fn move_job_to_top(&mut self, id: &str) -> Result<DownloadJob, LibraryError> {
+        let changed=self.conn.execute("UPDATE download_jobs SET queue_rank=(SELECT COALESCE(MAX(queue_rank),0)+1 FROM download_jobs),updated_at=?2 WHERE id=?1 AND state IN ('Queued','Paused')",params![id,now()?])?;
+        if changed != 1 {
+            return Err(invalid("job cannot be reprioritized"));
+        }
+        self.job(id)
+    }
+
+    pub fn preempt_job(&mut self, id: &str) -> Result<bool, LibraryError> {
+        Ok(self.conn.execute("UPDATE download_jobs SET state='Paused',auto_resume=1,updated_at=?2 WHERE id=?1 AND state='Downloading'",params![id,now()?])? == 1)
+    }
+
+    pub fn restore_preempted_jobs(&mut self) -> Result<(), LibraryError> {
+        // The paused transfer may still be flushing its last durable checkpoint in
+        // another process. Requeue it only after that process releases the slot.
+        let _slot = match self.lock_download_slot() {
+            Ok(slot) => slot,
+            Err(LibraryError::Invalid(message))
+                if message == "another application download holds the library slot" =>
+            {
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        self.conn.execute("UPDATE download_jobs SET state='Queued',auto_resume=0 WHERE state='Paused' AND auto_resume=1",[])?;
+        Ok(())
+    }
+
+    pub fn fail_queued_job(&mut self, id: &str, error: &str) -> Result<(), LibraryError> {
+        self.conn.execute("UPDATE download_jobs SET state='Failed',last_error=?2,updated_at=?3 WHERE id=?1 AND state='Queued'",params![id,error,now()?])?;
+        Ok(())
+    }
+
+    pub(crate) fn lock_download_slot(&self) -> Result<File, LibraryError> {
+        let path = self.paths.metadata.join(".app-depot-download.lock");
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        }
+        let file = options.open(path)?;
+        if !file.metadata()?.is_file() {
+            return Err(invalid("unsafe download slot lock"));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if file.metadata()?.permissions().mode() & 0o077 != 0 {
+                return Err(invalid("download slot lock must be private"));
+            }
+        }
+        file.try_lock_exclusive()
+            .map_err(|_| invalid("another application download holds the library slot"))?;
+        Ok(file)
+    }
+
     pub(crate) fn lock_job(&self, id: &str) -> Result<File, LibraryError> {
         let stage = self.stage(id)?;
         let dir = stage
@@ -381,6 +463,9 @@ impl Library {
             return Err(invalid("active profile and client origin must match"));
         }
         Uuid::parse_str(association_id).map_err(|_| invalid("invalid Association ID"))?;
+        if let Some(job) = self.active_association_job(profile_id, association_id)? {
+            return Ok(job);
+        }
         let caps = client.capabilities()?;
         if caps.api_version != "1.0.0"
             || caps.file_identity != "adfile:sha256"
@@ -418,14 +503,20 @@ impl Library {
         tx.execute("INSERT INTO releases(profile_id,id,app_id,metadata_json,last_seen) VALUES (?1,?2,?3,?4,0) ON CONFLICT(profile_id,id) DO UPDATE SET app_id=excluded.app_id,metadata_json=excluded.metadata_json",params![profile_id.0,release.id,release.app_id,serde_json::to_string(&release)?])?;
         tx.execute("INSERT INTO artifacts(profile_id,id,metadata_json,last_seen) VALUES (?1,?2,?3,0) ON CONFLICT(profile_id,id) DO UPDATE SET metadata_json=excluded.metadata_json",params![profile_id.0,artifact.id,serde_json::to_string(&artifact)?])?;
         tx.execute("INSERT INTO associations(profile_id,id,release_id,artifact_id,metadata_json,last_seen) VALUES (?1,?2,?3,?4,?5,0) ON CONFLICT(profile_id,id) DO UPDATE SET release_id=excluded.release_id,artifact_id=excluded.artifact_id,metadata_json=excluded.metadata_json",params![profile_id.0,association.id,association.release_id,association.artifact_id,serde_json::to_string(&association)?])?;
-        tx.execute("INSERT INTO download_jobs(id,profile_id,artifact_id,association_id,state,created_at,updated_at,expected_size) VALUES (?1,?2,?3,?4,'Queued',?5,?5,?6)",params![id,profile_id.0,artifact.id,association.id,time,size as i64])?;
+        if let Err(error) = tx.execute("INSERT INTO download_jobs(id,profile_id,artifact_id,association_id,state,created_at,updated_at,expected_size,queue_rank) VALUES (?1,?2,?3,?4,'Queued',?5,?5,?6,(SELECT COALESCE(MAX(queue_rank),0)+1 FROM download_jobs))",params![id,profile_id.0,artifact.id,association.id,time,size as i64]) {
+            drop(tx);
+            if let Some(job) = self.active_association_job(profile_id, association_id)? {
+                return Ok(job);
+            }
+            return Err(error.into());
+        }
         tx.commit()?;
         self.job(&id)
     }
     pub fn job(&self, id: &str) -> Result<DownloadJob, LibraryError> {
-        self.conn.query_row("SELECT profile_id,association_id,artifact_id,state,expected_size,progress,etag,last_error,created_at,updated_at,attempts FROM download_jobs WHERE id=?1",[id],|r| {
+        self.conn.query_row("SELECT profile_id,association_id,artifact_id,state,expected_size,progress,etag,last_error,created_at,updated_at,attempts,queue_rank,auto_resume FROM download_jobs WHERE id=?1",[id],|r| {
             let size: i64 = r.get(4)?; let progress: i64 = r.get(5)?; let attempts: i64 = r.get(10)?;
-            Ok(DownloadJob { id:id.into(), profile_id:ServerProfileId(r.get(0)?),association_id:r.get::<_,Option<String>>(1)?.unwrap_or_default(),artifact_id:r.get(2)?,state:r.get(3)?,expected_size:size.max(0) as u64,progress:progress.max(0) as u64,etag:r.get(6)?,last_error:r.get(7)?,created_at:r.get(8)?,updated_at:r.get::<_,Option<i64>>(9)?.unwrap_or_default(),attempts:attempts.max(0) as u32 })
+            Ok(DownloadJob { id:id.into(), profile_id:ServerProfileId(r.get(0)?),association_id:r.get::<_,Option<String>>(1)?.unwrap_or_default(),artifact_id:r.get(2)?,state:r.get(3)?,expected_size:size.max(0) as u64,progress:progress.max(0) as u64,etag:r.get(6)?,last_error:r.get(7)?,created_at:r.get(8)?,updated_at:r.get::<_,Option<i64>>(9)?.unwrap_or_default(),attempts:attempts.max(0) as u32,queue_rank:r.get(11)?,auto_resume:r.get::<_,i64>(12)? != 0 })
         }).optional()?.ok_or_else(||invalid("download job not found"))
     }
     pub fn jobs(
@@ -433,7 +524,7 @@ impl Library {
         profile: Option<&ServerProfileId>,
     ) -> Result<Vec<DownloadJob>, LibraryError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id FROM download_jobs WHERE ?1 IS NULL OR profile_id=?1 ORDER BY created_at,id",
+            "SELECT id FROM download_jobs WHERE ?1 IS NULL OR profile_id=?1 ORDER BY queue_rank DESC,created_at,id",
         )?;
         let ids = stmt
             .query_map([profile.map(|p| p.0.as_str())], |r| r.get::<_, String>(0))?
@@ -441,7 +532,7 @@ impl Library {
         ids.iter().map(|id| self.job(id)).collect()
     }
     pub fn pause_job(&mut self, id: &str) -> Result<DownloadJob, LibraryError> {
-        let changed=self.conn.execute("UPDATE download_jobs SET state='Paused',updated_at=?2 WHERE id=?1 AND state IN ('Queued','FetchingInventory','Downloading','Failed')",params![id,now()?])?;
+        let changed=self.conn.execute("UPDATE download_jobs SET state='Paused',auto_resume=0,updated_at=?2 WHERE id=?1 AND state IN ('Queued','FetchingInventory','Downloading','Failed')",params![id,now()?])?;
         if changed == 0 {
             return Err(invalid("job cannot be paused"));
         }
@@ -455,7 +546,7 @@ impl Library {
         self.job(id)
     }
     pub fn retry_job(&mut self, id: &str) -> Result<DownloadJob, LibraryError> {
-        let changed=self.conn.execute("UPDATE download_jobs SET state='Queued',last_error=NULL,updated_at=?2 WHERE id=?1 AND state IN ('Failed','Paused')",params![id,now()?])?;
+        let changed=self.conn.execute("UPDATE download_jobs SET state='Queued',auto_resume=0,queue_rank=(SELECT COALESCE(MAX(queue_rank),0)+1 FROM download_jobs),last_error=NULL,updated_at=?2 WHERE id=?1 AND state IN ('Failed','Paused')",params![id,now()?])?;
         if changed == 0 {
             return Err(invalid("job cannot be resumed or retried"));
         }
@@ -768,6 +859,7 @@ impl Library {
         pause_after: Option<u64>,
         observer: &mut dyn FnMut(TransferObservation),
     ) -> Result<DownloadJob, LibraryError> {
+        let _slot = self.lock_download_slot()?;
         let mut network_bytes = 0;
         let _lock = self.lock_job(id)?;
         let job = self.job(id)?;
@@ -875,6 +967,8 @@ impl Library {
                     "Paused",
                     Some("interrupted; resume to validate staging"),
                 )?;
+                self.conn
+                    .execute("UPDATE download_jobs SET auto_resume=1 WHERE id=?1", [&id])?;
             }
         }
         Ok(())
@@ -1132,7 +1226,16 @@ mod tests {
                 }
                 response.push_str("\r\n");
                 stream.write_all(response.as_bytes()).unwrap();
-                let _ = stream.write_all(&body);
+                if mode == "slow" {
+                    for chunk in body.chunks(64 * 1024) {
+                        if stream.write_all(chunk).is_err() {
+                            break;
+                        }
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                } else {
+                    let _ = stream.write_all(&body);
+                }
             }
         });
         let root = tempfile::tempdir().unwrap();
@@ -1484,11 +1587,112 @@ mod tests {
         assert_eq!(f.library.job(&job.id).unwrap().state, "Completed");
     }
     #[test]
+    fn queue_priority_preemption_and_user_pause_are_distinct() {
+        let mut f = fixture(vec![1], "normal");
+        let first = queue(&mut f);
+        for (rank, association) in [(2, "second"), (3, "third")] {
+            f.library.conn.execute("INSERT INTO download_jobs(id,profile_id,artifact_id,association_id,state,created_at,updated_at,expected_size,queue_rank) VALUES (?1,?2,?3,?4,'Queued',0,0,1,?5)",params![Uuid::new_v4().to_string(),f.profile.0,first.artifact_id,association,rank]).unwrap();
+        }
+        let next = f.library.next_queued_job().unwrap().unwrap();
+        assert_eq!(next.association_id, "third");
+        f.library.move_job_to_top(&first.id).unwrap();
+        assert_eq!(f.library.next_queued_job().unwrap().unwrap().id, first.id);
+        f.library
+            .conn
+            .execute(
+                "UPDATE download_jobs SET state='Downloading' WHERE id=?1",
+                [&first.id],
+            )
+            .unwrap();
+        assert!(f.library.preempt_job(&first.id).unwrap());
+        assert!(f.library.job(&first.id).unwrap().auto_resume);
+        f.library.restore_preempted_jobs().unwrap();
+        assert_eq!(f.library.job(&first.id).unwrap().state, "Queued");
+        f.library.pause_job(&first.id).unwrap();
+        f.library.restore_preempted_jobs().unwrap();
+        assert_eq!(f.library.job(&first.id).unwrap().state, "Paused");
+        assert!(!f.library.job(&first.id).unwrap().auto_resume);
+        let paths = f.library.paths.clone();
+        let reopened = Library::open(paths).unwrap();
+        assert_eq!(reopened.job(&first.id).unwrap().state, "Paused");
+        assert!(!reopened.job(&first.id).unwrap().auto_resume);
+        assert_eq!(
+            reopened.next_queued_job().unwrap().unwrap().association_id,
+            "third"
+        );
+    }
+    #[test]
+    fn repeated_association_request_reuses_pending_job() {
+        let mut f = fixture(vec![1], "normal");
+        let first = queue(&mut f);
+        let repeated = f
+            .library
+            .queue_file(&f.client, &f.profile, "release", ASSOCIATION)
+            .unwrap();
+        assert_eq!(first.id, repeated.id);
+        assert_eq!(f.library.jobs(Some(&f.profile)).unwrap().len(), 1);
+    }
+    #[test]
+    fn preemption_keeps_durable_checkpoint_and_resumes_without_discarding_bytes() {
+        let mut f = fixture(vec![7; 5 * 1024 * 1024], "slow");
+        let job = queue(&mut f);
+        let paths = f.library.paths.clone();
+        let origin = f.client.origin().to_owned();
+        let id = job.id.clone();
+        let worker = thread::spawn(move || {
+            let mut lib = Library::open(paths).unwrap();
+            let api = ApiClient::new(&origin, None, false).unwrap();
+            lib.run_file_job(&api, &id, None).unwrap()
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(4);
+        while f.hits.load(Ordering::Relaxed) == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "download did not start"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert!(f.library.lock_download_slot().is_err());
+        assert!(f.library.preempt_job(&job.id).unwrap());
+        f.library.restore_preempted_jobs().unwrap();
+        assert_eq!(f.library.job(&job.id).unwrap().state, "Paused");
+        assert_eq!(worker.join().unwrap().state, "Paused");
+        let paused = f.library.job(&job.id).unwrap();
+        assert!(paused.progress >= 4 * 1024 * 1024 && paused.progress < paused.expected_size);
+        f.library.restore_preempted_jobs().unwrap();
+        assert_eq!(f.library.job(&job.id).unwrap().state, "Queued");
+        assert_eq!(
+            f.library
+                .run_file_job(&f.client, &job.id, None)
+                .unwrap()
+                .state,
+            "Completed"
+        );
+    }
+
+    #[test]
+    fn separate_connections_wait_for_short_sqlite_writer() {
+        let f = fixture(vec![1], "normal");
+        let paths = f.library.paths.clone();
+        let id = f.profile.0.clone();
+        f.library.conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let worker = std::thread::spawn(move || {
+            let lib = Library::open(paths).unwrap();
+            lib.conn
+                .execute("UPDATE profiles SET name='second' WHERE id=?1", [id])
+                .unwrap();
+        });
+        std::thread::sleep(Duration::from_millis(75));
+        f.library.conn.execute_batch("COMMIT").unwrap();
+        worker.join().unwrap();
+        assert_eq!(f.library.profile(&f.profile).unwrap().name, "second");
+    }
+    #[test]
     fn migration_from_v1_preserves_existing_profile() {
         let f = fixture(vec![1], "normal");
         let paths = f.library.paths.clone();
         let id = f.profile.clone();
-        f.library.conn.execute_batch("PRAGMA user_version=1; DROP TABLE installations; DROP TABLE tree_files; DROP INDEX download_jobs_active; ALTER TABLE download_jobs DROP COLUMN inventory_json; ALTER TABLE download_jobs DROP COLUMN inventory_etag; ALTER TABLE download_jobs DROP COLUMN association_id; ALTER TABLE download_jobs DROP COLUMN expected_size; ALTER TABLE download_jobs DROP COLUMN etag; ALTER TABLE download_jobs DROP COLUMN progress; ALTER TABLE download_jobs DROP COLUMN checkpoint_hash; ALTER TABLE download_jobs DROP COLUMN last_error; ALTER TABLE download_jobs DROP COLUMN updated_at; ALTER TABLE download_jobs DROP COLUMN attempts; ALTER TABLE verified_content DROP COLUMN association_id;").unwrap();
+        f.library.conn.execute_batch("PRAGMA user_version=1; DROP TABLE installations; DROP TABLE tree_files; DROP INDEX download_jobs_active; ALTER TABLE download_jobs DROP COLUMN auto_resume; ALTER TABLE download_jobs DROP COLUMN queue_rank; ALTER TABLE download_jobs DROP COLUMN inventory_json; ALTER TABLE download_jobs DROP COLUMN inventory_etag; ALTER TABLE download_jobs DROP COLUMN association_id; ALTER TABLE download_jobs DROP COLUMN expected_size; ALTER TABLE download_jobs DROP COLUMN etag; ALTER TABLE download_jobs DROP COLUMN progress; ALTER TABLE download_jobs DROP COLUMN checkpoint_hash; ALTER TABLE download_jobs DROP COLUMN last_error; ALTER TABLE download_jobs DROP COLUMN updated_at; ALTER TABLE download_jobs DROP COLUMN attempts; ALTER TABLE verified_content DROP COLUMN association_id;").unwrap();
         let library = Library::open(paths).unwrap();
         assert_eq!(library.profile(&id).unwrap().name, "fixture");
     }
@@ -1497,7 +1701,7 @@ mod tests {
         let mut f = fixture(vec![1], "normal");
         let job = queue(&mut f);
         let paths = f.library.paths.clone();
-        f.library.conn.execute_batch("PRAGMA user_version=2; DROP TABLE installations; DROP TABLE tree_files; DROP INDEX download_jobs_active; ALTER TABLE download_jobs DROP COLUMN inventory_json; ALTER TABLE download_jobs DROP COLUMN inventory_etag; CREATE UNIQUE INDEX download_jobs_active ON download_jobs(profile_id,artifact_id,association_id) WHERE state IN ('Queued','Downloading','Verifying','Committing','Paused');").unwrap();
+        f.library.conn.execute_batch("PRAGMA user_version=2; DROP TABLE installations; DROP TABLE tree_files; DROP INDEX download_jobs_active; ALTER TABLE download_jobs DROP COLUMN auto_resume; ALTER TABLE download_jobs DROP COLUMN queue_rank; ALTER TABLE download_jobs DROP COLUMN inventory_json; ALTER TABLE download_jobs DROP COLUMN inventory_etag; CREATE UNIQUE INDEX download_jobs_active ON download_jobs(profile_id,artifact_id,association_id) WHERE state IN ('Queued','Downloading','Verifying','Committing','Paused');").unwrap();
         let library = Library::open(paths).unwrap();
         assert_eq!(library.job(&job.id).unwrap().artifact_id, job.artifact_id);
         assert_eq!(library.job(&job.id).unwrap().state, "Queued");

@@ -34,9 +34,9 @@ fn usage() -> &'static str {
      local: profile add NAME URL | profile list [--all] | profile rename ID NAME | profile move ID URL | profile remove ID --confirm\n\
      credentials: profile token-set ID --token-stdin | profile token-remove ID\n\
      sync/offline: --profile ID sync | cached-apps | cached-releases APP_ID | cached-declarations RELEASE_ID\n\
-     download: --profile ID download start RELEASE_ID ASSOCIATION_ID [--pause-after-bytes N] | jobs | files | trees | tree-files JOB_ID | pause JOB_ID | resume JOB_ID | retry JOB_ID | cancel JOB_ID\n\
+     download: --profile ID download start RELEASE_ID ASSOCIATION_ID [--pause-after-bytes N] | enqueue RELEASE_ID ASSOCIATION_ID | jobs | files | trees | tree-files JOB_ID | move-top JOB_ID | pause JOB_ID | resume JOB_ID | retry JOB_ID | cancel JOB_ID\n\
      launch: --profile ID launch list RELEASE_ID | launch play RELEASE_ID ASSOCIATION_ID ENTRY_POINT_ID\n\
-     runtime: --profile ID runtime list | runtime prepare ASSOCIATION_ID | runtime inspect INSTALLATION_ID | runtime preview INSTALLATION_ID | runtime preview-complete INSTALLATION_ID | runtime remove INSTALLATION_ID --confirm | runtime remove-complete INSTALLATION_ID --confirm | runtime remove-artifact ASSOCIATION_ID --confirm | runtime remove-app APP_ID --confirm | runtime remove-app-complete APP_ID --confirm | runtime repair INSTALLATION_ID --confirm | runtime repair-source ASSOCIATION_ID --confirm\n\
+     runtime: --profile ID runtime list | runtime prepare ASSOCIATION_ID | runtime inspect INSTALLATION_ID | runtime verify INSTALLATION_ID | runtime preview INSTALLATION_ID | runtime preview-complete INSTALLATION_ID | runtime remove INSTALLATION_ID --confirm | runtime remove-complete INSTALLATION_ID --confirm | runtime remove-artifact ASSOCIATION_ID --confirm | runtime remove-app APP_ID --confirm | runtime remove-app-complete APP_ID --confirm | runtime repair INSTALLATION_ID --confirm | runtime repair-source ASSOCIATION_ID --confirm\n\
      library: library info | library usage | library gc --confirm | library migration-preview DESTINATION_ROOT | library migrate DESTINATION_ROOT --confirm (source selected by --library-data/--library-content)\n\
      optional APP_DEPOT_TOKEN overrides stored token for this process; --library-data/--library-content select local roots"
 }
@@ -560,6 +560,13 @@ fn run_download(options: &Options) -> Result<(), CliError> {
             }
             print_job(&library.pause_job(&args[2])?, options.json)
         }
+        (Some("move-top"), 3) => {
+            let job = library.job(&args[2])?;
+            if &job.profile_id != profile_id {
+                return Err(LibraryError::Invalid("job belongs to another profile".into()).into());
+            }
+            print_job(&library.move_job_to_top(&args[2])?, options.json)
+        }
         (Some("cancel"), 3) => {
             let job = library.job(&args[2])?;
             if &job.profile_id != profile_id {
@@ -567,7 +574,7 @@ fn run_download(options: &Options) -> Result<(), CliError> {
             }
             print_job(&library.cancel_job(&args[2])?, options.json)
         }
-        (Some("start"), 4) | (Some("resume" | "retry"), 3) => {
+        (Some("start" | "enqueue"), 4) | (Some("resume" | "retry"), 3) => {
             let profile = library.profile(profile_id)?;
             if profile.archived {
                 return Err(
@@ -579,7 +586,7 @@ fn run_download(options: &Options) -> Result<(), CliError> {
                 selected_token(&profile)?,
                 options.allow_insecure_http,
             )?;
-            let job = if args[1] == "start" {
+            let job = if matches!(args[1].as_str(), "start" | "enqueue") {
                 let caps = client.ensure_read_compatible()?;
                 let association = client
                     .list_associations(&args[2], caps.page_size().map_err(ApiError::Incompatible)?)?
@@ -605,11 +612,32 @@ fn run_download(options: &Options) -> Result<(), CliError> {
                 }
                 library.retry_job(&args[2])?
             };
+            if matches!(args[1].as_str(), "start" | "enqueue") && job.state == "Queued" {
+                library.move_job_to_top(&job.id)?;
+            }
+            if args[1] == "enqueue" {
+                return print_job(&job, options.json);
+            }
+            if job.state != "Queued" {
+                return print_job(&job, options.json);
+            }
             eprintln!("download job: {}", job.id);
-            let final_job = if job.artifact_id.starts_with("adtree:v1:sha256:") {
-                library.run_tree_job(&client, &job.id, options.pause_after)?
+            let result = if job.artifact_id.starts_with("adtree:v1:sha256:") {
+                library.run_tree_job(&client, &job.id, options.pause_after)
             } else {
-                library.run_file_job(&client, &job.id, options.pause_after)?
+                library.run_file_job(&client, &job.id, options.pause_after)
+            };
+            let final_job = match result {
+                Ok(job) => job,
+                Err(LibraryError::Invalid(message))
+                    if message == "another application download holds the library slot" =>
+                {
+                    eprintln!(
+                        "another transfer is active; this job remains queued for the desktop scheduler"
+                    );
+                    library.job(&job.id)?
+                }
+                Err(error) => return Err(error.into()),
             };
             print_job(&final_job, options.json)
         }
@@ -629,7 +657,7 @@ fn run_launch(options: &Options) -> Result<(), CliError> {
     ) {
         return Err(ApiError::Config(usage().into()).into());
     }
-    let library = open_library(options)?;
+    let mut library = open_library(options)?;
     let candidates = library.launch_candidates(profile, &args[2])?;
     if args[1] == "list" {
         if options.json {
@@ -657,7 +685,10 @@ fn run_launch(options: &Options) -> Result<(), CliError> {
                     .into(),
             )
         })?;
-    if selected.status != "Ready" {
+    if selected.status == "PreparationRequired" {
+        eprintln!("preparing writable installation from verified local content");
+        library.prepare_portable(profile, &args[3])?;
+    } else if selected.status != "Ready" {
         return Err(LibraryError::Invalid(format!(
             "launch unavailable: {} ({})",
             selected.status, selected.reason
@@ -723,6 +754,37 @@ fn run_runtime(options: &Options) -> Result<(), CliError> {
                     item.state,
                     item.path.display()
                 );
+            }
+        }
+        (Some("verify"), 3) => {
+            let item = library.installation(&args[2])?;
+            if &item.profile_id != profile {
+                return Err(LibraryError::Invalid(
+                    "installation belongs to another profile".into(),
+                )
+                .into());
+            }
+            let result = library.verify_installation(&args[2])?;
+            if options.json {
+                print_json(&result)?;
+            } else {
+                println!(
+                    "{}",
+                    if result.matches_original() {
+                        "Matches published Artifact"
+                    } else {
+                        "Local installation differs from published Artifact"
+                    }
+                );
+                for path in &result.missing {
+                    println!("Missing: {path}");
+                }
+                for path in &result.modified {
+                    println!("Modified: {path}");
+                }
+                for path in &result.unexpected {
+                    println!("Unexpected: {path}");
+                }
             }
         }
         (Some("preview" | "preview-complete"), 3) => {
@@ -816,16 +878,26 @@ fn run_runtime(options: &Options) -> Result<(), CliError> {
                 .into());
             }
             let action = args[1].as_str();
-            library.remove_installation(&item.id, action == "remove-complete")?;
             if action == "repair" {
-                let repaired = library.prepare_portable(profile, &item.association_id)?;
+                let (repaired, quarantine) = library.repair_installation(&item.id)?;
                 if options.json {
                     print_json(&repaired)?
                 } else {
-                    println!("repaired {}", repaired.id);
+                    if let Some(quarantine) = quarantine {
+                        println!(
+                            "repaired {}; previous writable files preserved at {}",
+                            repaired.id,
+                            quarantine.display()
+                        );
+                    } else {
+                        println!("repaired {} from verified local content", repaired.id);
+                    }
                 }
-            } else if !options.json {
-                println!("removed local installation {}", item.id);
+            } else {
+                library.remove_installation(&item.id, action == "remove-complete")?;
+                if !options.json {
+                    println!("removed local installation {}", item.id);
+                }
             }
         }
         _ => return Err(ApiError::Config(usage().into()).into()),

@@ -172,15 +172,23 @@ impl Desktop {
             }
         });
         ui.add_space(10.0);
+        let current_catalog = profile
+            .as_ref()
+            .is_some_and(|p| p.connection_status == "connected")
+            && self
+                .active
+                .as_ref()
+                .is_some_and(|id| !self.sync_errors.contains_key(&id.0));
         let query = self.search.to_lowercase();
         let mut apps: Vec<_> = self
             .snapshot
             .apps
             .iter()
             .filter(|a| {
-                query.is_empty()
-                    || a.app.name.to_lowercase().contains(&query)
-                    || a.app.slug.to_lowercase().contains(&query)
+                catalog_item_visible(a.stale, current_catalog)
+                    && (query.is_empty()
+                        || a.app.name.to_lowercase().contains(&query)
+                        || a.app.slug.to_lowercase().contains(&query))
             })
             .cloned()
             .collect();
@@ -209,9 +217,21 @@ impl Desktop {
             } else {
                 self.empty_panel(
                     ui,
-                    "No matches",
-                    "Try a different search term.",
-                    "Clear search",
+                    if query.is_empty() && current_catalog {
+                        "No apps currently available"
+                    } else {
+                        "No matches"
+                    },
+                    if query.is_empty() && current_catalog {
+                        "Saved downloads remain in My library."
+                    } else {
+                        "Try a different search term."
+                    },
+                    if query.is_empty() && current_catalog {
+                        "My library"
+                    } else {
+                        "Clear search"
+                    },
                     None,
                 );
             }
@@ -306,6 +326,10 @@ impl Desktop {
                                 }
                             } else if action == "Clear search" {
                                 self.search.clear();
+                            } else if action == "My library" {
+                                self.screen = Screen::Library;
+                            } else if action == "Browse catalog" {
+                                self.screen = Screen::Catalog;
                             } else {
                                 self.screen = Screen::Settings;
                             }
@@ -496,7 +520,7 @@ impl Desktop {
         for candidate in choices {
             let key = format!("{}:{}", association, candidate.entry_id);
             let state = self.launch_states.get(&key).cloned();
-            if candidate.status == "Ready" {
+            if candidate.status == "Ready" || candidate.status == "PreparationRequired" {
                 let label = candidate
                     .label
                     .clone()
@@ -505,12 +529,15 @@ impl Desktop {
                     .snapshot
                     .launches
                     .iter()
-                    .filter(|c| c.release_id == candidate.release_id && c.status == "Ready")
+                    .filter(|c| {
+                        c.release_id == candidate.release_id
+                            && matches!(c.status.as_str(), "Ready" | "PreparationRequired")
+                    })
                     .count()
                     > 1;
                 let busy = state
                     .as_ref()
-                    .is_some_and(|(s, _)| s == "Starting" || s == "Running");
+                    .is_some_and(|(s, _)| s == "Starting" || s == "Preparing" || s == "Running");
                 ui.horizontal_wrapped(|ui| {
                     if ui
                         .add_enabled(
@@ -541,25 +568,16 @@ impl Desktop {
                     ui.label(
                         RichText::new(format!(
                             "{label} · {}",
-                            state.as_ref().map_or("Ready to play", |(s, _)| s.as_str())
+                            state.as_ref().map_or(
+                                if candidate.status == "Ready" {
+                                    "Ready to play"
+                                } else {
+                                    "Will prepare on Play"
+                                },
+                                |(s, _)| s.as_str()
+                            )
                         ))
                         .small(),
-                    );
-                });
-            } else if candidate.status == "PreparationRequired" {
-                ui.horizontal_wrapped(|ui| {
-                    if ui.button("Prepare to play").clicked() {
-                        self.send(Command::Prepare {
-                            profile: candidate.profile_id.clone(),
-                            association: candidate.association_id.clone(),
-                        });
-                    }
-                    ui.label(
-                        RichText::new(
-                            "Creates a separate writable copy from the verified download.",
-                        )
-                        .small()
-                        .weak(),
                     );
                 });
             } else if candidate.status != "NoLaunch" {
@@ -602,8 +620,10 @@ impl Desktop {
                     ui.label(RichText::new(if count>0 { format!("{count} artifact{} verified locally",if count==1{""}else{"s"}) }else if view.stale { "Saved metadata".into() } else { "Available to download".into() }).small().weak());
                     if count>0 && let Some(profile)=self.active.clone() {
                         let prepared=self.snapshot.installations.iter().any(|item|item.app_id==view.app.id && item.state=="Ready");
-                        if prepared && ui.button("Remove local application…").clicked(){self.remove_app_target=Some((profile.clone(),view.app.id.clone(),view.app.name.clone(),false));self.confirmation=Some(Confirmation::RemoveApp);}
-                        if ui.button("Remove all local content and managed data…").clicked(){self.remove_app_target=Some((profile,view.app.id.clone(),view.app.name.clone(),true));self.confirmation=Some(Confirmation::RemoveApp);}
+                        let busy=self.local_operations.contains_key(&view.app.id);
+                        if let Some(phase)=self.local_operations.get(&view.app.id){ui.horizontal(|ui|{ui.spinner();ui.label(phase);});}
+                        if prepared && ui.add_enabled(!busy,egui::Button::new("Remove local application…")).clicked(){self.remove_app_target=Some((profile.clone(),view.app.id.clone(),view.app.name.clone(),false));self.confirmation=Some(Confirmation::RemoveApp);}
+                        if ui.add_enabled(!busy,egui::Button::new("Remove all local content and managed data…")).clicked(){self.remove_app_target=Some((profile,view.app.id.clone(),view.app.name.clone(),true));self.confirmation=Some(Confirmation::RemoveApp);}
                     }
                     if view.stale { ui.label(RichText::new("Saved metadata; this app was absent from the latest catalog refresh.").small().weak()); }
                 });
@@ -817,7 +837,7 @@ impl Desktop {
                                     ui.label(RichText::new(subtitle).small().weak());
                                     ui.label(
                                         RichText::new(format!(
-                                            "Verified locally{}",
+                                            "Original download verified{}",
                                             size.map(|n| format!(" · {}", format_bytes(n)))
                                                 .or_else(
                                                     || file_count.map(|n| format!(" · {n} files"))
@@ -842,23 +862,43 @@ impl Desktop {
                                 })
                                 .cloned()
                             {
+                                if let Some(phase)=self.local_operations.get(&installation.id){
+                                    ui.horizontal(|ui|{ui.spinner();ui.label(phase);});
+                                }
                                 ui.horizontal_wrapped(|ui| {
-                                    ui.label(format!("Working copy: {}", installation.state));
-                                    if ui.button("Remove application…").clicked() {
+                                    ui.label(format!("Writable installation: {}", installation.state));
+                                    if ui.add_enabled(!self.local_operations.contains_key(&installation.id),egui::Button::new("Verify integrity")).clicked(){
+                                        self.local_operations.insert(installation.id.clone(),"Comparing installed files with the published Artifact".into());
+                                        self.send(Command::VerifyInstallation(installation.id.clone()));
+                                    }
+                                    if ui.add_enabled(!self.local_operations.contains_key(&installation.id),egui::Button::new("Repair…")).clicked(){
+                                        self.repair_installation_target=Some((installation.id.clone(),title.clone()));
+                                        self.confirmation=Some(Confirmation::RepairInstallation);
+                                    }
+                                    if ui.add_enabled(!self.local_operations.contains_key(&installation.id),egui::Button::new("Remove application…")).clicked() {
                                         self.remove_target =
                                             Some((installation.id.clone(), false, title.clone()));
                                         self.confirmation = Some(Confirmation::RemoveInstallation);
                                     }
-                                    if ui.button("Remove completely…").clicked() {
+                                    if ui.add_enabled(!self.local_operations.contains_key(&installation.id),egui::Button::new("Remove completely…")).clicked() {
                                         self.remove_target =
                                             Some((installation.id.clone(), true, title.clone()));
                                         self.confirmation = Some(Confirmation::RemoveInstallation);
                                     }
                                 });
-                            } else if let Some(profile)=self.active.clone()
-                                && ui.button("Remove local download…").clicked() {
-                                self.remove_artifact_target=Some((profile,association.clone(),title.clone()));
-                                self.confirmation=Some(Confirmation::RemoveArtifact);
+                                if let Some(report)=self.integrity_reports.get(&installation.id){
+                                    egui::CollapsingHeader::new(if report.matches_original(){"Integrity check: matches original"}else{"Integrity check: local changes found"}).show(ui,|ui|{
+                                        for path in &report.missing {ui.label(format!("Missing: {path}"));}
+                                        for path in &report.modified {ui.label(format!("Modified: {path}"));}
+                                        for path in &report.unexpected {ui.label(format!("Unexpected: {path}"));}
+                                    });
+                                }
+                            } else if let Some(profile)=self.active.clone() {
+                                if let Some(phase)=self.local_operations.get(&association){ui.horizontal(|ui|{ui.spinner();ui.label(phase);});}
+                                if ui.add_enabled(!self.local_operations.contains_key(&association),egui::Button::new("Remove local download…")).clicked() {
+                                    self.remove_artifact_target=Some((profile,association.clone(),title.clone()));
+                                    self.confirmation=Some(Confirmation::RemoveArtifact);
+                                }
                             }
                             egui::CollapsingHeader::new("Technical details")
                                 .id_salt(&association)
@@ -892,27 +932,14 @@ impl Desktop {
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                for job in jobs.iter().rev() {
+                for job in &jobs {
                     let live = self.live_progress.get(&job.id).cloned().filter(|_| matches!(job.state.as_str(), "Downloading" | "FetchingInventory" | "Verifying" | "Committing"));
                     let now = Instant::now();
                     let received = live.as_ref().map_or(job.progress, |p| p.observation.received_bytes.max(job.progress)).min(job.expected_size);
-                    let context = self
-                        .snapshot
-                        .apps
-                        .iter()
-                        .flat_map(|a| a.releases.iter().map(move |r| (a, r)))
-                        .find(|(_, r)| {
-                            r.associations
-                                .iter()
-                                .any(|x| x.association.id == job.association_id)
-                        });
-                    let title = context.map_or_else(
-                        || "Artifact download".to_owned(),
-                        |(a, _)| a.app.name.clone(),
-                    );
-                    let release = context
-                        .and_then(|(_, r)| r.release.version.as_deref())
-                        .map_or("Release".to_owned(), |v| format!("Version {v}"));
+                    let context=self.snapshot.job_context.get(&job.id).cloned();
+                    let title=context.as_ref().map_or("Artifact download",|c|c.0.as_str()).to_owned();
+                    let release=context.as_ref().map_or("Release".to_owned(),|c|if c.1=="Release"{"Release".to_owned()}else{format!("Version {}",c.1)});
+                    let server=context.as_ref().map_or("Saved server",|c|c.2.as_str()).to_owned();
                     let kind = if job.artifact_id.starts_with("adtree:") {
                         "Directory"
                     } else {
@@ -929,8 +956,8 @@ impl Desktop {
                                     ui.label(RichText::new(&title).size(16.0).strong());
                                     ui.label(
                                         RichText::new(format!(
-                                            "{release} · {kind} · {}",
-                                            live.as_ref().map_or(friendly_job_state(&job.state), |p| phase_label(p.observation.phase, &job.state))
+                                            "{server} · {release} · {kind} · {}",
+                                            live.as_ref().map_or(if job.auto_resume {"Waiting for priority"} else {friendly_job_state(&job.state)}, |p| phase_label(p.observation.phase, &job.state))
                                         ))
                                         .small()
                                         .weak(),
@@ -1214,6 +1241,9 @@ impl Desktop {
             Confirmation::RepairSource => {
                 "Rebuild this downloaded directory from verified local objects? The current directory, including any files added by an application, will be preserved in staging."
             }
+            Confirmation::RepairInstallation => {
+                "Restore original installation files from the verified download? Modified files, mods and other additions in the current working copy will be moved to a managed backup in staging. Managed user data stays. This may require space for another working copy."
+            }
             Confirmation::Exit => {
                 "Downloads are active. Closing interrupts them; incomplete jobs can be resumed after restart."
             }
@@ -1233,6 +1263,7 @@ impl Desktop {
                     .remove_app_target
                     .as_ref()
                     .map(|(_, _, name, _)| name.as_str()),
+                Confirmation::RepairInstallation => self.repair_installation_target.as_ref().map(|(_,name)|name.as_str()),
                 _ => None,
             };
             if let Some(name) = selected {
@@ -1285,6 +1316,7 @@ impl Desktop {
                             Confirmation::RemoveInstallation => {
                                 if let Some((installation, complete, _)) = self.remove_target.take()
                                 {
+                                    self.local_operations.insert(installation.clone(),"Removing working data".into());
                                     self.send(Command::RemoveInstallation {
                                         id: installation,
                                         complete,
@@ -1295,6 +1327,7 @@ impl Desktop {
                                 if let Some((profile, association, _)) =
                                     self.remove_artifact_target.take()
                                 {
+                                    self.local_operations.insert(association.clone(),"Removing local download".into());
                                     self.send(Command::RemoveArtifact {
                                         profile,
                                         association,
@@ -1305,6 +1338,7 @@ impl Desktop {
                                 if let Some((profile, app, _, complete)) =
                                     self.remove_app_target.take()
                                 {
+                                    self.local_operations.insert(app.clone(),"Removing application items".into());
                                     self.send(Command::RemoveApp {
                                         profile,
                                         app,
@@ -1318,6 +1352,12 @@ impl Desktop {
                                         profile,
                                         association,
                                     });
+                                }
+                            }
+                            Confirmation::RepairInstallation => {
+                                if let Some((installation,_))=self.repair_installation_target.take(){
+                                    self.local_operations.insert(installation.clone(),"Preserving modified installation and restoring original files".into());
+                                    self.send(Command::RepairInstallation(installation));
                                 }
                             }
                             Confirmation::Exit => {
@@ -1341,6 +1381,7 @@ impl Desktop {
                     if kind == Confirmation::RepairSource {
                         self.repair_target = None;
                     }
+                    if kind == Confirmation::RepairInstallation {self.repair_installation_target=None;}
                     self.confirmation = None;
                 }
             });
@@ -1490,6 +1531,10 @@ pub(super) fn friendly_job_state(state: &str) -> &str {
         _ => "Status unavailable",
     }
 }
+
+pub(super) fn catalog_item_visible(stale: bool, current_catalog: bool) -> bool {
+    !stale || !current_catalog
+}
 fn copy_line(ui: &mut egui::Ui, label: &str, value: &str) {
     ui.horizontal_wrapped(|ui| {
         ui.label(RichText::new(label).small().weak());
@@ -1516,7 +1561,12 @@ fn declaration(ui: &mut egui::Ui, label: &str, value: &serde_json::Value) {
 }
 pub(super) fn job_actions(job: &DownloadJob) -> Vec<(&'static str, Command)> {
     match job.state.as_str() {
-        "Queued" | "FetchingInventory" | "Downloading" => vec![
+        "Queued" => vec![
+            ("Download first", Command::MoveToTop(job.id.clone())),
+            ("Pause", Command::Pause(job.id.clone())),
+            ("Cancel", Command::Cancel(job.id.clone())),
+        ],
+        "FetchingInventory" | "Downloading" => vec![
             ("Pause", Command::Pause(job.id.clone())),
             ("Cancel", Command::Cancel(job.id.clone())),
         ],

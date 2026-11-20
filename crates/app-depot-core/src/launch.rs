@@ -4,15 +4,12 @@ use crate::{
     ServerProfileId,
     library::{Library, LibraryError},
     models::InventoryEntry,
-    transfer::VerifiedFile,
-    tree_download::VerifiedTree,
 };
+use rusqlite::OptionalExtension;
 use serde::Serialize;
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use std::{
     fs::File,
-    io::Read,
     path::{Path, PathBuf},
     process::{Child, Command},
 };
@@ -34,10 +31,6 @@ pub struct LaunchCandidate {
     pub reason: String,
     #[serde(skip)]
     local_root: Option<PathBuf>,
-    #[serde(skip)]
-    expected_hash: Option<String>,
-    #[serde(skip)]
-    expected_size: Option<u64>,
 }
 fn invalid(message: &str) -> LibraryError {
     LibraryError::Invalid(message.into())
@@ -125,17 +118,6 @@ impl Library {
         profile: &ServerProfileId,
         release: &str,
     ) -> Result<Vec<LaunchCandidate>, LibraryError> {
-        let (files, _) = self.inspect_files(Some(profile))?;
-        let (trees, _) = self.inspect_trees(Some(profile))?;
-        self.launch_candidates_with_verified(profile, release, &files, &trees)
-    }
-    pub fn launch_candidates_with_verified(
-        &self,
-        profile: &ServerProfileId,
-        release: &str,
-        _file_items: &[VerifiedFile],
-        _tree_items: &[VerifiedTree],
-    ) -> Result<Vec<LaunchCandidate>, LibraryError> {
         let snapshot = self
             .cached_snapshot(profile, release)?
             .ok_or_else(|| invalid("cached Release declaration snapshot unavailable"))?
@@ -186,8 +168,6 @@ impl Library {
                     status: "Unavailable".into(),
                     reason: String::new(),
                     local_root: None,
-                    expected_hash: None,
-                    expected_size: None,
                 };
                 if id.is_empty()
                     || id.len() > 80
@@ -353,19 +333,23 @@ impl Library {
                 if file {
                     if let Some(runtime) = runtime {
                         c.local_root = Some(runtime.path.clone());
-                        c.expected_size = artifact.value.size;
-                        c.expected_hash = a
-                            .artifact_id
-                            .strip_prefix("adfile:sha256:")
-                            .map(str::to_owned);
                         c.target = Some("payload".into());
                     }
                 } else if let Some(runtime) = runtime {
-                    let job_id:String=self.conn.query_row("SELECT id FROM download_jobs WHERE profile_id=?1 AND association_id=?2 AND artifact_id=?3 AND state='Completed' ORDER BY updated_at DESC LIMIT 1",rusqlite::params![profile.0,a.id,a.artifact_id],|r|r.get(0))?;
+                    let job_id:Option<String>=self.conn.query_row("SELECT id FROM download_jobs WHERE profile_id=?1 AND association_id=?2 AND artifact_id=?3 AND state='Completed' ORDER BY updated_at DESC LIMIT 1",rusqlite::params![profile.0,a.id,a.artifact_id],|r|r.get(0)).optional()?;
+                    let Some(job_id) = job_id else {
+                        issue(
+                            &mut c,
+                            "LocalUnavailable",
+                            "Verified Tree inventory is unavailable",
+                        );
+                        out.push(c);
+                        continue;
+                    };
                     let inventory = self
                         .tree_inventory(&job_id)?
                         .ok_or_else(|| invalid("verified Tree inventory unavailable"))?;
-                    if let Some(InventoryEntry::File { size, sha256, .. }) =
+                    if let Some(InventoryEntry::File { .. }) =
                         inventory.iter().find(|e| e.path() == target_path)
                     {
                         if work.is_empty()
@@ -374,8 +358,6 @@ impl Library {
                                 .any(|e| matches!(e,InventoryEntry::Directory{path} if path==&work))
                         {
                             c.local_root = Some(runtime.path.clone());
-                            c.expected_size = Some(*size);
-                            c.expected_hash = Some(sha256.clone());
                         } else {
                             issue(
                                 &mut c,
@@ -397,7 +379,7 @@ impl Library {
                         Ok(()) => issue(
                             &mut c,
                             "Ready",
-                            "Verified content and declaration available; target hash checked again before launch",
+                            "Declared target is available in the writable installation",
                         ),
                         Err(reason) => issue(&mut c, "LocalUnavailable", &reason),
                     }
@@ -411,7 +393,7 @@ impl Library {
                     issue(
                         &mut c,
                         "PreparationRequired",
-                        "Verified download is available; prepare a writable local copy before Play",
+                        "Verified download is available; a writable installation will be prepared on Play",
                     );
                 } else if c.reason.is_empty() {
                     issue(
@@ -501,8 +483,8 @@ impl LaunchCandidate {
         open_nofollow(root, work, true)
             .map_err(|e| format!("unsafe or missing working directory: {e}"))?;
         let meta = file.metadata().map_err(|e| e.to_string())?;
-        if !meta.is_file() || Some(meta.len()) != self.expected_size {
-            return Err("local target is missing or has changed size".into());
+        if !meta.is_file() {
+            return Err("local target is missing or is not a regular file".into());
         }
         if meta.permissions().mode() & 0o111 == 0 {
             return Err("declared target is not executable".into());
@@ -527,7 +509,7 @@ impl LaunchCandidate {
             let root = self
                 .local_root
                 .as_ref()
-                .ok_or_else(|| invalid("verified local root missing"))?;
+                .ok_or_else(|| invalid("writable installation root missing"))?;
             let target = self
                 .target
                 .as_deref()
@@ -539,29 +521,18 @@ impl LaunchCandidate {
             if !path_valid(target) || (!work.is_empty() && !path_valid(work)) {
                 return Err(invalid("unsafe launch path"));
             }
-            let mut executable = open_nofollow(root, target, false)?;
+            let executable = open_nofollow(root, target, false)?;
             let dir = open_nofollow(root, work, true)?;
             let meta = executable.metadata()?;
-            if !meta.is_file() || Some(meta.len()) != self.expected_size {
-                return Err(invalid("local executable is missing or changed"));
+            if !meta.is_file() {
+                return Err(invalid(
+                    "local executable is missing or is not a regular file",
+                ));
             }
             if meta.permissions().mode() & 0o111 == 0 {
                 return Err(invalid("declared target is not executable by current user"));
             }
-            let mut hash = Sha256::new();
-            let mut buffer = [0u8; 65536];
-            loop {
-                let n = executable.read(&mut buffer)?;
-                if n == 0 {
-                    break;
-                }
-                hash.update(&buffer[..n]);
-            }
-            let actual = format!("{:x}", hash.finalize());
-            if self.expected_hash.as_deref() != Some(actual.as_str()) {
-                return Err(invalid("local executable integrity check failed"));
-            }
-            // /proc/self/fd binds exec to the opened, hashed inode. The descriptor closes on exec.
+            // /proc/self/fd binds exec to the validated opened inode. The descriptor closes on exec.
             let mut command = Command::new(format!("/proc/self/fd/{}", executable.as_raw_fd()));
             command.args(&self.arguments);
             for (key, _) in std::env::vars_os() {
@@ -696,16 +667,11 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn direct_process_uses_verified_open_inode_and_rejects_symlink() {
-        use std::{io::Read, os::unix::fs::symlink};
+        use std::os::unix::fs::symlink;
         let temp = tempfile::tempdir().unwrap();
         let source = std::env::current_exe().unwrap();
         let target = temp.path().join("native-program");
         std::fs::copy(source, &target).unwrap();
-        let mut bytes = Vec::new();
-        File::open(&target)
-            .unwrap()
-            .read_to_end(&mut bytes)
-            .unwrap();
         let candidate = LaunchCandidate {
             profile_id: ServerProfileId("test".into()),
             release_id: "r".into(),
@@ -720,9 +686,9 @@ mod tests {
             status: "Ready".into(),
             reason: String::new(),
             local_root: Some(temp.path().to_owned()),
-            expected_hash: Some(format!("{:x}", Sha256::digest(&bytes))),
-            expected_size: Some(bytes.len() as u64),
         };
+        assert!(candidate.spawn().unwrap().wait().unwrap().success());
+        std::fs::copy("/bin/true", &target).unwrap();
         assert!(candidate.spawn().unwrap().wait().unwrap().success());
         std::fs::remove_file(&target).unwrap();
         symlink("/bin/true", &target).unwrap();
@@ -763,7 +729,6 @@ mod tests {
                 .unwrap()
                 .success()
         );
-        let bytes = fs::read(&executable).unwrap();
         let candidate = LaunchCandidate {
             profile_id: ServerProfileId("test".into()),
             release_id: "r".into(),
@@ -778,8 +743,6 @@ mod tests {
             status: "Ready".into(),
             reason: String::new(),
             local_root: Some(temp.path().to_owned()),
-            expected_hash: Some(format!("{:x}", Sha256::digest(&bytes))),
-            expected_size: Some(bytes.len() as u64),
         };
         assert!(candidate.local_readiness().is_ok());
         let status = candidate.spawn().unwrap().wait().unwrap();
@@ -789,8 +752,14 @@ mod tests {
         assert!(report.contains(&system.display().to_string()));
         assert!(report.ends_with("false\n"));
         fs::write(&executable, b"corrupt").unwrap();
-        assert!(candidate.spawn().is_err());
-        fs::write(&executable, &bytes).unwrap();
+        assert!(
+            !candidate
+                .spawn()
+                .map(|mut child| child.wait().unwrap().success())
+                .unwrap_or(false)
+        );
+        fs::copy("/bin/true", &executable).unwrap();
+        assert!(candidate.spawn().unwrap().wait().unwrap().success());
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o600)).unwrap();
         assert!(candidate.spawn().is_err());
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();

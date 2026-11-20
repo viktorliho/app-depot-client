@@ -5,7 +5,7 @@ use app_depot_core::{
     api::ApiClient,
     launch::LaunchCandidate,
     library::{Library, LibraryPaths, LocalIssue, Profile},
-    managed::{Installation, StorageUsage},
+    managed::{Installation, InstallationIntegrity, StorageUsage},
     models::{App, Artifact, Association, DeclarationSnapshot, Release},
     secrets::{NativeSecrets, SecretStore},
     transfer::{DownloadJob, TransferObservation, TransferPhase, VerifiedFile},
@@ -58,6 +58,7 @@ pub struct Snapshot {
     pub profiles: Vec<Profile>,
     pub apps: Vec<AppView>,
     pub jobs: Vec<DownloadJob>,
+    pub job_context: HashMap<String, (String, String, String)>,
     pub files: Vec<VerifiedFile>,
     pub trees: Vec<VerifiedTree>,
     pub local_issues: Vec<LocalIssue>,
@@ -105,6 +106,7 @@ pub enum Command {
     Pause(String),
     Resume(String),
     Retry(String),
+    MoveToTop(String),
     Cancel(String),
     TreeFiles(String),
     Artwork {
@@ -114,14 +116,12 @@ pub enum Command {
     },
     Reveal(PathBuf),
     StorageUsage,
-    Prepare {
-        profile: ServerProfileId,
-        association: String,
-    },
     RemoveInstallation {
         id: String,
         complete: bool,
     },
+    VerifyInstallation(String),
+    RepairInstallation(String),
     RemoveArtifact {
         profile: ServerProfileId,
         association: String,
@@ -150,6 +150,7 @@ pub enum Event {
     Jobs {
         profile: ServerProfileId,
         jobs: Vec<DownloadJob>,
+        context: Option<HashMap<String, (String, String, String)>>,
     },
     JobChanged,
     CatalogChanged(ServerProfileId),
@@ -176,6 +177,11 @@ pub enum Event {
     },
     Notice(String),
     Error(String),
+    LocalOperation {
+        id: String,
+        phase: Option<String>,
+    },
+    Integrity(InstallationIntegrity),
     SelectProfile(ServerProfileId),
     Launch {
         profile: ServerProfileId,
@@ -200,6 +206,10 @@ pub enum Event {
 }
 
 enum Background {
+    DownloadFinished {
+        id: String,
+        result: Result<(), String>,
+    },
     Synced {
         profile: ServerProfileId,
         result: Result<(), String>,
@@ -320,6 +330,40 @@ fn send(tx: &Sender<Event>, ctx: &egui::Context, event: Event) {
     }
 }
 
+fn send_jobs(
+    lib: &Library,
+    profile: &ServerProfileId,
+    with_context: bool,
+    tx: &Sender<Event>,
+    ctx: &egui::Context,
+) -> Result<(), String> {
+    let jobs = lib.jobs(None).map_err(|e| e.to_string())?;
+    let context = if with_context {
+        let mut context = HashMap::new();
+        for job in &jobs {
+            if let Some(value) = lib
+                .display_context_for_association(&job.profile_id, &job.association_id)
+                .map_err(|e| e.to_string())?
+            {
+                context.insert(job.id.clone(), value);
+            }
+        }
+        Some(context)
+    } else {
+        None
+    };
+    send(
+        tx,
+        ctx,
+        Event::Jobs {
+            profile: profile.clone(),
+            jobs,
+            context,
+        },
+    );
+    Ok(())
+}
+
 fn client(profile: &Profile, memory: &HashMap<String, String>) -> Result<ApiClient, String> {
     let token = match memory.get(&profile.id.0) {
         Some(value) => Some(value.clone()),
@@ -349,6 +393,15 @@ pub(crate) fn snapshot(
         library_content: lib.paths.content.clone(),
         ..Snapshot::default()
     };
+    result.jobs = lib.jobs(None).map_err(|e| e.to_string())?;
+    for job in &result.jobs {
+        if let Some(context) = lib
+            .display_context_for_association(&job.profile_id, &job.association_id)
+            .map_err(|e| e.to_string())?
+        {
+            result.job_context.insert(job.id.clone(), context);
+        }
+    }
     if let Some(id) = selected {
         for row in lib.cached_apps(id).map_err(|e| e.to_string())? {
             let mut releases = Vec::new();
@@ -385,7 +438,6 @@ pub(crate) fn snapshot(
                 stale: row.stale,
             });
         }
-        result.jobs = lib.jobs(Some(id)).map_err(|e| e.to_string())?;
         let (files, file_issues) = lib.inspect_files(Some(id)).map_err(|e| e.to_string())?;
         let (trees, tree_issues) = lib.inspect_trees(Some(id)).map_err(|e| e.to_string())?;
         result.files = files;
@@ -397,13 +449,8 @@ pub(crate) fn snapshot(
             for release in &app.releases {
                 if release.declaration.is_some() {
                     result.launches.extend(
-                        lib.launch_candidates_with_verified(
-                            id,
-                            &release.release.id,
-                            &result.files,
-                            &result.trees,
-                        )
-                        .map_err(|e| e.to_string())?,
+                        lib.launch_candidates(id, &release.release.id)
+                            .map_err(|e| e.to_string())?,
                     );
                 }
             }
@@ -426,6 +473,15 @@ fn operation(
     art_tx: &Sender<ArtTask>,
     ctx: &egui::Context,
 ) -> Result<bool, String> {
+    let jobs_only = matches!(
+        &cmd,
+        Command::Download { .. }
+            | Command::Pause(_)
+            | Command::Resume(_)
+            | Command::Retry(_)
+            | Command::MoveToTop(_)
+            | Command::Cancel(_)
+    );
     match cmd {
         Command::Refresh(id) => {
             *selected = id;
@@ -544,14 +600,9 @@ fn operation(
                 _ => return Err("unsupported Artifact kind".into()),
             }
             .map_err(|e| e.to_string())?;
-            start_job(
-                paths.clone(),
-                p,
-                memory.get(&profile.0).cloned(),
-                job,
-                tx.clone(),
-                ctx.clone(),
-            );
+            if job.state == "Queued" {
+                lib.move_job_to_top(&job.id).map_err(|e| e.to_string())?;
+            }
         }
         Command::Pause(id) => {
             lib.pause_job(&id).map_err(|e| e.to_string())?;
@@ -560,16 +611,10 @@ fn operation(
             lib.cancel_job(&id).map_err(|e| e.to_string())?;
         }
         Command::Resume(id) | Command::Retry(id) => {
-            let job = lib.retry_job(&id).map_err(|e| e.to_string())?;
-            let p = lib.profile(&job.profile_id).map_err(|e| e.to_string())?;
-            start_job(
-                paths.clone(),
-                p,
-                memory.get(&job.profile_id.0).cloned(),
-                job,
-                tx.clone(),
-                ctx.clone(),
-            );
+            lib.retry_job(&id).map_err(|e| e.to_string())?;
+        }
+        Command::MoveToTop(id) => {
+            lib.move_job_to_top(&id).map_err(|e| e.to_string())?;
         }
         Command::TreeFiles(id) => {
             let files = lib.tree_files(&id).map_err(|e| e.to_string())?;
@@ -637,39 +682,94 @@ fn operation(
             );
             return Ok(false);
         }
-        Command::Prepare {
-            profile,
-            association,
-        } => {
+        Command::RemoveInstallation { id, complete } => {
+            send(
+                tx,
+                ctx,
+                Event::LocalOperation {
+                    id: id.clone(),
+                    phase: Some("Checking active processes".into()),
+                },
+            );
             let paths = paths.clone();
             let tx = tx.clone();
             let ctx = ctx.clone();
             thread::spawn(move || {
-                let result = Library::open(paths)
-                    .and_then(|mut lib| lib.prepare_portable(&profile, &association));
-                match result {
-                    Ok(_) => send(
+                let report = |phase: &str| {
+                    send(
                         &tx,
                         &ctx,
-                        Event::Notice("Writable application copy is ready".into()),
-                    ),
-                    Err(error) => send(&tx, &ctx, Event::Error(error.to_string())),
-                }
-                send(&tx, &ctx, Event::JobChanged);
-            });
-            return Ok(false);
-        }
-        Command::RemoveInstallation { id, complete } => {
-            let paths = paths.clone();
-            let tx = tx.clone();
-            let ctx = ctx.clone();
-            thread::spawn(move || {
-                let result =
-                    Library::open(paths).and_then(|mut lib| lib.remove_installation(&id, complete));
+                        Event::LocalOperation {
+                            id: id.clone(),
+                            phase: Some(phase.into()),
+                        },
+                    )
+                };
+                let result = Library::open(paths).and_then(|mut lib| {
+                    lib.remove_installation_observed(&id, complete, &mut |phase| report(phase))
+                });
                 match result {
                     Ok(())=>send(&tx,&ctx,Event::Notice(if complete{"Managed application data and local download reference removed"}else{"Writable application copy removed; verified download and managed data kept"}.into())),
                     Err(error)=>send(&tx,&ctx,Event::Error(error.to_string())),
                 }
+                send(&tx, &ctx, Event::LocalOperation { id, phase: None });
+                send(&tx, &ctx, Event::JobChanged);
+            });
+            return Ok(false);
+        }
+        Command::VerifyInstallation(id) => {
+            let paths = paths.clone();
+            let tx = tx.clone();
+            let ctx = ctx.clone();
+            thread::spawn(move || {
+                send(
+                    &tx,
+                    &ctx,
+                    Event::LocalOperation {
+                        id: id.clone(),
+                        phase: Some("Comparing installed files with the published Artifact".into()),
+                    },
+                );
+                match Library::open(paths).and_then(|lib| lib.verify_installation(&id)) {
+                    Ok(report) => send(&tx, &ctx, Event::Integrity(report)),
+                    Err(error) => send(&tx, &ctx, Event::Error(error.to_string())),
+                }
+                send(&tx, &ctx, Event::LocalOperation { id, phase: None });
+            });
+            return Ok(false);
+        }
+        Command::RepairInstallation(id) => {
+            let paths = paths.clone();
+            let tx = tx.clone();
+            let ctx = ctx.clone();
+            thread::spawn(move || {
+                send(
+                    &tx,
+                    &ctx,
+                    Event::LocalOperation {
+                        id: id.clone(),
+                        phase: Some(
+                            "Preserving modified installation and restoring original files".into(),
+                        ),
+                    },
+                );
+                match Library::open(paths).and_then(|mut lib| lib.repair_installation(&id)) {
+                    Ok((_, backup)) => send(
+                        &tx,
+                        &ctx,
+                        Event::Notice(backup.map_or(
+                            "Installation restored from verified local content".into(),
+                            |backup| {
+                                format!(
+                                    "Installation restored. Previous files kept at {}",
+                                    backup.display()
+                                )
+                            },
+                        )),
+                    ),
+                    Err(error) => send(&tx, &ctx, Event::Error(error.to_string())),
+                }
+                send(&tx, &ctx, Event::LocalOperation { id, phase: None });
                 send(&tx, &ctx, Event::JobChanged);
             });
             return Ok(false);
@@ -678,6 +778,14 @@ fn operation(
             profile,
             association,
         } => {
+            send(
+                tx,
+                ctx,
+                Event::LocalOperation {
+                    id: association.clone(),
+                    phase: Some("Removing local download and unreferenced content".into()),
+                },
+            );
             let paths = paths.clone();
             let tx = tx.clone();
             let ctx = ctx.clone();
@@ -692,6 +800,14 @@ fn operation(
                     ),
                     Err(error) => send(&tx, &ctx, Event::Error(error.to_string())),
                 };
+                send(
+                    &tx,
+                    &ctx,
+                    Event::LocalOperation {
+                        id: association,
+                        phase: None,
+                    },
+                );
                 send(&tx, &ctx, Event::JobChanged);
             });
             return Ok(false);
@@ -701,12 +817,33 @@ fn operation(
             app,
             complete,
         } => {
+            send(
+                tx,
+                ctx,
+                Event::LocalOperation {
+                    id: app.clone(),
+                    phase: Some("Removing application items".into()),
+                },
+            );
             let paths = paths.clone();
             let tx = tx.clone();
             let ctx = ctx.clone();
             thread::spawn(move || {
-                let result = Library::open(paths)
-                    .and_then(|mut lib| lib.remove_local_app(&profile, &app, complete));
+                let report = |index: usize, total: usize| {
+                    send(
+                        &tx,
+                        &ctx,
+                        Event::LocalOperation {
+                            id: app.clone(),
+                            phase: Some(format!("Removing item {index} of {total}")),
+                        },
+                    )
+                };
+                let result = Library::open(paths).and_then(|mut lib| {
+                    lib.remove_local_app_observed(&profile, &app, complete, &mut |index, total| {
+                        report(index, total)
+                    })
+                });
                 match result {
                     Ok(count) => send(
                         &tx,
@@ -717,6 +854,14 @@ fn operation(
                     ),
                     Err(error) => send(&tx, &ctx, Event::Error(error.to_string())),
                 };
+                send(
+                    &tx,
+                    &ctx,
+                    Event::LocalOperation {
+                        id: app,
+                        phase: None,
+                    },
+                );
                 send(&tx, &ctx, Event::JobChanged);
             });
             return Ok(false);
@@ -787,7 +932,7 @@ fn operation(
                 };
                 announce("Starting", "Checking local content before launch".into());
                 let result = (|| -> Result<(), String> {
-                    let lib = Library::open(paths).map_err(|e| e.to_string())?;
+                    let mut lib = Library::open(paths).map_err(|e| e.to_string())?;
                     let candidate = lib
                         .launch_candidates(&profile, &release)
                         .map_err(|e| e.to_string())?
@@ -800,7 +945,12 @@ fn operation(
                                 .into(),
                         );
                     }
-                    if candidate.status != "Ready" {
+                    if candidate.status == "PreparationRequired" {
+                        announce("Preparing", "Creating the writable application copy".into());
+                        lib.prepare_portable(&profile, &association)
+                            .map_err(|e| format!("Preparation failed: {e}"))?;
+                        send(&tx, &ctx, Event::JobChanged);
+                    } else if candidate.status != "Ready" {
                         return Err(format!("{}: {}", candidate.status, candidate.reason));
                     }
                     let mut child = lib
@@ -837,7 +987,14 @@ fn operation(
             return Ok(false);
         }
     }
-    Ok(true)
+    if jobs_only {
+        if let Some(profile) = selected.as_ref() {
+            send_jobs(lib, profile, true, tx, ctx)?;
+        }
+        Ok(false)
+    } else {
+        Ok(true)
+    }
 }
 
 fn artwork_loop(rx: Receiver<ArtTask>, tx: Sender<Event>, ctx: egui::Context) {
@@ -962,6 +1119,7 @@ fn start_job(
     job: DownloadJob,
     tx: Sender<Event>,
     ctx: egui::Context,
+    background: Sender<Background>,
 ) {
     thread::spawn(move || {
         let result = (|| -> Result<(), String> {
@@ -1008,12 +1166,36 @@ fn start_job(
                 lib.run_file_job_observed(&api, &job.id, None, &mut observe)
                     .map_err(|e| e.to_string())?;
             }
+            if lib.job(&job.id).map_err(|e| e.to_string())?.state == "Completed" {
+                let release: Option<String> = lib
+                    .release_for_association(&job.profile_id, &job.association_id)
+                    .map_err(|e| e.to_string())?;
+                if let Some(release) = release {
+                    let ready = lib
+                        .launch_candidates(&job.profile_id, &release)
+                        .map_err(|e| e.to_string())?
+                        .iter()
+                        .any(|c| {
+                            c.association_id == job.association_id
+                                && c.status == "PreparationRequired"
+                        });
+                    if ready {
+                        send(
+                            &tx,
+                            &ctx,
+                            Event::Notice("Preparing the downloaded application for Play".into()),
+                        );
+                        lib.prepare_portable(&job.profile_id, &job.association_id)
+                            .map_err(|e| format!("Automatic preparation failed: {e}"))?;
+                    }
+                }
+            }
             Ok(())
         })();
-        match result {
-            Ok(()) => {}
-            Err(e) => send(&tx, &ctx, Event::Error(format!("Download failed: {e}"))),
-        }
+        let _ = background.send(Background::DownloadFinished {
+            id: job.id.clone(),
+            result,
+        });
         send(&tx, &ctx, Event::JobChanged);
     });
 }
@@ -1037,6 +1219,7 @@ fn run(
             if let Err(e) = lib
                 .reconcile_file_jobs()
                 .and_then(|_| lib.reconcile_tree_jobs())
+                .and_then(|_| lib.restore_preempted_jobs())
             {
                 send(&tx, &ctx, Event::Error(format!("Job recovery: {e}")));
             }
@@ -1055,12 +1238,31 @@ fn run(
     let mut memory = HashMap::new();
     let mut refreshes: HashMap<String, RefreshState> = HashMap::new();
     let mut pending_connect: Option<u64> = None;
+    let mut active_download: Option<String> = None;
+    let mut next_download_try = Instant::now();
     if let Ok(value) = snapshot(&lib, None) {
         send(&tx, &ctx, Event::Snapshot(value));
     }
     loop {
         while let Ok(done) = background_rx.try_recv() {
             match done {
+                Background::DownloadFinished { id, result } => {
+                    if active_download.as_deref() == Some(&id) {
+                        active_download = None;
+                    }
+                    if let Err(error) = result {
+                        if error.contains("another application download holds the library slot") {
+                            next_download_try = Instant::now() + Duration::from_secs(1);
+                        } else {
+                            let _ = lib.fail_queued_job(&id, &error);
+                            send(&tx, &ctx, Event::Error(format!("Download: {error}")));
+                        }
+                    }
+                    if let Err(error) = lib.restore_preempted_jobs() {
+                        send(&tx, &ctx, Event::Error(error.to_string()));
+                    }
+                    send(&tx, &ctx, Event::JobChanged);
+                }
                 Background::Synced {
                     profile,
                     result,
@@ -1242,6 +1444,38 @@ fn run(
                 }
             }
         }
+        if let Some(current) = active_download.as_deref()
+            && let (Ok(active), Ok(Some(next))) = (lib.job(current), lib.next_queued_job())
+            && next.id != current
+            && next.queue_rank > active.queue_rank
+        {
+            let _ = lib.preempt_job(current);
+        }
+        if active_download.is_none() && Instant::now() >= next_download_try {
+            if let Err(error) = lib.restore_preempted_jobs() {
+                send(&tx, &ctx, Event::Error(error.to_string()));
+            }
+            match lib.next_queued_job() {
+                Ok(Some(job)) => match lib.profile(&job.profile_id) {
+                    Ok(profile) => {
+                        let token = memory.get(&job.profile_id.0).cloned();
+                        active_download = Some(job.id.clone());
+                        start_job(
+                            paths.clone(),
+                            profile,
+                            token,
+                            job,
+                            tx.clone(),
+                            ctx.clone(),
+                            background_tx.clone(),
+                        );
+                    }
+                    Err(error) => send(&tx, &ctx, Event::Error(error.to_string())),
+                },
+                Ok(None) => next_download_try = Instant::now() + Duration::from_secs(1),
+                Err(error) => send(&tx, &ctx, Event::Error(error.to_string())),
+            }
+        }
         match rx.recv_timeout(Duration::from_millis(250)) {
             Ok(Command::Connect {
                 name,
@@ -1292,6 +1526,8 @@ fn run(
                 );
             }
             Ok(cmd) => {
+                let priority_change =
+                    matches!(&cmd, Command::Download { .. } | Command::MoveToTop(_));
                 let activate = match &cmd {
                     Command::Refresh(Some(id)) => Some(id.clone()),
                     _ => None,
@@ -1345,6 +1581,18 @@ fn run(
                         );
                     }
                 }
+                if priority_change
+                    && succeeded
+                    && let Some(current) = active_download.as_deref()
+                    && let (Ok(active), Ok(Some(next))) = (lib.job(current), lib.next_queued_job())
+                    && next.id != current
+                    && next.queue_rank > active.queue_rank
+                {
+                    let _ = lib.preempt_job(current);
+                }
+                if priority_change && succeeded {
+                    next_download_try = Instant::now();
+                }
                 if let Some(id) = activate {
                     schedule_sync(
                         &paths,
@@ -1360,17 +1608,8 @@ fn run(
                 }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                if let Some(id) = selected.as_ref()
-                    && let Ok(jobs) = lib.jobs(Some(id))
-                {
-                    send(
-                        &tx,
-                        &ctx,
-                        Event::Jobs {
-                            profile: id.clone(),
-                            jobs,
-                        },
-                    );
+                if let Some(id) = selected.as_ref() {
+                    let _ = send_jobs(&lib, id, false, &tx, &ctx);
                 }
                 if let Some(id) = selected.as_ref() {
                     schedule_sync(

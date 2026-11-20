@@ -8,7 +8,7 @@ use app_depot_core::{
     ServerProfileId,
     api::ApiClient,
     library::LibraryPaths,
-    managed::StorageUsage,
+    managed::{InstallationIntegrity, StorageUsage},
     models::{AppConvention, AssociationConvention, ReleaseConvention},
     transfer::DownloadJob,
 };
@@ -39,6 +39,7 @@ enum Confirmation {
     RemoveArtifact,
     RemoveApp,
     RepairSource,
+    RepairInstallation,
     Exit,
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -80,6 +81,8 @@ struct Desktop {
     tree_progress: HashMap<String, Vec<app_depot_core::tree_download::TreeFileProgress>>,
     live_progress: HashMap<String, LiveProgress>,
     launch_states: HashMap<String, (String, String)>,
+    local_operations: HashMap<String, String>,
+    integrity_reports: HashMap<String, InstallationIntegrity>,
     search: String,
     sort_desc: bool,
     prefs: Preferences,
@@ -103,6 +106,7 @@ struct Desktop {
     remove_artifact_target: Option<(ServerProfileId, String, String)>,
     remove_app_target: Option<(ServerProfileId, String, String, bool)>,
     repair_target: Option<(ServerProfileId, String)>,
+    repair_installation_target: Option<(String, String)>,
     exit_allowed: bool,
     syncing: HashSet<String>,
     sync_errors: HashMap<String, String>,
@@ -133,6 +137,8 @@ impl Desktop {
             tree_progress: HashMap::new(),
             live_progress: HashMap::new(),
             launch_states: HashMap::new(),
+            local_operations: HashMap::new(),
+            integrity_reports: HashMap::new(),
             search: String::new(),
             sort_desc: false,
             prefs,
@@ -156,6 +162,7 @@ impl Desktop {
             remove_artifact_target: None,
             remove_app_target: None,
             repair_target: None,
+            repair_installation_target: None,
             exit_allowed: false,
             syncing: HashSet::new(),
             sync_errors: HashMap::new(),
@@ -164,6 +171,7 @@ impl Desktop {
             last_focus: false,
         };
         this.apply_theme(ctx);
+        ctx.request_repaint_after(std::time::Duration::from_millis(100));
         this
     }
     fn send(&self, command: Command) {
@@ -263,6 +271,7 @@ impl Desktop {
                     if selected.as_ref() == self.active.as_ref() {
                         self.snapshot.apps = s.apps;
                         self.snapshot.jobs = s.jobs;
+                        self.snapshot.job_context = s.job_context;
                         self.snapshot.files = s.files;
                         self.snapshot.trees = s.trees;
                         self.snapshot.local_issues = s.local_issues;
@@ -271,9 +280,16 @@ impl Desktop {
                     }
                 }
                 Event::StorageUsage(usage) => self.storage_usage = Some(usage),
-                Event::Jobs { profile, jobs } => {
+                Event::Jobs {
+                    profile,
+                    jobs,
+                    context,
+                } => {
                     if self.active.as_ref() == Some(&profile) {
                         self.snapshot.jobs = jobs;
+                        if let Some(context) = context {
+                            self.snapshot.job_context = context;
+                        }
                     }
                 }
                 Event::JobChanged => {
@@ -353,6 +369,17 @@ impl Desktop {
                 }
                 Event::Notice(s) => self.notice(s, false),
                 Event::Error(s) => self.notice(s, true),
+                Event::LocalOperation { id, phase } => {
+                    if let Some(phase) = phase {
+                        self.local_operations.insert(id, phase);
+                    } else {
+                        self.local_operations.remove(&id);
+                    }
+                }
+                Event::Integrity(report) => {
+                    self.integrity_reports
+                        .insert(report.installation_id.clone(), report);
+                }
                 Event::SelectProfile(id) => {
                     self.setup = Setup::Closed;
                     self.setup_error = None;
@@ -496,7 +523,7 @@ fn main() -> eframe::Result {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::views::{format_time, friendly_job_state, job_actions};
+    use crate::views::{catalog_item_visible, format_time, friendly_job_state, job_actions};
     fn job(state: &str) -> DownloadJob {
         DownloadJob {
             id: "job".into(),
@@ -511,6 +538,8 @@ mod tests {
             created_at: 0,
             updated_at: 0,
             attempts: 0,
+            queue_rank: 0,
+            auto_resume: false,
         }
     }
     #[test]
@@ -524,6 +553,12 @@ mod tests {
             Command::Retry(_)
         ));
         assert!(job_actions(&job("Verifying")).is_empty());
+    }
+    #[test]
+    fn retired_catalog_entry_is_hidden_only_after_complete_online_sync() {
+        assert!(!catalog_item_visible(true, true));
+        assert!(catalog_item_visible(true, false));
+        assert!(catalog_item_visible(false, true));
     }
     #[test]
     fn unknown_json_keeps_large_integer_for_display() {
