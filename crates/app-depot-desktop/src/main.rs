@@ -1,4 +1,5 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
+mod design;
 mod preferences;
 mod telemetry;
 mod views;
@@ -77,6 +78,7 @@ struct Desktop {
     settings_tab: SettingsTab,
     selected_app: Option<String>,
     selected_job: Option<String>,
+    show_history: bool,
     last_tree_details_refresh: Instant,
     tree_progress: HashMap<String, Vec<app_depot_core::tree_download::TreeFileProgress>>,
     live_progress: HashMap<String, LiveProgress>,
@@ -133,6 +135,7 @@ impl Desktop {
             settings_tab: SettingsTab::Servers,
             selected_app: None,
             selected_job: None,
+            show_history: false,
             last_tree_details_refresh: Instant::now(),
             tree_progress: HashMap::new(),
             live_progress: HashMap::new(),
@@ -194,17 +197,7 @@ impl Desktop {
             Theme::Dark => egui::ThemePreference::Dark,
             Theme::Light => egui::ThemePreference::Light,
         };
-        ctx.set_theme(theme);
-        for theme in [egui::Theme::Dark, egui::Theme::Light] {
-            let mut style = (*ctx.style_of(theme)).clone();
-            style.spacing.item_spacing = egui::vec2(10.0, 9.0);
-            style.spacing.button_padding = egui::vec2(13.0, 8.0);
-            style.visuals.widgets.noninteractive.corner_radius = egui::CornerRadius::same(10);
-            style.visuals.widgets.inactive.corner_radius = egui::CornerRadius::same(8);
-            style.visuals.widgets.hovered.corner_radius = egui::CornerRadius::same(8);
-            style.visuals.widgets.active.corner_radius = egui::CornerRadius::same(8);
-            ctx.set_style_of(theme, style);
-        }
+        design::install(ctx, theme, self.prefs.ui_scale);
     }
     fn notice(&mut self, message: String, error: bool) {
         self.message = Some((message, error, Instant::now()));
@@ -510,8 +503,9 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("App Depot")
-            .with_inner_size([1120.0, 760.0])
-            .with_min_inner_size([640.0, 480.0]),
+            .with_inner_size([1280.0, 820.0])
+            .with_min_inner_size([760.0, 540.0])
+            .with_decorations(!cfg!(target_os = "linux")),
         ..Default::default()
     };
     eframe::run_native(
@@ -523,7 +517,10 @@ fn main() -> eframe::Result {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::views::{catalog_item_visible, format_time, friendly_job_state, job_actions};
+    use crate::views::{
+        PrimaryAction, catalog_item_visible, format_time, friendly_job_state, job_actions,
+        primary_action, titlebar_command,
+    };
     fn job(state: &str) -> DownloadJob {
         DownloadJob {
             id: "job".into(),
@@ -597,5 +594,33 @@ mod tests {
     fn completion_progress_is_not_premature() {
         assert_eq!(friendly_job_state("Verifying"), "Verifying");
         assert_eq!(friendly_job_state("Completed"), "Downloaded and verified");
+    }
+    #[test]
+    fn hero_never_chooses_among_multiple_launches() {
+        assert_eq!(
+            primary_action(0, 1, 1, false),
+            PrimaryAction::ChooseArtifact
+        );
+        assert_eq!(primary_action(0, 1, 1, true), PrimaryAction::Offline);
+        assert_eq!(primary_action(1, 1, 1, false), PrimaryAction::Play);
+        assert_eq!(primary_action(1, 2, 2, false), PrimaryAction::ChooseLaunch);
+        assert_eq!(primary_action(1, 1, 2, false), PrimaryAction::ChooseLaunch);
+        assert_eq!(primary_action(2, 1, 2, false), PrimaryAction::ChooseLaunch);
+    }
+    #[test]
+    fn titlebar_commands_follow_window_state() {
+        assert_eq!(
+            titlebar_command(0, false),
+            egui::ViewportCommand::Minimized(true)
+        );
+        assert_eq!(
+            titlebar_command(1, false),
+            egui::ViewportCommand::Maximized(true)
+        );
+        assert_eq!(
+            titlebar_command(1, true),
+            egui::ViewportCommand::Maximized(false)
+        );
+        assert_eq!(titlebar_command(2, false), egui::ViewportCommand::Close);
     }
 }

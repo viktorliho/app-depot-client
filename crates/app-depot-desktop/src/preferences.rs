@@ -20,6 +20,7 @@ pub struct Preferences {
     pub theme: Theme,
     pub grid: bool,
     pub last_profile: Option<String>,
+    pub ui_scale: f32,
 }
 impl Default for Preferences {
     fn default() -> Self {
@@ -27,6 +28,7 @@ impl Default for Preferences {
             theme: Theme::System,
             grid: true,
             last_profile: None,
+            ui_scale: 1.15,
         }
     }
 }
@@ -47,7 +49,14 @@ pub fn load(root: &Path) -> Result<Preferences, String> {
             if bytes.len() > 16 * 1024 {
                 return Err("desktop preferences file is too large".into());
             }
-            serde_json::from_slice(&bytes).map_err(|e| e.to_string())
+            let mut value: Preferences =
+                serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+            value.ui_scale = if value.ui_scale.is_finite() {
+                value.ui_scale.clamp(0.85, 1.6)
+            } else {
+                1.15
+            };
+            Ok(value)
         }
     }
 }
@@ -93,12 +102,14 @@ mod tests {
             theme: Theme::Light,
             grid: false,
             last_profile: Some("profile".into()),
+            ui_scale: 1.25,
         };
         save(dir.path(), &value).unwrap();
         assert_eq!(
             load(dir.path()).unwrap().last_profile.as_deref(),
             Some("profile")
         );
+        assert_eq!(load(dir.path()).unwrap().ui_scale, 1.25);
         let text = fs::read_to_string(path(dir.path())).unwrap();
         assert!(!text.contains("token"));
         #[cfg(unix)]
@@ -121,5 +132,19 @@ mod tests {
         assert!(load(dir.path()).is_err());
         assert!(save(dir.path(), &Preferences::default()).is_err());
         assert_eq!(fs::read(&target).unwrap(), b"keep");
+    }
+    #[test]
+    fn old_preferences_and_out_of_range_scale_are_safe() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            path(dir.path()),
+            br#"{"theme":"Dark","grid":false,"last_profile":null}"#,
+        )
+        .unwrap();
+        let old = load(dir.path()).unwrap();
+        assert_eq!(old.ui_scale, 1.15);
+        assert!(!old.grid);
+        fs::write(path(dir.path()), br#"{"ui_scale":100.0}"#).unwrap();
+        assert_eq!(load(dir.path()).unwrap().ui_scale, 1.6);
     }
 }
