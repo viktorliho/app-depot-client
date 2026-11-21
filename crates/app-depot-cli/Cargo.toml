@@ -13,3 +13,27 @@ serde_json = { version = "1", features = ["arbitrary_precision"] }
 [dev-dependencies]
 tempfile = "3"
 ureq = { version = "2.12", default-features = false, features = ["tls"] }
+
+[features]
+decky = ["dep:eframe", "dep:image", "dep:base64", "dep:gilrs", "dep:libc", "dep:signal-hook"]
+
+[dependencies.eframe]
+version = "0.37"
+default-features = false
+features = ["glow", "wayland", "x11", "default_fonts"]
+optional = true
+
+[dependencies.image]
+version = "0.25"
+default-features = false
+features = ["png", "jpeg", "webp"]
+optional = true
+
+[dependencies.base64]
+version = "0.22"
+optional = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+gilrs = { version = "0.11.2", optional = true }
+libc = { version = "0.2", optional = true }
+signal-hook = { version = "0.4.6", optional = true }

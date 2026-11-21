@@ -51,12 +51,16 @@ Acceptance criteria:
 
 [ADR-016](ARCHITECTURE.md) retains Linux Desktop and prioritizes SteamOS Decky, then Windows Desktop and macOS Desktop. Steam is the SteamOS library and exposes every App accessible to the configured Server profile. All clients use the existing App Depot protocol.
 
-M3.0 includes a headless First Play CLI with explicit cached selection, shared transfers, verified runtime preparation and supervised native launch. A disposable loopback Dev Server harness covers download and offline execution after installed-file modification. Binary VDF reconciliation and artwork derivatives are exercised with disposable fixtures. Decky packaging and Gaming Mode validation are pending.
+M3.0 includes a headless First Play CLI with explicit cached selection, shared transfers, verified runtime preparation and supervised native launch. A disposable loopback Dev Server harness covers download and offline execution after installed-file modification. Binary VDF reconciliation and artwork derivatives are exercised with disposable fixtures. Decky packaging and Gaming Mode validation were deferred to M3.1.
 
-## M3.1 — SteamOS integration
+## M3.1a — SteamOS Decky release candidate
 
-1. Build a gated Steam adapter and per-account binding ledger. Verify immediate appearance, repeated sync, equal names, rename, metadata changes and restart with an authorized Deck and disposable Steam account. Include uninstalled and unsupported Apps. Require stable AppIDs, readback, no duplicates and preservation of foreign shortcuts and user settings. Verify interrupted creation and Decky reload. Consider an offline VDF fallback only after safe shutdown/write behavior is established.
-2. Package a stable user-owned wrapper and the Server, Installed and Settings panels. Test user-level credentials in Gaming Mode, plugin upgrade and reload, concurrent Play/Sync/Desktop queue behavior and internal and microSD library roots.
+The installable local candidate adds Decky onboarding, catalog reconciliation, artwork, a shared-core native launcher and a pinned single-file installer. Build, verification and deployment boundaries are in [SteamOS Decky](STEAMOS_DECKY.md). Live Steam and SteamOS acceptance is an owner hardware task.
+
+## M3.1b — SteamOS integration
+
+1. Validate the live Steam adapter and per-account binding ledger. Verify immediate appearance, repeated sync, equal names, rename, metadata changes and restart with an authorized Deck and disposable Steam account. Include uninstalled and unsupported Apps. Require stable AppIDs, readback, no duplicates and preservation of foreign shortcuts and user settings. Verify interrupted creation and Decky reload. Consider an offline VDF fallback only after safe shutdown/write behavior is established.
+2. Install and upgrade the packaged wrapper and Decky panels on hardware. Test user-level credentials in Gaming Mode, plugin upgrade and reload, concurrent Play/Sync/Desktop queue behavior and internal and microSD library roots.
 3. Verify native First Play and offline launch in Gaming Mode. Cover optional choice, controller navigation, readable progress, checkpoint retry, cancellation and offline Retry/Exit. Test focus, overlay, Steam Input layouts, built-in controls and Steam Controller, playtime, Stop Game, child and descendant lifetime, and return to Steam.
 4. Verify live artwork independently. Cover source revision changes, original colors after install, user overrides, per-role scaling and formats, refresh after restart and operation without artwork.
 5. Spike Steam-managed Proton for a benign Windows fixture using stable and mutable targets. Record actual AppID, compatibility tool, prefix, controller settings and first-session behavior. Keep Windows execution unavailable if neither path preserves the required experience. Keep Windows Apps visible either way.

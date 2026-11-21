@@ -1,8 +1,10 @@
 """Exercise the First Play CLI against a fresh, real loopback Dev Server."""
 
 import argparse
+import asyncio
 import hashlib
 import http.cookiejar
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -127,6 +129,91 @@ def wait_ready(server, log):
     raise TimeoutError("Dev Server did not start")
 
 
+def verify_decky(args, root, origin, token, app, server):
+    """Exercise the packaged backend, OS credential store and wrapper."""
+    package_root = root / "plugin"
+    (package_root / "bin").mkdir(parents=True)
+    (package_root / "bin" / "app-depot").symlink_to(args.client.resolve())
+    plugin_home = root / "steam-user"
+    plugin_home.mkdir()
+    os.environ["DECKY_USER_HOME"] = str(plugin_home)
+    os.environ["DECKY_PLUGIN_DIR"] = str(package_root)
+    os.environ["XDG_DATA_HOME"] = str(plugin_home / "data")
+    spec = importlib.util.spec_from_file_location("app_depot_backend", args.decky_plugin)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    async def configure_backend():
+        backend = module.Plugin()
+        await backend._main()
+        try:
+            assert (await backend.status())["profiles"] == []
+            assert (await backend.test(origin, token))["connected"]
+            profile = await backend.configure(origin, token)
+            assert (await backend.status())["profiles"][0]["authenticated"]
+            rows = await backend.catalog(profile, True)
+            assert any(row["id"] == app and not row["downloaded"] for row in rows)
+            media = await backend._rust("decky", "artwork", profile, app, "steam.grid.vertical", "muted", "")
+            assert media["revision"].endswith(":true:png1")
+            unchanged = await backend._rust("decky", "artwork", profile, app, "steam.grid.vertical", "muted", media["revision"])
+            assert unchanged == {"revision": media["revision"]}
+            return profile
+        finally:
+            await backend._unload()
+
+    profile = asyncio.run(configure_backend())
+    env = dict(os.environ, HOME=str(plugin_home))
+    env.pop("APP_DEPOT_TOKEN", None)
+    command = [args.client, "decky", "play", profile, app]
+    play = subprocess.run(command, check=True, timeout=45, env=env, capture_output=True, text=True)
+    assert "m30 fixture executed" in play.stdout
+
+    async def check_after_reload():
+        backend = module.Plugin()
+        await backend._main()
+        try:
+            rows = await backend.catalog(profile, False)
+            assert any(row["id"] == app and row["downloaded"] and row["installations"] for row in rows)
+        finally:
+            await backend._unload()
+
+    asyncio.run(check_after_reload())
+    server.terminate()
+    server.wait(timeout=20)
+    env.pop("DISPLAY", None)
+    env.pop("WAYLAND_DISPLAY", None)
+    offline = subprocess.run(command, check=True, timeout=15, env=env, capture_output=True, text=True)
+    assert "m30 fixture executed" in offline.stdout
+
+    # Replace only this disposable writable runtime. The immutable object and
+    # declaration remain intact, so Play must permit the user modification.
+    runtime = next((plugin_home / ".appdepot/apps").glob("*/bin/run.sh"))
+    source = root / "exit-status.c"
+    source.write_text("int main(void) { return 17; }\n")
+    subprocess.run(["cc", str(source), "-o", str(runtime)], check=True, timeout=20)
+    exited = subprocess.run(command, timeout=10, env=env, capture_output=True, text=True)
+    assert exited.returncode == 17
+
+    source.write_text(
+        '#include <stdio.h>\n#include <unistd.h>\n'
+        'int main(void) { puts("signal fixture started"); fflush(stdout); sleep(30); return 0; }\n'
+    )
+    subprocess.run(["cc", str(source), "-o", str(runtime)], check=True, timeout=20)
+    with subprocess.Popen(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                          text=True) as wrapper:
+        try:
+            ready, _, _ = select.select([wrapper.stdout], [], [], 5)
+            assert ready and wrapper.stdout.readline().strip() == "signal fixture started"
+            assert wrapper.poll() is None
+            wrapper.terminate()
+            assert wrapper.wait(timeout=5) == 143
+        finally:
+            if wrapper.poll() is None:
+                wrapper.kill()
+    print("PASS Decky backend configure/reload, Secret Service, X11 First Play, "
+          "display-free offline replay, child exit status and SIGTERM supervision")
+
+
 def run(args, root):
     namespace = root / "server-data"
     namespace.mkdir()
@@ -225,8 +312,11 @@ def run(args, root):
                 ["cargo", "test", "-p", "app-depot", "--locked", "--test", "tree_sigkill",
                  "--", "--ignored"], env=env, cwd=args.client_repo, check=True, timeout=180,
             )
-        server.terminate()
-        server.wait(timeout=20)
+        if args.decky_plugin:
+            verify_decky(args, root, origin, token, app, server)
+        else:
+            server.terminate()
+            server.wait(timeout=20)
         offline = client(*play, authenticated=False)
         assert "m30 fixture executed" in offline.stdout and "downloading Artifact" not in offline.stderr
         jobs_after = json.loads(client("--json", "--profile", profile, "download", "jobs",
@@ -253,6 +343,8 @@ if __name__ == "__main__":
     parser.add_argument("--server", type=Path, required=True)
     parser.add_argument("--client", type=Path, required=True)
     parser.add_argument("--client-repo", type=Path, help="also run existing real Server conformance tests")
+    parser.add_argument("--decky-plugin", type=Path,
+                        help="also exercise the real Decky RPC backend and native wrapper under X11")
     args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix="app-depot-m30-") as root:
         try:

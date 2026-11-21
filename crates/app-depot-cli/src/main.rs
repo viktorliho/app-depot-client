@@ -1,3 +1,6 @@
+#[cfg(all(feature = "decky", target_os = "linux"))]
+mod decky;
+
 use app_depot_core::{
     ServerProfileId,
     api::{ApiClient, ApiError},
@@ -225,6 +228,8 @@ enum CliError {
     Api(ApiError),
     Library(LibraryError),
     Secret(SecretError),
+    #[cfg(all(feature = "decky", target_os = "linux"))]
+    Child(std::process::ExitStatus),
 }
 fn api_exit(error: &ApiError) -> u8 {
     match error {
@@ -268,6 +273,8 @@ impl std::fmt::Display for CliError {
             Self::Api(error) => error.fmt(f),
             Self::Library(error) => error.fmt(f),
             Self::Secret(error) => error.fmt(f),
+            #[cfg(all(feature = "decky", target_os = "linux"))]
+            Self::Child(status) => write!(f, "Application exited with {status}"),
         }
     }
 }
@@ -690,13 +697,19 @@ fn run_launch(options: &Options) -> Result<(), CliError> {
     play_selected(&mut library, &selected)
 }
 
-fn run_first_play(options: &Options) -> Result<(), CliError> {
+fn run_first_play(options: &Options, prepare_only: bool) -> Result<(), CliError> {
     let profile_id = options
         .profile
         .as_ref()
         .ok_or_else(|| ApiError::Config("first-play requires --profile ID".into()))?;
-    let [_, app, release, association, entry] = options.positional.as_slice() else {
-        return Err(ApiError::Config(usage().into()).into());
+    let (app, release, association, entry, revision) = match options.positional.as_slice() {
+        [_, app, release, association, entry] if !prepare_only => {
+            (app, release, association, entry, None)
+        }
+        [_, app, release, association, entry, revision] if prepare_only => {
+            (app, release, association, entry, Some(revision))
+        }
+        _ => return Err(ApiError::Config(usage().into()).into()),
     };
     let mut library = open_library(options)?;
     let cached_release = library
@@ -713,6 +726,12 @@ fn run_first_play(options: &Options) -> Result<(), CliError> {
         .ok_or_else(|| {
             LibraryError::Invalid("selected entry point is absent from cached Release".into())
         })?;
+    if revision.is_some_and(|revision| *revision != selected.declaration_revision) {
+        return Err(LibraryError::Invalid(
+            "Launch declaration changed. Synchronize and choose again.".into(),
+        )
+        .into());
+    }
     if selected.status == "NotDownloaded" {
         let profile = library.profile(profile_id)?;
         if profile.archived || cached_release.stale {
@@ -779,12 +798,23 @@ fn run_first_play(options: &Options) -> Result<(), CliError> {
             .ok_or_else(|| {
                 LibraryError::Invalid("cached selection changed during download".into())
             })?;
-        return play_selected(&mut library, &refreshed);
+        return finish_first_play(&mut library, &refreshed, prepare_only);
     }
-    play_selected(&mut library, &selected)
+    finish_first_play(&mut library, &selected, prepare_only)
 }
 
-fn play_selected(library: &mut Library, selected: &LaunchCandidate) -> Result<(), CliError> {
+fn finish_first_play(
+    library: &mut Library,
+    selected: &LaunchCandidate,
+    prepare_only: bool,
+) -> Result<(), CliError> {
+    if prepare_only {
+        return prepare_selected(library, selected);
+    }
+    play_selected(library, selected)
+}
+
+fn prepare_selected(library: &mut Library, selected: &LaunchCandidate) -> Result<(), CliError> {
     if selected.status == "PreparationRequired" {
         eprintln!("preparing writable installation from verified local content");
         library.prepare_portable(&selected.profile_id, &selected.association_id)?;
@@ -795,6 +825,11 @@ fn play_selected(library: &mut Library, selected: &LaunchCandidate) -> Result<()
         ))
         .into());
     }
+    Ok(())
+}
+
+fn play_selected(library: &mut Library, selected: &LaunchCandidate) -> Result<(), CliError> {
+    prepare_selected(library, selected)?;
     let mut child = library.play_declared(
         &selected.profile_id,
         &selected.release_id,
@@ -1092,6 +1127,10 @@ fn run_library(options: &Options) -> Result<(), CliError> {
 
 fn run() -> Result<(), CliError> {
     let options = parse_args()?;
+    #[cfg(all(feature = "decky", target_os = "linux"))]
+    if options.positional[0] == "decky" {
+        return decky::run_decky(&options);
+    }
     if options.positional[0] == "profile" {
         return run_profile(&options);
     }
@@ -1101,8 +1140,12 @@ fn run() -> Result<(), CliError> {
     if options.positional[0] == "launch" {
         return run_launch(&options);
     }
+    #[cfg(all(feature = "decky", target_os = "linux"))]
+    if options.positional[0] == "decky-prepare" {
+        return run_first_play(&options, true);
+    }
     if options.positional[0] == "first-play" {
-        return run_first_play(&options);
+        return run_first_play(&options, false);
     }
     if options.positional[0] == "runtime" {
         return run_runtime(&options);
@@ -1269,6 +1312,15 @@ fn main() -> ExitCode {
                 }
                 CliError::Library(_) => 9,
                 CliError::Secret(_) => 10,
+                #[cfg(all(feature = "decky", target_os = "linux"))]
+                CliError::Child(status) => {
+                    use std::os::unix::process::ExitStatusExt;
+                    status
+                        .code()
+                        .or_else(|| status.signal().map(|signal| 128 + signal))
+                        .and_then(|code| u8::try_from(code).ok())
+                        .unwrap_or(1)
+                }
             })
         }
     }
