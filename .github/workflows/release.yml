@@ -28,7 +28,7 @@ jobs:
           git merge-base --is-ancestor "$GITHUB_SHA" origin/main
           if gh release view "$tag" >/dev/null 2>&1; then echo 'Release already exists' >&2; exit 1; fi
       - name: Install Linux build dependencies
-        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libxcb1-dev libgl1-mesa-dev libegl1-mesa-dev desktop-file-utils appstream zsync
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libdbus-1-dev libxkbcommon-dev libwayland-dev libx11-dev libxcb1-dev libgl1-mesa-dev libegl1-mesa-dev desktop-file-utils appstream zsync
       - name: Pin Rust toolchain
         run: rustup toolchain install 1.100.0 --profile minimal --component rustfmt,clippy && rustup default 1.100.0
       - run: cargo fmt --check
