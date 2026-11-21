@@ -632,8 +632,8 @@ mod tests {
         );
         assert_eq!(primary_action(0, 1, 1, true), PrimaryAction::Offline);
         assert_eq!(primary_action(1, 1, 1, false), PrimaryAction::Play);
-        assert_eq!(primary_action(1, 2, 2, false), PrimaryAction::ChooseLaunch);
-        assert_eq!(primary_action(1, 1, 2, false), PrimaryAction::ChooseLaunch);
+        assert_eq!(primary_action(1, 2, 2, false), PrimaryAction::Play);
+        assert_eq!(primary_action(1, 1, 2, false), PrimaryAction::Play);
         assert_eq!(primary_action(2, 1, 2, false), PrimaryAction::ChooseLaunch);
     }
     #[test]

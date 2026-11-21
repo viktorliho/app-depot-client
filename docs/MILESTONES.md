@@ -28,6 +28,8 @@ M2.2.1 adds a durable, prioritized library-wide download queue with checkpoint-b
 
 M2.3 reorganizes the native desktop presentation around a Linux custom titlebar, compact navigation, shared light/dark styling, larger readable text and a persisted bounded interface scale. Browse, details, My Library, Downloads and Settings use the same visual components. Multiple launch choices and all Release associations remain explicit; completed transfer history is collapsed by default, with durable records unchanged. This is a presentation milestone: no Server contract, transfer integrity, writable-runtime policy or CLI command semantics change. Windows/macOS keep native window decorations until tested.
 
+M2.3.2 refines the existing desktop views: My Library uses stable compact cards and list rows with Play or Open Folder as the visible action, while right-click and More open the same per-Association management menu. Browse list reserves space for local status and adapts at narrow widths. App details can lead with Play for one uniquely applicable local candidate across several Release choices, with the exact choice shown beside it; several candidates still require selection. Downloads separates queue title, saved progress and trailing actions, and retains compact history. This changes presentation and command access only; the core lifecycle, Server declarations and CLI remain unchanged.
+
 The original M1 objective was a shared core transport, declaration reader, transfer engine, local library, diagnostic CLI and egui desktop browser on Linux. All M1 network operations use existing Server read APIs. M1 did not include installation, runtime preparation or launch; M2.1 adds only the separately declared native portable launch method.
 
 Acceptance criteria:
