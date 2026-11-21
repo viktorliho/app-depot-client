@@ -229,16 +229,18 @@ fn downloads_and_resumes_real_tree_artifact() {
         .iter()
         .find(|f| f.progress > 0 && !f.verified)
         .unwrap();
-    let response = ureq::get(&format!(
+    let mut request = ureq::get(&format!(
         "{}/api/v1/artifacts/{}/files/{}",
         url.trim_end_matches('/'),
         job.artifact_id,
         incomplete.file_id
     ))
     .set("Range", &format!("bytes={}-", incomplete.progress))
-    .set("If-Range", incomplete.etag.as_deref().unwrap())
-    .call()
-    .unwrap();
+    .set("If-Range", incomplete.etag.as_deref().unwrap());
+    if let Ok(token) = env::var("APP_DEPOT_TEST_TOKEN") {
+        request = request.set("Authorization", &format!("Bearer {token}"));
+    }
+    let response = request.call().unwrap();
     assert_eq!(response.status(), 206);
     assert_eq!(
         response.header("Content-Range"),

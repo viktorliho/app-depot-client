@@ -6,7 +6,7 @@ The Server stores authoritative declarations and immutable Artifact bytes. The c
 
 ### ADR-001: Rust core, egui adapter
 
-Use a native Rust core with an egui desktop UI on Linux first, then Windows/macOS. A CLI uses the same core for diagnostics and conformance. The current workspace implements the M1.1 read-only HTTP core and CLI, M1.2 profiles/catalog cache, M1.3 File transfer, M1.4 Tree transfer and the M1.5 desktop adapter. Future modules/crates are introduced when concrete later responsibilities exist:
+Use a native Rust core with an egui desktop UI on Linux. The four-platform roadmap is defined in ADR-016. A CLI uses the same core for diagnostics and conformance. The current workspace implements the M1.1 read-only HTTP core and CLI, M1.2 profiles/catalog cache, M1.3 File transfer, M1.4 Tree transfer and the M1.5 desktop adapter. Future modules/crates are introduced when concrete later responsibilities exist:
 
 | Boundary | Responsibility |
 | --- | --- |
@@ -84,6 +84,75 @@ Catalog grid/list share the same filtered App set. The details header offers dir
 ### ADR-015: Official AppImage distribution and updater (M2.4)
 
 The release build embeds a numeric workspace version, Git revision and official build marker. A pinned Ubuntu-based GitHub Actions workflow builds a Type 2 Linux x86_64 AppImage with fixed desktop/AppStream identity and icon sizes. The dedicated desktop updater queries only official stable GitHub Releases; it never uses a configured App Depot Server or its Bearer token. It requires the exact architecture-specific asset, GitHub's asset SHA-256 digest and a matching checksum asset, then stages verified bytes beside a supported user-owned AppImage. A separate helper performs a hash-rechecked atomic exchange after the desktop exits and retains the prior image for recovery. Development and package-managed binaries have no in-place update path. The local library, credentials and download queue are outside the AppImage and outside the updater's write scope. See [DISTRIBUTION.md](DISTRIBUTION.md) for the release and activation procedure.
+
+### ADR-016. SteamOS Decky and the four-platform strategy (M3.0)
+
+| Platform | Client strategy |
+| --- | --- |
+| Linux Desktop | Maintain the existing AppImage and egui catalog, library and application management. |
+| SteamOS | First new platform. Steam Library is the catalog and Play surface, with a small Decky control surface and a Rust wrapper. |
+| Windows Desktop | Second new platform. Reuse the Rust core and broadly the same desktop UI, with platform adapters. |
+| macOS Desktop | Third new platform. Reuse the Rust core and broadly the same desktop UI, with platform adapters. |
+
+All clients use the authoritative App Depot Server protocol and declarations. The core remains independent of Steam and Decky.
+
+#### Catalog, identity and ownership
+
+Each completed catalog sync supplies one Steam shortcut per accessible App for the configured Server profile, including missing, Windows, generic, data-only and unsupported Apps. Availability and execution support are distinct. Failed or partial sync cannot authorize destructive changes. Keep local content and cached declarations on lost access. Defer detailed stale-entry and removal UX.
+
+Scope the binding ledger by Steam account, immutable local Server profile ID and Server App ID. Keep actual Steam shortcut AppID, an ownership marker and the last values App Depot wrote. Store the selected Release, Association, entry-point and declaration revision independently of shortcut identity. Derive local installation status from the core. Bind artwork by role, source revision and last applied derivative. Changing a profile origin produces a different identity.
+
+NonSteamLaunchers seeds binary VDF AppIDs with CRC32 of the executable string followed by the display name, with bit 31 set. VDF stores the same bits in a signed integer. Artwork filenames use unsigned decimal. Recomputing after rename or target change can produce another AppID. Preserve the stored ID when editing fixtures and capture the actual ID returned by Steam when creating live. The fixture models distinct stable target paths so equal display names can coexist. It rejects true numeric collisions. Verify a practical live collision strategy before committing to the target layout.
+
+Only modify a shortcut when a saved binding matches a unique observable ownership marker. Never adopt by name, executable, numeric ID or tag alone. Missing or ambiguous proof stops that operation for diagnosis. Preserve foreign entries, unknown fields, user launch options and compatibility settings. Apply a Server rename only when the name still equals the last written value. Artwork uses the same conflict principle. Release changes invalidate an affected selection or require an explicit new choice. Unknown metadata remains inert. For live creation, persist pending intent and re-read before retrying to prevent duplicates after a crash.
+
+NonSteamLaunchers uses internal SteamClient.Apps methods including AddShortcut, SetShortcutName, SetShortcutExe, SpecifyCompatTool and SetCustomArtworkForApp. Prefer a feature-detected live adapter after hardware validation. These interfaces have no public stability contract established by the reviewed projects. Capture readback after changes and restart. Binary shortcuts.vdf editing is limited to disposable fixtures in M3.0. Any future file fallback requires positive Steam shutdown detection, a fresh read, backup, atomic replacement and a persistence test. A lock used by another tool cannot serialize Steam's own writes.
+
+#### Decky, storage and deployment
+
+The Server panel handles setup, authentication, profile, refresh and sync errors. Installed shows local status and leaves room for later removal. Settings shows integration health, library root and diagnostics. Decky Loader supplies the frontend/backend RPC, reads dist/index.js and runs an optional Python main.py. The Python layer can supervise a user-level Rust worker with typed operations. Rust owns credentials, catalog, transfers, runtime and launch. Steam-facing calls only consume bounded typed values. Never concatenate Server text into executable arguments or scripts.
+
+Use Decky's settings and runtime directories for plugin state and keep the App Depot library outside replaceable code. Package versioned plugin binaries and validate upgrading a stable user-owned wrapper path with live bindings intact. Run as the selected Steam user. Unload cancels sync tasks and detaches the integration bridge. Already running games retain their own wrapper lifetime. Reattach after a plugin or Steam restart and read back the active account's state.
+
+Default to the existing marked Linux library or ~/.appdepot for a new one. Use writable home paths. For microSD, validate mount identity, execution, hard links, atomic promotion and free space before enabling a content root. Keep SQLite metadata on internal storage initially and treat an unmounted card as unavailable. Multiple libraries are deferred. Reuse existing SQLite WAL and schema, library access, job and lifecycle locks. One durable download queue and shared transfer slot coordinate wrapper, Decky and Desktop. M3.1 must pick a scheduler ownership and reattachment model that preserves checkpoints and explicit pauses without independent transfer workers. Validate native secure storage under the Steam user in Gaming Mode. [SteamOS writable storage](https://help.steampowered.com/en/faqs/view/671a-4453-e8d2-323c)
+
+#### First Play and session
+
+The stable native wrapper resolves explicit App Depot identity and cached selection. Present a choice only when needed among Releases, Associations and entry points. Download missing content through the core, verify SHA-256 and Tree Identity v1 where applicable, prepare a writable runtime and launch the declared executable. A ready runtime starts from cached state without networking or rehashing local changes. When an uninstalled App cannot reach its Server, show Retry and Exit. A small controller-friendly egui window is a candidate for selection, progress and errors. Hide or close it when handing off focus to the game.
+
+The wrapper waits for the core-spawned process, using literal arguments, with no intermediate shell. Steam remains responsible for controller mappings. Linux process waiting is locally testable. On a real Deck validate overlay, focus, playtime, Stop Game and signals, descendant lifetime and return to Steam. Verify built-in controls and Steam Controller and check that controller configuration survives rename and restart. [Steam Deck FAQ](https://partner.steamgames.com/doc/steamhardware/steamdeck/faq) · [Steam Input devices](https://partner.steamgames.com/doc/features/steam_controller/device)
+
+#### Windows and Proton
+
+Show Windows Apps in every successful catalog sync. A stable native target has no established handoff to Steam's selected Proton for a Windows child. A mutable target could let Steam apply Proton on a later Play, with AppID, Input configuration, compatibility tool, prefix and the current session all needing verification. NonSteamLaunchers explicitly sets compatibility or prefix information for its own launchers. That does not establish an in-session native-to-Proton transition. Test both strategies without distributing or managing Proton. Keep unsupported Windows execution inert with a clear explanation. If a Server extension is needed, propose a separate optional declaration with Windows target, platform, literal argument list and relative working directory. Steam would continue choosing the tool. NativePortableV1 retains its existing meaning. [Valve Proton](https://github.com/ValveSoftware/Proton)
+
+#### Artwork
+
+Map Server roles steam.grid.vertical, steam.grid.horizontal, steam.hero, logo (fallback steam.logo) and icon to their Steam equivalents. In userdata/<account>/config/grid the reference PNG names are <appid>p.png, <appid>.png, <appid>_hero.png and <appid>_logo.png. The icon is referenced by path. SteamGridDB filters include portrait 600×900, wide 460×215 or 920×430 and hero 1920×620. These are test inputs, with Steam's acceptance and scaling subject to hardware validation. SteamGridDB lists PNG, JPEG, WebP and ICO depending on role, uses a PNG upload for live artwork, and prompts for Steam restart for its non-Steam icon path.
+
+Preserve Server bytes. Cache a deterministic grayscale derivative for the two uninstalled grids, preserving alpha. Switch to original colors after install. Key cached derivatives by role, source digest or binding revision, and transformation version. Update only App Depot-owned artwork when its binding changes and no local override is detected. Test cache invalidation per role and across restart. Shortcut creation and play remain usable if artwork is missing.
+
+#### Feasibility and development
+
+The headless command app-depot --profile ID first-play APP_ID RELEASE_ID ASSOCIATION_ID ENTRY_POINT_ID requires explicit cached selection. It shares the Rust transfer, preparation and launch paths. The loopback harness exercises authenticated catalog reads, exact artwork bytes, verified Tree download, runtime preparation, literal arguments, supervised process lifetime, catalog rename and offline replay after modifying the installed executable. Existing real-Server tests cover declaration round-tripping and File/Tree Range resume and CLI recovery after SIGKILL. Binary VDF fixtures cover idempotence, stable rename, equal names, preservation of foreign settings and refusal on ambiguous ownership or collision. Artwork fixtures exercise mapping and color/grayscale placement. No Steam process reads these fixtures.
+
+Use Client Rust 1.95.0 with rustfmt and clippy and the Server's pinned Rust 1.88.0. The Server web build uses Node 26.5.0 and npm 11.17.0. Debian dependencies include build-essential, pkg-config, libssl-dev and libdbus-1-dev. For fixture tests also install python3-vdf and python3-pil. From the Client checkout with Server as a sibling:
+
+~~~sh
+(cd ../app-depot-server && cargo build -p app-depot-server --locked)
+cargo build -p app-depot --locked
+/usr/bin/python3 -B -m unittest discover -s tools/steamos -v
+/usr/bin/python3 -B tools/steamos/verify_first_play.py --server "$PWD/../app-depot-server/target/debug/app-depot-server" --client "$PWD/target/debug/app-depot" --client-repo "$PWD"
+~~~
+
+The harness uses an OS-assigned loopback port, a fresh temporary namespace and synthetic credentials. It stops the process and removes its temporary data on exit. Omit --client-repo to run only the fixture and First Play flows. The native fixture is x86-64 Linux. The CLI currently reports transport/queue failures in the terminal. Controller UI, automatic selection and interactive retry are follow-up work. See [M3.1](MILESTONES.md#m31--steamos-integration) for hardware acceptance.
+
+| Upstream revision | Evidence |
+| --- | --- |
+| [NonSteamLaunchers](https://github.com/moraroy/NonSteamLaunchers-On-Steam-Deck/tree/0a0d4f0cd0a99ae1d9a1c958440846cce28ae4db) | Shortcut seed, VDF, artwork names, live SteamClient methods and compatibility launch options |
+| [NonSteamLaunchersDecky](https://github.com/moraroy/NonSteamLaunchersDecky/tree/5bca453e24fb0ef192c0786dd3854f8b4256de51) | Decky frontend/backend bridge and scanner lifecycle |
+| [Decky Loader](https://github.com/SteamDeckHomebrew/decky-loader/tree/ffd103b9c1a4ce5bf305e7c0998eda6e05457dad) | Bundle path, plugin process, runtime/settings directories and unload |
+| [SteamGridDB Decky](https://github.com/SteamGridDB/decky-steamgriddb/tree/26682f6a58b5dad774abe740ee3f9bad38296496) | Runtime artwork, format and size filters, icon persistence and restart prompt |
 
 ## UI read model
 

@@ -1,6 +1,7 @@
 use app_depot_core::{
     ServerProfileId,
     api::{ApiClient, ApiError},
+    launch::LaunchCandidate,
     library::{Library, LibraryError, LibraryPaths},
     models::{App, AssociationArtifact, Capabilities, DeclarationSnapshot, Release},
     secrets::{NativeSecrets, SecretError, SecretStore},
@@ -36,6 +37,7 @@ fn usage() -> &'static str {
      sync/offline: --profile ID sync | cached-apps | cached-releases APP_ID | cached-declarations RELEASE_ID\n\
      download: --profile ID download start RELEASE_ID ASSOCIATION_ID [--pause-after-bytes N] | enqueue RELEASE_ID ASSOCIATION_ID | jobs | files | trees | tree-files JOB_ID | move-top JOB_ID | pause JOB_ID | resume JOB_ID | retry JOB_ID | cancel JOB_ID\n\
      launch: --profile ID launch list RELEASE_ID | launch play RELEASE_ID ASSOCIATION_ID ENTRY_POINT_ID\n\
+     prototype: --profile ID first-play APP_ID RELEASE_ID ASSOCIATION_ID ENTRY_POINT_ID\n\
      runtime: --profile ID runtime list | runtime prepare ASSOCIATION_ID | runtime inspect INSTALLATION_ID | runtime verify INSTALLATION_ID | runtime preview INSTALLATION_ID | runtime preview-complete INSTALLATION_ID | runtime remove INSTALLATION_ID --confirm | runtime remove-complete INSTALLATION_ID --confirm | runtime remove-artifact ASSOCIATION_ID --confirm | runtime remove-app APP_ID --confirm | runtime remove-app-complete APP_ID --confirm | runtime repair INSTALLATION_ID --confirm | runtime repair-source ASSOCIATION_ID --confirm\n\
      library: library info | library usage | library gc --confirm | library migration-preview DESTINATION_ROOT | library migrate DESTINATION_ROOT --confirm (source selected by --library-data/--library-content)\n\
      optional APP_DEPOT_TOKEN overrides stored token for this process; --library-data/--library-content select local roots"
@@ -685,9 +687,107 @@ fn run_launch(options: &Options) -> Result<(), CliError> {
                     .into(),
             )
         })?;
+    play_selected(&mut library, &selected)
+}
+
+fn run_first_play(options: &Options) -> Result<(), CliError> {
+    let profile_id = options
+        .profile
+        .as_ref()
+        .ok_or_else(|| ApiError::Config("first-play requires --profile ID".into()))?;
+    let [_, app, release, association, entry] = options.positional.as_slice() else {
+        return Err(ApiError::Config(usage().into()).into());
+    };
+    let mut library = open_library(options)?;
+    let cached_release = library
+        .cached_releases(profile_id, app)?
+        .into_iter()
+        .find(|row| row.value.id == *release)
+        .ok_or_else(|| {
+            LibraryError::Invalid("selected Release is absent from cached App".into())
+        })?;
+    let selected = library
+        .launch_candidates(profile_id, release)?
+        .into_iter()
+        .find(|candidate| candidate.association_id == *association && candidate.entry_id == *entry)
+        .ok_or_else(|| {
+            LibraryError::Invalid("selected entry point is absent from cached Release".into())
+        })?;
+    if selected.status == "NotDownloaded" {
+        let profile = library.profile(profile_id)?;
+        if profile.archived || cached_release.stale {
+            return Err(LibraryError::Invalid(
+                "selected Release is offline-only; refresh the catalog before downloading".into(),
+            )
+            .into());
+        }
+        let client = ApiClient::new(
+            &profile.origin,
+            selected_token(&profile)?,
+            options.allow_insecure_http,
+        )?;
+        client.ensure_read_compatible()?;
+        let cached = library
+            .cached_snapshot(profile_id, release)?
+            .ok_or_else(|| LibraryError::Invalid("cached declaration unavailable".into()))?;
+        let live = client.declarations(release)?;
+        if client.release(release)?.app_id != *app
+            || live.app.revision_id != cached.value.app.revision_id
+            || live.release.revision_id != cached.value.release.revision_id
+            || !live.associations.iter().any(|scope| {
+                scope.association_id == *association
+                    && scope.declaration.revision_id == selected.declaration_revision
+            })
+        {
+            return Err(LibraryError::Invalid(
+                "selected declaration changed; refresh the catalog".into(),
+            )
+            .into());
+        }
+        library.reconcile_file_jobs()?;
+        library.reconcile_tree_jobs()?;
+        let is_tree = selected.artifact_id.starts_with("adtree:v1:sha256:");
+        let job = if is_tree {
+            library.queue_tree(&client, profile_id, release, association)?
+        } else {
+            library.queue_file(&client, profile_id, release, association)?
+        };
+        if job.artifact_id != selected.artifact_id {
+            return Err(LibraryError::Invalid(
+                "selected Artifact changed; refresh the catalog".into(),
+            )
+            .into());
+        }
+        if job.state == "Queued" {
+            library.move_job_to_top(&job.id)?;
+            eprintln!("downloading Artifact");
+            if is_tree {
+                library.run_tree_job(&client, &job.id, None)?;
+            } else {
+                library.run_file_job(&client, &job.id, None)?;
+            }
+        }
+        let refreshed = library
+            .launch_candidates(profile_id, release)?
+            .into_iter()
+            .find(|candidate| {
+                candidate.association_id == *association
+                    && candidate.entry_id == *entry
+                    && candidate.artifact_id == selected.artifact_id
+                    && candidate.declaration_revision == selected.declaration_revision
+            })
+            .ok_or_else(|| {
+                LibraryError::Invalid("cached selection changed during download".into())
+            })?;
+        return play_selected(&mut library, &refreshed);
+    }
+    play_selected(&mut library, &selected)
+}
+
+fn play_selected(library: &mut Library, selected: &LaunchCandidate) -> Result<(), CliError> {
     if selected.status == "PreparationRequired" {
         eprintln!("preparing writable installation from verified local content");
-        library.prepare_portable(profile, &args[3])?;
+        library.prepare_portable(&selected.profile_id, &selected.association_id)?;
     } else if selected.status != "Ready" {
         return Err(LibraryError::Invalid(format!(
             "launch unavailable: {} ({})",
@@ -696,10 +796,10 @@ fn run_launch(options: &Options) -> Result<(), CliError> {
         .into());
     }
     let mut child = library.play_declared(
-        profile,
-        &args[2],
-        &args[3],
-        &args[4],
+        &selected.profile_id,
+        &selected.release_id,
+        &selected.association_id,
+        &selected.entry_id,
         &selected.declaration_revision,
     )?;
     eprintln!("started process {}", child.id());
@@ -1000,6 +1100,9 @@ fn run() -> Result<(), CliError> {
     }
     if options.positional[0] == "launch" {
         return run_launch(&options);
+    }
+    if options.positional[0] == "first-play" {
+        return run_first_play(&options);
     }
     if options.positional[0] == "runtime" {
         return run_runtime(&options);
