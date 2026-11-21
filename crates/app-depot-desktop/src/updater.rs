@@ -173,7 +173,7 @@ fn request(url: &str) -> Result<ureq::Response, String> {
         .timeout_read(Duration::from_secs(30))
         .timeout_write(Duration::from_secs(10))
         .build();
-    let mut current = Url::parse(url).map_err(|_| "Invalid update URL")?;
+    let current = Url::parse(url).map_err(|_| "Invalid update URL")?;
     if current.scheme() != "https"
         || current.username() != ""
         || current.password().is_some()
@@ -182,6 +182,14 @@ fn request(url: &str) -> Result<ureq::Response, String> {
     {
         return Err("Update URL is outside the official GitHub HTTPS hosts".into());
     }
+    follow_redirects(&agent, current, allowed_redirect)
+}
+
+fn follow_redirects(
+    agent: &ureq::Agent,
+    mut current: Url,
+    allowed: impl Fn(&Url, &Url) -> bool,
+) -> Result<ureq::Response, String> {
     for _ in 0..=3 {
         let accept = if current.host_str() == Some("api.github.com") {
             "application/vnd.github+json"
@@ -197,19 +205,21 @@ fn request(url: &str) -> Result<ureq::Response, String> {
             .set("Accept", accept)
             .call();
         match response {
-            Ok(result) => return Ok(result),
-            Err(ureq::Error::Status(code, result)) if (300..400).contains(&code) => {
+            // ureq 2.x returns 3xx as Ok when automatic redirects are disabled.
+            Ok(result) if (300..400).contains(&result.status()) => {
                 let location = result
                     .header("Location")
                     .ok_or("Update redirect has no Location")?;
                 let next = current
                     .join(location)
                     .map_err(|_| "Invalid update redirect")?;
-                if !allowed_redirect(&current, &next) {
+                if !allowed(&current, &next) {
                     return Err("Update redirect left the trusted GitHub HTTPS hosts".into());
                 }
                 current = next;
             }
+            Ok(result) if result.status() == 200 => return Ok(result),
+            Ok(result) => return Err(format!("Update server returned HTTP {}", result.status())),
             Err(ureq::Error::Status(403 | 429, _)) => {
                 return Err("GitHub rate limit or access restriction; try later".into());
             }
@@ -225,9 +235,53 @@ fn request(url: &str) -> Result<ureq::Response, String> {
     Err("Too many update redirects".into())
 }
 
-fn read_bounded(url: &str, limit: u64) -> Result<Vec<u8>, String> {
+#[derive(Clone, Copy)]
+enum ResponseKind {
+    ReleaseJson,
+    Checksum,
+    AppImage,
+}
+
+fn validate_response_kind(response: &ureq::Response, kind: ResponseKind) -> Result<(), String> {
+    let content_type = response.header("Content-Type").unwrap_or("");
+    let media_type = content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    let valid_type = match kind {
+        ResponseKind::ReleaseJson => matches!(
+            media_type.as_str(),
+            "application/json" | "application/vnd.github+json"
+        ),
+        ResponseKind::Checksum => matches!(
+            media_type.as_str(),
+            "application/octet-stream" | "text/plain"
+        ),
+        ResponseKind::AppImage => media_type == "application/octet-stream",
+    };
+    if !valid_type {
+        return Err(format!(
+            "Unexpected update response Content-Type: {content_type}; expected {}",
+            match kind {
+                ResponseKind::ReleaseJson => "GitHub release JSON",
+                ResponseKind::Checksum => "a checksum asset",
+                ResponseKind::AppImage => "an AppImage asset",
+            }
+        ));
+    }
+    Ok(())
+}
+
+fn read_response_bounded(
+    response: ureq::Response,
+    limit: u64,
+    kind: ResponseKind,
+) -> Result<Vec<u8>, String> {
+    validate_response_kind(&response, kind)?;
     let mut bytes = Vec::new();
-    request(url)?
+    response
         .into_reader()
         .take(limit + 1)
         .read_to_end(&mut bytes)
@@ -238,13 +292,17 @@ fn read_bounded(url: &str, limit: u64) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
+fn read_bounded(url: &str, limit: u64, kind: ResponseKind) -> Result<Vec<u8>, String> {
+    read_response_bounded(request(url)?, limit, kind)
+}
+
 fn check() -> Result<Option<Release>, String> {
     let current = Version::parse(env!("CARGO_PKG_VERSION")).ok_or("Invalid running version")?;
-    let bytes = read_bounded(API, MAX_METADATA)?;
+    let bytes = read_bounded(API, MAX_METADATA, ResponseKind::ReleaseJson)?;
     let Some((release, checksum_url)) = parse_release(&bytes, current)? else {
         return Ok(None);
     };
-    let checksum = read_bounded(&checksum_url, 4096)?;
+    let checksum = read_bounded(&checksum_url, 4096, ResponseKind::Checksum)?;
     if checksum_digest(&checksum, &release.tag)? != release.sha256 {
         return Err("GitHub release digest and checksum asset disagree".into());
     }
@@ -596,6 +654,7 @@ fn stage(
             .open(&staged)
             .map_err(|e| format!("Cannot stage update beside AppImage: {e}"))?;
         let response = request(&release.image_url)?;
+        validate_response_kind(&response, ResponseKind::AppImage)?;
         if let Some(length) = response.header("Content-Length")
             && length.parse::<u64>().ok() != Some(release.image_size)
         {
@@ -636,6 +695,108 @@ fn stage(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::TcpListener;
+
+    #[test]
+    fn github_style_asset_redirect_delivers_checksum_bytes() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let checksum = b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  AppDepot-0.2.0-x86_64.AppImage\n";
+        let server = thread::spawn(move || {
+            for step in 0..3 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0_u8; 2048];
+                let n = stream.read(&mut request).unwrap();
+                let path = if step < 2 { "/asset" } else { "/cdn" };
+                assert!(
+                    String::from_utf8_lossy(&request[..n]).starts_with(&format!("GET {path} "))
+                );
+                if step > 0 {
+                    let headers = String::from_utf8_lossy(&request[..n]).to_ascii_lowercase();
+                    assert!(headers.contains("accept: application/octet-stream"));
+                    assert!(headers.contains(&format!(
+                        "user-agent: appdepotdesktop/{}",
+                        env!("CARGO_PKG_VERSION")
+                    )));
+                }
+                if step < 2 {
+                    write!(stream, "HTTP/1.1 302 Found\r\nContent-Type: text/html; charset=utf-8\r\nLocation: http://{address}/cdn\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                } else {
+                    write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", checksum.len()).unwrap();
+                    stream.write_all(checksum).unwrap();
+                }
+            }
+        });
+        let agent = ureq::AgentBuilder::new().redirects(0).build();
+        // This is the v0.1.0 failure: ureq returns 302 as Ok, with an empty
+        // redirect body that the old code passed to checksum_digest.
+        let old_response = agent
+            .get(&format!("http://{address}/asset"))
+            .call()
+            .unwrap();
+        assert_eq!(old_response.status(), 302);
+        let mut old_body = Vec::new();
+        old_response
+            .into_reader()
+            .read_to_end(&mut old_body)
+            .unwrap();
+        assert_eq!(
+            checksum_digest(&old_body, "v0.2.0").unwrap_err(),
+            "Missing checksum filename"
+        );
+        let response = follow_redirects(
+            &agent,
+            Url::parse(&format!("http://{address}/asset")).unwrap(),
+            |_, target| {
+                target.host_str() == Some("127.0.0.1") && target.port() == Some(address.port())
+            },
+        )
+        .unwrap();
+        assert_eq!(response.status(), 200);
+        let bytes = read_response_bounded(response, 4096, ResponseKind::Checksum).unwrap();
+        assert_eq!(checksum_digest(&bytes, "v0.2.0").unwrap(), "a".repeat(64));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn html_checksum_response_is_rejected_before_parsing() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 2048];
+            let received = stream.read(&mut request).unwrap();
+            assert!(received > 0);
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: 17\r\nConnection: close\r\n\r\n<html>oops</html>").unwrap();
+        });
+        let agent = ureq::AgentBuilder::new().redirects(0).build();
+        let response = follow_redirects(
+            &agent,
+            Url::parse(&format!("http://{address}/asset")).unwrap(),
+            |_, _| false,
+        )
+        .unwrap();
+        assert!(
+            read_response_bounded(response, 4096, ResponseKind::Checksum)
+                .unwrap_err()
+                .contains("Content-Type: text/html")
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires the public GitHub release service"]
+    fn current_official_release_metadata_and_checksum() {
+        let metadata = read_bounded(API, MAX_METADATA, ResponseKind::ReleaseJson).unwrap();
+        let (release, checksum_url) = parse_release(&metadata, Version(0, 1, 0))
+            .unwrap()
+            .expect("a stable release newer than v0.1.0");
+        let checksum = read_bounded(&checksum_url, 4096, ResponseKind::Checksum).unwrap();
+        assert_eq!(
+            checksum_digest(&checksum, &release.tag).unwrap(),
+            release.sha256
+        );
+    }
     #[test]
     fn versions_are_numeric_and_strict() {
         assert!(Version::parse("v0.10.0") > Version::parse("v0.9.9"));
