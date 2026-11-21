@@ -26,4 +26,6 @@ If the install directory is not writable or in-place replacement is unsupported,
 2. Confirm the version has no existing tag or release. Prepare accurate release notes. Create an annotated `vMAJOR.MINOR.PATCH` tag at the verified main commit and push only that tag.
 3. Wait for the `AppImage release` GitHub Actions run to complete. Verify the public non-prerelease Release, all assets, the published `.sha256`, GitHub's asset digest, embedded `--version` revision and a smoke run of the downloaded AppImage.
 
+If the tag-triggered workflow fails before a Release exists, fix the workflow on `main` and dispatch it with the existing immutable tag (`gh workflow run release.yml --ref main -f tag=vMAJOR.MINOR.PATCH`). The workflow checks out and verifies that original annotated tag. Never move the tag to a later commit. If a draft Release or assets already exist, inspect that state before retrying; the workflow refuses to overwrite an existing release.
+
 Publishing another version always requires task-specific owner authorization. No Server deployment or Production library mutation is part of this process.
