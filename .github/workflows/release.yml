@@ -8,6 +8,11 @@ on:
         description: Existing annotated release tag to build
         required: true
         type: string
+      resume_draft:
+        description: Verify and publish already uploaded draft assets without replacing them
+        required: false
+        type: boolean
+        default: false
 permissions:
   contents: read
 jobs:
@@ -37,7 +42,15 @@ jobs:
           test "$(git rev-parse "$remote_tag^{commit}")" = "$(git rev-parse HEAD)"
           git fetch origin main
           git merge-base --is-ancestor HEAD origin/main
-          if gh release view "$tag" >/dev/null 2>&1; then echo 'Release already exists' >&2; exit 1; fi
+          if gh release view "$tag" >/dev/null 2>&1; then
+            if test "${{ inputs.resume_draft || false }}" != true || test "$(gh release view "$tag" --json isDraft --jq .isDraft)" != true; then
+              echo 'Release already exists and is not an explicitly selected draft retry' >&2
+              exit 1
+            fi
+          elif test "${{ inputs.resume_draft || false }}" = true; then
+            echo 'Draft retry requested but no release exists' >&2
+            exit 1
+          fi
           printf 'RELEASE_TAG=%s\nAPP_DEPOT_SOURCE_REVISION=%s\n' "$tag" "$(git rev-parse HEAD)" >> "$GITHUB_ENV"
       - name: Install Linux build dependencies
         run: sudo apt-get update && sudo apt-get install -y pkg-config libdbus-1-dev libxkbcommon-dev libwayland-dev libx11-dev libxcb1-dev libgl1-mesa-dev libegl1-mesa-dev desktop-file-utils appstream zsync
@@ -69,15 +82,28 @@ jobs:
           image="dist/AppDepot-${tag#v}-x86_64.AppImage"
           notes="docs/release-notes/$tag.md"
           test -f "$notes"
-          gh release create "$tag" --verify-tag --draft --title "App Depot Client $tag" --notes-file "$notes"
-          gh release upload "$tag" "$image" "$image.sha256" "$image.zsync"
-          expected="$(cut -d ' ' -f1 "$image.sha256")"
-          observed=""
-          for attempt in 1 2 3 4 5; do
-            observed="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$tag" --jq '.assets[] | select(.name == "'"$(basename "$image")"'") | .digest')"
-            if test "$observed" = "sha256:$expected"; then break; fi
-            sleep 2
+          if test "${{ inputs.resume_draft || false }}" = true; then
+            release_dir="$(mktemp -d)"
+            gh release download "$tag" --dir "$release_dir"
+          else
+            gh release create "$tag" --verify-tag --draft --title "App Depot Client $tag" --notes-file "$notes"
+            gh release upload "$tag" "$image" "$image.sha256" "$image.zsync"
+            release_dir=dist
+          fi
+          image_name="$(basename "$image")"
+          test "$(gh release view "$tag" --json assets --jq '.assets | length')" = 3
+          for asset_name in "$image_name" "$image_name.sha256" "$image_name.zsync"; do
+            test "$(gh release view "$tag" --json assets --jq '.assets[] | select(.name == "'"$asset_name"'") | .name')" = "$asset_name"
           done
-          test "$observed" = "sha256:$expected"
+          (cd "$release_dir" && sha256sum -c "$image_name.sha256")
+          expected="$(cut -d ' ' -f1 "$release_dir/$image_name.sha256")"
+          for asset_name in "$image_name" "$image_name.sha256" "$image_name.zsync"; do
+            observed="$(gh release view "$tag" --json assets --jq '.assets[] | select(.name == "'"$asset_name"'") | .digest')"
+            test "$observed" = "sha256:$(sha256sum "$release_dir/$asset_name" | cut -d ' ' -f1)"
+          done
+          test "sha256:$expected" = "$(gh release view "$tag" --json assets --jq '.assets[] | select(.name == "'"$image_name"'") | .digest')"
+          chmod +x "$release_dir/$image_name"
+          "$release_dir/$image_name" --appimage-extract-and-run --version | grep -F "App Depot Desktop ${tag#v} (official, $APP_DEPOT_SOURCE_REVISION)"
+          "$release_dir/$image_name" --appimage-updateinformation | grep -F 'gh-releases-zsync|viktorliho|app-depot-client|latest|AppDepot-*-x86_64.AppImage.zsync'
           gh release edit "$tag" --draft=false --prerelease=false
           gh release view "$tag" --json isDraft,isPrerelease --jq '(.isDraft == false) and (.isPrerelease == false)' | grep -Fx true
