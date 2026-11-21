@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { callable, definePlugin } from '@decky/api';
-import { ButtonItem, PanelSection, PanelSectionRow, TextField } from '@decky/ui';
+import { ButtonItem, PanelSection, PanelSectionRow, TextField, ToggleField } from '@decky/ui';
 import { artwork, reconcile, steamId } from './steam.ts';
 import type { Bridge, CatalogApp } from './steam.ts';
 
@@ -15,8 +15,8 @@ const account = () => steamId(environment.App?.m_CurrentUser?.strSteamID ?? '');
 const steam = () => environment.SteamClient?.Apps ?? {};
 const bridgeReady = () => Boolean(steam().AddShortcut && steam().RegisterForAppDetails);
 const statusRpc = callable<[], Status>('status');
-const test = callable<[string, string], { connected: boolean }>('test');
-const configure = callable<[string, string], string>('configure');
+const test = callable<[string, string, boolean], { connected: boolean }>('test');
+const configure = callable<[string, string, boolean], string>('configure');
 const catalog = callable<[string, boolean], CatalogApp[]>('catalog');
 const rpc: Bridge = {
   shortcut: callable('shortcut'),
@@ -64,6 +64,8 @@ function AppDepot() {
   const [rows, setRows] = useState<CatalogApp[]>([]);
   const [origin, setOrigin] = useState('');
   const [token, setToken] = useState('');
+  const [allowHttp, setAllowHttp] = useState(false);
+  const isHttp = /^http:\/\//i.test(origin.trim());
   const [message, setMessage] = useState('');
   const [busy, setBusy] = useState(false);
 
@@ -96,20 +98,23 @@ function AppDepot() {
 
   return <>
     <PanelSection title="Server">
-      <PanelSectionRow><TextField label="Server URL" value={origin} onChange={event => setOrigin(event.target.value)} /></PanelSectionRow>
+      <PanelSectionRow><TextField label="Server URL" value={origin} onChange={event => { setOrigin(event.target.value); setAllowHttp(false); }} /></PanelSectionRow>
+      {isHttp && <PanelSectionRow><ToggleField label="Allow unencrypted HTTP"
+        description="HTTP sends access tokens without transport encryption. Only enable this if you accept that someone on the network could read the token."
+        checked={allowHttp} onChange={setAllowHttp} disabled={busy} /></PanelSectionRow>}
       <PanelSectionRow><TextField label="Access token (optional)" bIsPassword value={token} onChange={event => setToken(event.target.value)} /></PanelSectionRow>
       <PanelSectionRow><ButtonItem layout="below" disabled={busy || !origin} onClick={() => operation(async () => {
-        await test(origin.trim(), token);
+        await test(origin.trim(), token, isHttp && allowHttp);
         setMessage('Connection and catalog access verified.');
       })}>Test connection</ButtonItem></PanelSectionRow>
       <PanelSectionRow><ButtonItem layout="below" disabled={busy || !origin} onClick={() => operation(async () => {
-        const profile = await configure(origin.trim(), token);
+        const profile = await configure(origin.trim(), token, isHttp && allowHttp);
         setToken('');
         await refresh(profile);
         setMessage(lastOperations);
       })}>Save and synchronize</ButtonItem></PanelSectionRow>
       {status?.profiles.map(profile => <PanelSectionRow key={profile.id}>
-        <ButtonItem layout="below" disabled={busy} description={`${profile.status} · ${profile.lastSync ? new Date(profile.lastSync).toLocaleString() : 'Never synchronized'}`}
+        <ButtonItem layout="below" disabled={busy} description={`${profile.origin.startsWith("http://") ? "HTTP · unencrypted · " : ""}${profile.status} · ${profile.lastSync ? new Date(profile.lastSync).toLocaleString() : 'Never synchronized'}`}
           onClick={() => operation(async () => { await refresh(profile.id); setMessage(lastOperations); })}>
           Synchronize {profile.origin}
         </ButtonItem>

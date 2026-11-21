@@ -1180,6 +1180,64 @@ mod tests {
     }
 
     #[test]
+    fn https_connection_does_not_fall_back_to_plain_http() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("https://{}/", listener.local_addr().unwrap());
+        let client = ApiClient::new(&base, Some("tls-only-fixture".into()), true).unwrap();
+        let worker = thread::spawn(move || client.capabilities());
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut record_type = [0];
+        stream.read_exact(&mut record_type).unwrap();
+        assert_eq!(record_type, [22], "expected a TLS handshake record");
+        drop(stream);
+        assert!(matches!(
+            worker.join().unwrap(),
+            Err(ApiError::Transport(_))
+        ));
+        listener.set_nonblocking(true).unwrap();
+        assert!(
+            listener.accept().is_err(),
+            "unexpected retry to a plain HTTP endpoint"
+        );
+    }
+
+    #[test]
+    fn server_transport_preserves_explicit_schemes() {
+        for url in [
+            "https://depot.example/",
+            "http://127.0.0.1:8787/",
+            "http://[::1]:8787/",
+        ] {
+            assert_eq!(ApiClient::new(url, None, false).unwrap().origin(), url);
+        }
+        for url in [
+            "http://192.168.50.232:8787/",
+            "http://8.8.8.8:8787/",
+            "http://depot.example:8787/",
+        ] {
+            assert!(matches!(
+                ApiClient::new(url, None, false),
+                Err(ApiError::Config(_))
+            ));
+            assert_eq!(ApiClient::new(url, None, true).unwrap().origin(), url);
+        }
+        for url in [
+            "file:///tmp",
+            "http://user:pass@depot.example/",
+            "http://depot.example/api",
+            "http://depot.example/?token=x",
+            "http://depot.example/#x",
+        ] {
+            assert!(ApiClient::new(url, None, true).is_err(), "{url}");
+        }
+        let https = "https://depot.example/";
+        assert_eq!(ApiClient::new(https, None, true).unwrap().origin(), https);
+    }
+
+    #[test]
     fn rejects_unsafe_urls_and_encodes_path_segments() {
         for url in [
             "file:///tmp",

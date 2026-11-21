@@ -9,6 +9,7 @@ import tempfile
 import threading
 import unittest
 from urllib.error import HTTPError
+from urllib.request import Request
 from zipfile import ZipFile, ZipInfo
 
 import vdf
@@ -206,6 +207,20 @@ class InstallerTests(unittest.TestCase):
             finally:
                 server.shutdown()
                 thread.join()
+    def test_release_redirect_requires_exact_https_hosts_and_strips_headers(self):
+        initial = ("https://github.com/viktorliho/app-depot-client/releases/download/"
+                   "decky-v0.1.0-beta.1/AppDepot-Decky-v0.1.0-beta.1-x86_64.zip")
+        target = "https://release-assets.githubusercontent.com/github-production-release-asset/fixture"
+        redirect = installer.ReleaseRedirect(initial)
+        request = Request(initial, headers={"Authorization": "Bearer fixture"})
+        response = redirect.redirect_request(request, None, 302, "", {}, target)
+        self.assertEqual(response.full_url, target)
+        self.assertIsNone(response.get_header("Authorization"))
+        self.assertIsNone(redirect.redirect_request(response, None, 302, "", {}, target))
+        for changed in (target.replace("https:", "http:"), target.replace(".com/", ".com.evil/"),
+                        target.replace(".com/", ".com:8443/"), target.replace(".com/", ".com@evil/")):
+            self.assertIsNone(redirect.redirect_request(request, None, 302, "", {}, changed))
+
     def test_bootstrap_contains_pinned_metadata_and_source(self):
         source = "def desktop(*args):\n    print(args[1:])\n"
         desktop = package.desktop_entry(source, "http://127.0.0.1:8765/v1.zip", "a" * 64, "v1", True)

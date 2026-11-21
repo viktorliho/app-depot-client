@@ -3,6 +3,7 @@
 import argparse
 import hashlib
 import json
+import re
 from pathlib import Path
 import stat
 from zipfile import ZIP_DEFLATED, ZipFile, ZipInfo
@@ -21,9 +22,16 @@ def desktop_entry(source, url, digest, version, development):
             f'\n# Package: {url}\n# SHA-256: {digest}\n# Bootstrap source\n{commentary}\n')
 
 
-def build(binary, out, base_url, development):
+def build(binary, out, base_url, development, github_release_tag=None):
     source = Path(__file__).parent
     version = json.loads((source / "package.json").read_text())["version"]
+    if github_release_tag:
+        if development or not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+-beta\.[0-9]+", version) or github_release_tag != f"decky-v{version}":
+            raise ValueError("Public Decky beta tag must match package.json")
+        base_url = f"https://github.com/viktorliho/app-depot-client/releases/download/{github_release_tag}"
+        name = f"AppDepot-Decky-v{version}-x86_64.zip"
+    else:
+        name = f"AppDepot-Decky-{version}-linux-x86_64.zip"
     paths = {
         "plugin.json": source / "plugin.json",
         "package.json": source / "package.json",
@@ -33,7 +41,7 @@ def build(binary, out, base_url, development):
         "LICENSE": source.parent / "LICENSE",
     }
     out.mkdir(parents=True, exist_ok=True)
-    package = out / f"AppDepot-Decky-{version}-linux-x86_64.zip"
+    package = out / name
     with ZipFile(package, "w", compresslevel=9) as archive:
         for name, real in sorted(paths.items()):
             item = ZipInfo(f"AppDepot/{name}", (2000, 1, 1, 0, 0, 0))
@@ -58,5 +66,6 @@ if __name__ == "__main__":
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--base-url", default="http://127.0.0.1:8765")
     parser.add_argument("--development-loopback", action="store_true")
+    parser.add_argument("--github-release-tag")
     args = parser.parse_args()
-    build(args.binary, args.out, args.base_url, args.development_loopback)
+    build(args.binary, args.out, args.base_url, args.development_loopback, args.github_release_tag)

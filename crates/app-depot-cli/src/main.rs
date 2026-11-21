@@ -743,7 +743,7 @@ fn run_first_play(options: &Options, prepare_only: bool) -> Result<(), CliError>
         let client = ApiClient::new(
             &profile.origin,
             selected_token(&profile)?,
-            options.allow_insecure_http,
+            options.allow_insecure_http || (prepare_only && profile.origin.starts_with("http://")),
         )?;
         client.ensure_read_compatible()?;
         let cached = library

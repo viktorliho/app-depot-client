@@ -11,6 +11,7 @@ from pathlib import Path
 import secrets
 import select
 import struct
+import socket
 import subprocess
 import tempfile
 import time
@@ -124,7 +125,7 @@ def wait_ready(server, log):
                           if event.get("event") == "listening"), None)
         if listening:
             setup = next(event["token"] for event in events if event.get("event") == "initial_setup")
-            return "http://" + listening, setup
+            return "http://" + listening.replace("0.0.0.0:", "127.0.0.1:"), setup
         time.sleep(0.05)
     raise TimeoutError("Dev Server did not start")
 
@@ -148,8 +149,16 @@ def verify_decky(args, root, origin, token, app, server):
         await backend._main()
         try:
             assert (await backend.status())["profiles"] == []
-            assert (await backend.test(origin, token))["connected"]
-            profile = await backend.configure(origin, token)
+            if args.decky_lan_host:
+                try:
+                    await backend.test(origin, token)
+                except RuntimeError as error:
+                    assert "explicit --allow-insecure-http" in str(error)
+                else:
+                    raise AssertionError("LAN HTTP connected without consent")
+            allow_http = bool(args.decky_lan_host)
+            assert (await backend.test(origin, token, allow_http))["connected"]
+            profile = await backend.configure(origin, token, allow_http)
             assert (await backend.status())["profiles"][0]["authenticated"]
             rows = await backend.catalog(profile, True)
             assert any(row["id"] == app and not row["downloaded"] for row in rows)
@@ -215,6 +224,11 @@ def verify_decky(args, root, origin, token, app, server):
 
 
 def run(args, root):
+    if args.decky_lan_host and (
+        not args.decky_plugin or [name for _, name in socket.if_nameindex()] != ["lo"]
+    ):
+        raise ValueError("LAN test requires a Decky plugin and an isolated network namespace")
+    bind = "0.0.0.0:0" if args.decky_lan_host else "127.0.0.1:0"
     namespace = root / "server-data"
     namespace.mkdir()
     setup_args = ["--namespace", str(namespace), "--instance", "fixture"]
@@ -222,7 +236,7 @@ def run(args, root):
     log = root / "server.log"
     with log.open("w") as output:
         server = subprocess.Popen(
-            [args.server, "serve", *setup_args, "--mode", "dev", "--bind", "127.0.0.1:0"],
+            [args.server, "serve", *setup_args, "--mode", "dev", "--bind", bind],
             stdout=output, stderr=output,
         )
     try:
@@ -313,7 +327,10 @@ def run(args, root):
                  "--", "--ignored"], env=env, cwd=args.client_repo, check=True, timeout=180,
             )
         if args.decky_plugin:
-            verify_decky(args, root, origin, token, app, server)
+            decky_origin = origin
+            if args.decky_lan_host:
+                decky_origin = origin.replace("127.0.0.1", args.decky_lan_host)
+            verify_decky(args, root, decky_origin, token, app, server)
         else:
             server.terminate()
             server.wait(timeout=20)
@@ -345,6 +362,8 @@ if __name__ == "__main__":
     parser.add_argument("--client-repo", type=Path, help="also run existing real Server conformance tests")
     parser.add_argument("--decky-plugin", type=Path,
                         help="also exercise the real Decky RPC backend and native wrapper under X11")
+    parser.add_argument("--decky-lan-host", choices=["192.168.77.1"],
+                        help="test explicit LAN HTTP via an address on the isolated loopback interface")
     args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix="app-depot-m30-") as root:
         try:

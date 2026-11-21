@@ -1,0 +1,119 @@
+name: Decky beta release
+on:
+  push:
+    tags: ['decky-v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing annotated Decky beta tag to verify or resume
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: decky-release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.tag || github.ref }}
+      - name: Verify Decky beta source and record Desktop release
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^decky-v[0-9]+\.[0-9]+\.[0-9]+-beta\.[0-9]+$ ]]
+          test "$RELEASE_TAG" = "decky-v$(jq -r .version decky/package.json)"
+          tag_ref="refs/tags/$RELEASE_TAG"
+          remote_tag="$(git ls-remote origin "$tag_ref" | cut -f1)"
+          git fetch --no-tags origin "$tag_ref"
+          test -n "$remote_tag"
+          test "$(git cat-file -t "$remote_tag")" = tag
+          test "$(git rev-parse "$remote_tag^{commit}")" = "$(git rev-parse HEAD)"
+          git fetch origin main
+          git merge-base --is-ancestor HEAD origin/main
+          gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq '.id' > "$RUNNER_TEMP/desktop-release"
+          printf 'ZIP=AppDepot-Decky-%s-x86_64.zip\n' "${RELEASE_TAG#decky-}" >> "$GITHUB_ENV"
+      - name: Install pinned toolchains
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libdbus-1-dev libudev-dev desktop-file-utils python3-vdf python3-pil
+          rustup toolchain install 1.95.0 --profile minimal --component rustfmt,clippy
+          rustup default 1.95.0
+          cd "$RUNNER_TEMP"
+          curl --proto '=https' --fail --silent --show-error --remote-name https://nodejs.org/dist/v26.5.0/node-v26.5.0-linux-x64.tar.xz
+          printf '9f619528f1db5ddc41dccf54211066fb42228d69a156733c69cb9d6cc92e358c  node-v26.5.0-linux-x64.tar.xz\n' | sha256sum -c
+          tar -xf node-v26.5.0-linux-x64.tar.xz
+          echo "$RUNNER_TEMP/node-v26.5.0-linux-x64/bin" >> "$GITHUB_PATH"
+      - name: Test Rust, Decky and installer
+        run: |
+          set -euo pipefail
+          cargo fmt --check
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          cargo test --workspace --locked
+          cargo clippy -p app-depot --features decky --all-targets --locked -- -D warnings
+          cargo test -p app-depot --features decky --locked
+          npm --prefix decky ci
+          npm --prefix decky test
+          npm --prefix decky run build
+          /usr/bin/python3 -B -m unittest discover -s decky -v
+          /usr/bin/python3 -B -m unittest discover -s tools/steamos -v
+      - name: Build and verify Decky distribution
+        run: |
+          set -euo pipefail
+          cargo build --release -p app-depot --features decky --locked
+          readelf -h -d target/release/app-depot
+          readelf --version-info target/release/app-depot
+          for output in release-decky "$RUNNER_TEMP/rebuild"; do
+            /usr/bin/python3 -B decky/package.py --binary target/release/app-depot --out "$output" --github-release-tag "$RELEASE_TAG"
+            (cd "$output" && sha256sum -c SHA256SUMS)
+          done
+          for file in "$ZIP" SHA256SUMS AppDepot-Decky-Installer.desktop; do
+            cmp "release-decky/$file" "$RUNNER_TEMP/rebuild/$file"
+          done
+          desktop-file-validate release-decky/AppDepot-Decky-Installer.desktop
+          grep -Fx "# Package: https://github.com/$GITHUB_REPOSITORY/releases/download/$RELEASE_TAG/$ZIP" release-decky/AppDepot-Decky-Installer.desktop
+          grep -Fx "# SHA-256: $(cut -d ' ' -f1 release-decky/SHA256SUMS)" release-decky/AppDepot-Decky-Installer.desktop
+      - name: Create or verify draft and publish as prerelease
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" --json isDraft,isPrerelease > "$RUNNER_TEMP/decky-release"; then
+            jq -e '.isDraft and .isPrerelease' "$RUNNER_TEMP/decky-release" >/dev/null
+          else
+            gh release create "$RELEASE_TAG" --verify-tag --draft --prerelease --latest=false \
+              --title "App Depot Decky v${RELEASE_TAG#decky-v}" \
+              --notes-file "docs/release-notes/$RELEASE_TAG.md"
+          fi
+          mkdir -p "$RUNNER_TEMP/draft-assets"
+          for file in "$ZIP" SHA256SUMS AppDepot-Decky-Installer.desktop; do
+            if gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name' | grep -Fx "$file"; then
+              gh release download "$RELEASE_TAG" --pattern "$file" --dir "$RUNNER_TEMP/draft-assets"
+              cmp "release-decky/$file" "$RUNNER_TEMP/draft-assets/$file"
+            else
+              gh release upload "$RELEASE_TAG" "release-decky/$file"
+              gh release download "$RELEASE_TAG" --pattern "$file" --dir "$RUNNER_TEMP/draft-assets"
+              cmp "release-decky/$file" "$RUNNER_TEMP/draft-assets/$file"
+            fi
+          done
+          test "$(gh release view "$RELEASE_TAG" --json assets --jq '.assets | length')" = 3
+          gh release edit "$RELEASE_TAG" --draft=false --prerelease --latest=false
+      - name: Verify public delivery and unchanged Desktop release
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/public-assets"
+          for file in "$ZIP" SHA256SUMS AppDepot-Decky-Installer.desktop; do
+            curl --proto '=https' --proto-redir '=https' --fail --silent --show-error --location \
+              --retry 4 --retry-all-errors --output "$RUNNER_TEMP/public-assets/$file" \
+              "https://github.com/$GITHUB_REPOSITORY/releases/download/$RELEASE_TAG/$file"
+            cmp "release-decky/$file" "$RUNNER_TEMP/public-assets/$file"
+          done
+          gh release view "$RELEASE_TAG" --json isDraft,isPrerelease --jq '(.isDraft | not) and .isPrerelease' | grep -Fx true
+          test "$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq '.id')" = "$(cat "$RUNNER_TEMP/desktop-release")"

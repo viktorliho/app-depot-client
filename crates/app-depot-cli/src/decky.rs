@@ -22,7 +22,7 @@ fn profile_client(library: &Library, id: &ServerProfileId) -> Result<ApiClient, 
     Ok(ApiClient::new(
         &profile.origin,
         selected_token(&profile)?,
-        false,
+        profile.origin.starts_with("http://"),
     )?)
 }
 
@@ -164,7 +164,11 @@ pub(super) fn run_decky(options: &Options) -> Result<(), CliError> {
             if input.len() > 16_384 {
                 return Err(SecretError::Invalid.into());
             }
-            let client = ApiClient::new(origin, (!input.is_empty()).then_some(input), false)?;
+            let client = ApiClient::new(
+                origin,
+                (!input.is_empty()).then_some(input),
+                options.allow_insecure_http,
+            )?;
             let caps = client.ensure_read_compatible()?;
             client.list_apps(caps.page_size().map_err(ApiError::Incompatible)?)?;
             print_json(&json!({"connected":true,"origin":client.origin()}))?;

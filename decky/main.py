@@ -129,10 +129,15 @@ class Plugin:
                 child.kill()
         await asyncio.gather(*(child.wait() for child in children))
 
-    async def _rust(self, *args, token=""):
+    async def _rust(self, *args, token="", allow_http=False):
         if self.closing:
             raise RuntimeError("App Depot is reloading")
         # Decky dispatches by method name, including underscore methods.
+        if type(allow_http) is not bool:
+            raise ValueError("HTTP consent must be explicit")
+        if allow_http and not (args[:2] == ("decky", "test")
+                               or args[:3] == ("--json", "profile", "add")):
+            raise ValueError("HTTP consent only applies to Server setup")
         match args:
             case ("decky", "status"):
                 pass
@@ -158,8 +163,9 @@ class Plugin:
             env.setdefault("DBUS_SESSION_BUS_ADDRESS", f"unix:path={runtime / 'bus'}")
         if len(token.encode()) > 16384 or any(c in token for c in ("\r", "\n", "\0")):
             raise ValueError("Invalid token")
+        flags = ["--allow-insecure-http"] if allow_http else []
         child = await asyncio.create_subprocess_exec(
-            str(self.plugin / "bin/app-depot"), *args, stdin=asyncio.subprocess.PIPE,
+            str(self.plugin / "bin/app-depot"), *flags, *args, stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, env=env,
         )
         self.children.add(child)
@@ -185,22 +191,23 @@ class Plugin:
     async def status(self):
         return await self._rust("decky", "status")
 
-    async def test(self, origin, token):
+    async def test(self, origin, token, allow_http=False):
         self._origin(origin)
-        return await self._rust("decky", "test", origin, token=token)
+        return await self._rust("decky", "test", origin, token=token, allow_http=allow_http)
 
     @staticmethod
     def _origin(origin):
         if not isinstance(origin, str) or len(origin) > 2048 or origin.startswith("-"):
             raise ValueError("Enter a valid Server URL")
 
-    async def configure(self, origin, token):
-        origin = (await self.test(origin, token))["origin"]
+    async def configure(self, origin, token, allow_http=False):
+        origin = (await self.test(origin, token, allow_http))["origin"]
         async with self.lock:
             profiles = (await self.status())["profiles"]
             profile = next((p for p in profiles if p["origin"].rstrip("/") == origin.rstrip("/")), None)
             if profile is None:
-                profile = await self._rust("--json", "profile", "add", "App Depot Server", origin)
+                profile = await self._rust("--json", "profile", "add", "App Depot Server", origin,
+                                           allow_http=allow_http)
             ident = identity(profile["id"])
             if token:
                 await self._rust("profile", "token-set", ident, "--token-stdin", token=token)

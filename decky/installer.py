@@ -26,8 +26,29 @@ MAX_PACKAGE = 128 * 1024 * 1024
 EXPECTED = {"plugin.json", "package.json", "main.py", "dist/index.js", "bin/app-depot", "LICENSE"}
 
 
-class NoRedirect(HTTPRedirectHandler):
+class ReleaseRedirect(HTTPRedirectHandler):
+    def __init__(self, package_url):
+        self.package_url = package_url
+
     def redirect_request(self, req, fp, code, msg, headers, newurl):
+        source = urlparse(req.full_url)
+        target = urlparse(newurl)
+        if (
+            req.full_url == self.package_url
+            and source.scheme == "https"
+            and source.netloc == "github.com"
+            and re.fullmatch(
+                r"/viktorliho/app-depot-client/releases/download/decky-v[0-9]+\.[0-9]+\.[0-9]+-beta\.[0-9]+/"
+                r"AppDepot-Decky-v[0-9]+\.[0-9]+\.[0-9]+-beta\.[0-9]+-x86_64\.zip",
+                source.path,
+            )
+            and target.scheme == "https"
+            and target.netloc == "release-assets.githubusercontent.com"
+            and not target.fragment
+        ):
+            # Start a new GET with only the installer User-Agent, even if the
+            # original request carried other headers. The ZIP digest is pinned.
+            return Request(newurl, headers={"User-Agent": "AppDepot-Decky-Installer"})
         return None
 
 
@@ -38,7 +59,7 @@ def get_package(url, checksum, development):
             or not (location.scheme == "https" and location.hostname
                     or development and location.scheme == "http" and location.hostname == "127.0.0.1")):
         raise ValueError("Invalid pinned package location")
-    opener = build_opener(ProxyHandler({}), HTTPSHandler(), NoRedirect())
+    opener = build_opener(ProxyHandler({}), HTTPSHandler(), ReleaseRedirect(url))
     with opener.open(Request(url, headers={"User-Agent": "AppDepot-Decky-Installer"}), timeout=20) as response:
         expected_size = response.headers.get("Content-Length")
         payload = response.read(MAX_PACKAGE + 1)
