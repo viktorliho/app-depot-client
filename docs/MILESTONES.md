@@ -30,6 +30,8 @@ M2.3 reorganizes the native desktop presentation around a Linux custom titlebar,
 
 M2.3.2 refines the existing desktop views: My Library uses stable compact cards and list rows with Play or Open Folder as the visible action, while right-click and More open the same per-Association management menu. Browse list reserves space for local status and adapts at narrow widths. App details can lead with Play for one uniquely applicable local candidate across several Release choices, with the exact choice shown beside it; several candidates still require selection. Downloads separates queue title, saved progress and trailing actions, and retains compact history. This changes presentation and command access only; the core lifecycle, Server declarations and CLI remain unchanged.
 
+M2.4 introduces the official Linux x86_64 AppImage distribution, pinned packaging inputs, CI and intentional tag-driven GitHub release workflow. The desktop embeds version, source revision and build kind, shows the selected App Depot icon in its titlebar and native window, and checks newer stable official releases independently of Server profiles. A supported user-owned AppImage can download a verified update and use a separate helper for atomic activation and rollback after a failed start. Development and unsupported installations cannot self-replace. See [distribution and update details](DISTRIBUTION.md).
+
 The original M1 objective was a shared core transport, declaration reader, transfer engine, local library, diagnostic CLI and egui desktop browser on Linux. All M1 network operations use existing Server read APIs. M1 did not include installation, runtime preparation or launch; M2.1 adds only the separately declared native portable launch method.
 
 Acceptance criteria:

@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.viktorliho.AppDepot</id>
+  <name>App Depot</name>
+  <summary>Browse, download and launch self-hosted software</summary>
+  <categories><category>Network</category></categories>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <description><p>App Depot is a native desktop client for self-hosted App Depot servers. Browse a catalog, verify downloads and launch declared native portable applications.</p></description>
+  <launchable type="desktop-id">io.github.viktorliho.AppDepot.desktop</launchable>
+  <icon type="stock">io.github.viktorliho.AppDepot</icon>
+  <url type="homepage">https://github.com/viktorliho/app-depot-client</url>
+  <provides><binary>app-depot-desktop</binary></provides>
+</component>

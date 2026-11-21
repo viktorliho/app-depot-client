@@ -1,0 +1,72 @@
+name: AppImage release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: read
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+      - name: Verify immutable release source
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          version="${tag#v}"
+          test "$(sed -n 's/^version = "\([0-9][0-9.]*\)"$/\1/p' Cargo.toml | head -1)" = "$version"
+          test "$(git cat-file -t "$tag")" = tag
+          test "$(git rev-parse "$tag^{commit}")" = "$GITHUB_SHA"
+          git fetch origin main
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+          if gh release view "$tag" >/dev/null 2>&1; then echo 'Release already exists' >&2; exit 1; fi
+      - name: Install Linux build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libxcb1-dev libgl1-mesa-dev libegl1-mesa-dev desktop-file-utils appstream zsync
+      - name: Pin Rust toolchain
+        run: rustup toolchain install 1.100.0 --profile minimal --component rustfmt,clippy && rustup default 1.100.0
+      - run: cargo fmt --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked
+      - name: Build official AppImage
+        env:
+          APP_DEPOT_OFFICIAL_RELEASE: '1'
+          APP_DEPOT_SOURCE_REVISION: ${{ github.sha }}
+        run: |
+          cargo build --release -p app-depot-desktop -p app-depot-update-helper --locked
+          bash scripts/build-appimage.sh
+          image="dist/AppDepot-${GITHUB_REF_NAME#v}-x86_64.AppImage"
+          (cd dist && sha256sum -c "$(basename "$image").sha256")
+          "$image" --appimage-extract-and-run --version | grep -F "App Depot Desktop ${GITHUB_REF_NAME#v} (official, $GITHUB_SHA)"
+          "$image" --appimage-updateinformation | grep -F 'gh-releases-zsync|viktorliho|app-depot-client|latest|AppDepot-*-x86_64.AppImage.zsync'
+          test -s "$image.zsync"
+          desktop-file-validate assets/io.github.viktorliho.AppDepot.desktop
+          appstreamcli validate assets/io.github.viktorliho.AppDepot.appdata.xml
+          for size in 256 128 64 48 32; do test -s "target/AppDepot.AppDir/usr/share/icons/hicolor/${size}x${size}/apps/io.github.viktorliho.AppDepot.png"; done
+      - name: Create draft, upload, verify and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="$GITHUB_REF_NAME"
+          image="dist/AppDepot-${tag#v}-x86_64.AppImage"
+          notes="docs/release-notes/$tag.md"
+          test -f "$notes"
+          gh release create "$tag" --verify-tag --draft --title "App Depot Client $tag" --notes-file "$notes"
+          gh release upload "$tag" "$image" "$image.sha256" "$image.zsync"
+          expected="$(cut -d ' ' -f1 "$image.sha256")"
+          observed=""
+          for attempt in 1 2 3 4 5; do
+            observed="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$tag" --jq '.assets[] | select(.name == "'"$(basename "$image")"'") | .digest')"
+            if test "$observed" = "sha256:$expected"; then break; fi
+            sleep 2
+          done
+          test "$observed" = "sha256:$expected"
+          gh release edit "$tag" --draft=false --prerelease=false
+          gh release view "$tag" --json isDraft,isPrerelease --jq '(.isDraft == false) and (.isPrerelease == false)' | grep -Fx true

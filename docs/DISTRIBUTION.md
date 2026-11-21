@@ -1,0 +1,29 @@
+# Linux AppImage distribution and updates
+
+The supported binary distribution is a Type 2 `x86_64` AppImage built on Ubuntu 24.04 with Rust 1.100.0. This is a compatibility baseline, not a promise that every Linux distribution or compositor works. Linux supplies glibc, graphics drivers, Wayland/X11 integration and a usable desktop session. AppImage's Type 2 runtime may need FUSE 2; `--appimage-extract-and-run` is a manual fallback. Secret Service remains the preferred credential backend. Persistent profiles, downloads, installations and preferences remain in `~/.appdepot` or an explicitly configured library, never in the AppImage.
+
+## Install
+
+Download `AppDepot-VERSION-x86_64.AppImage` and its `.sha256` file from the [official client releases](https://github.com/viktorliho/app-depot-client/releases). Verify with `sha256sum -c AppDepot-VERSION-x86_64.AppImage.sha256`, make the AppImage executable and run it. Gear Lever can integrate this same file into the user application menu. The desktop ID is always `io.github.viktorliho.AppDepot.desktop`; the icon name and AppStream ID use the same stem. The packaged desktop entry supplies `X-AppImage-Version`, which Gear Lever displays. Keep one integrated copy. The updater replaces the current user-owned AppImage path, so the desktop entry can continue pointing to it.
+
+## Versions and publication
+
+Workspace version `MAJOR.MINOR.PATCH` and annotated Git tag `vMAJOR.MINOR.PATCH` must match. Release builds embed the source commit and `official` build kind; Cargo builds say `development` and cannot update in place. A tag is an intentional, separately authorized publication; ordinary pushes to main do not publish releases. GitHub Actions checks the annotated tag against main, runs format, Clippy and workspace tests, builds the desktop and helper, validates the AppImage and publishes a draft release with a versioned AppImage, checksum and `.zsync`. It verifies GitHub's asset digest against the checksum before making the release public. Existing releases and tags are never overwritten. CI on main and pull requests runs the same Rust checks and a development AppImage package check.
+
+`scripts/build-appimage.sh` pins appimagetool 1.9.1 and its Type 2 runtime by SHA-256 and refuses mismatched downloads. The AppDir has `AppRun`, the desktop executable, update helper, `.desktop`, AppStream metadata and PNG icon sizes. It embeds `gh-releases-zsync|viktorliho|app-depot-client|latest|AppDepot-*-x86_64.AppImage.zsync` and publishes the corresponding `.zsync` asset for external AppImage-aware tools. The built-in updater uses full downloads; delta updates are not required for correctness.
+
+## Built-in updater
+
+Only an official AppImage running from a user-owned regular file in a user-owned directory can update in place. Development, extracted AppDir and package-managed builds may check official releases but offer only the release link. The checker runs at startup and at most every six hours while the app is open, independently of App Depot Server profiles. It accepts only a newer stable numeric version, the exact `x86_64` asset name and URL, GitHub's SHA-256 asset digest and a matching published checksum file. Requests use HTTPS and bounded GitHub redirect hosts, sizes and timeouts. The trust root is the official GitHub repository and TLS; this protects against transport corruption and untrusted mirrors, but compromise of that GitHub release authority is outside this initial model. No private signing key is embedded or claimed.
+
+Update downloads stage beside the installed AppImage, verify length, SHA-256 and Type 2 format, then wait for explicit **Update and restart**. The button is unavailable while a transfer, local operation or managed game is active. A separate helper waits for the launcher to exit, verifies the old and new hashes again and writes and synchronizes a checked previous-version backup **before** atomic exchange on Linux. It launches the replacement directly and waits for its first UI frame to acknowledge startup. If spawn or acknowledgement fails, it exchanges the files back and starts the prior version. A helper interruption still leaves the previous version at the explicit backup path; if recovery is needed, close App Depot, inspect the installed and backup AppImages with `--version`, then restore the backup with an ordinary file-manager operation. The helper never overwrites an existing backup. A rollback of application code does not reverse any future SQLite schema migration; release authors must assess migration compatibility before publication.
+
+If the install directory is not writable or in-place replacement is unsupported, download the official release manually. Do not replace a package-manager-owned executable. The updater does not access the managed library or credentials. Active queue and local operations are not silently cancelled; a user can restart after work finishes. A native program launched independently may continue after App Depot exits, but the updater defers while one is tracked as running.
+
+## Repeatable release procedure
+
+1. Finish an authorized release candidate on `main`, review the full diff and run `cargo fmt --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo test --workspace --locked`, the release desktop build, package validation and graphical smoke checks.
+2. Confirm the version has no existing tag or release. Prepare accurate release notes. Create an annotated `vMAJOR.MINOR.PATCH` tag at the verified main commit and push only that tag.
+3. Wait for the `AppImage release` GitHub Actions run to complete. Verify the public non-prerelease Release, all assets, the published `.sha256`, GitHub's asset digest, embedded `--version` revision and a smoke run of the downloaded AppImage.
+
+Publishing another version always requires task-specific owner authorization. No Server deployment or Production library mutation is part of this process.

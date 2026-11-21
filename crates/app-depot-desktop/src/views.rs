@@ -13,6 +13,127 @@ type LibraryItem = (
 );
 
 impl Desktop {
+    #[cfg(target_os = "linux")]
+    fn updates_settings(&mut self, ui: &mut egui::Ui) {
+        section(ui, "App Depot updates", |ui| {
+            ui.label(
+                RichText::new(format!("Version {}", env!("CARGO_PKG_VERSION")))
+                    .size(18.0)
+                    .strong(),
+            );
+            ui.label(format!(
+                "{} build · revision {}",
+                env!("APP_DEPOT_BUILD_KIND"),
+                env!("APP_DEPOT_SOURCE_REVISION")
+            ));
+            ui.add_space(8.0);
+            match &self.updater.mode {
+                updater::InstallMode::OfficialAppImage { .. } => {
+                    ui.label("Official AppImage · stable GitHub releases");
+                }
+                updater::InstallMode::Development => {
+                    ui.label("Development build. Automatic installation is disabled.");
+                }
+                updater::InstallMode::Unsupported(reason) => {
+                    ui.label(reason);
+                }
+            }
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(!self.updater.busy, egui::Button::new("Check for updates"))
+                    .clicked()
+                {
+                    self.updater.check(ui.ctx());
+                }
+                if ui.button("Open official releases").clicked() {
+                    ui.ctx().open_url(egui::OpenUrl::new_tab(
+                        "https://github.com/viktorliho/app-depot-client/releases",
+                    ));
+                }
+            });
+            ui.label(&self.updater.status);
+            if let Some(error) = &self.updater.last_error
+                && error != &self.updater.status
+            {
+                ui.colored_label(
+                    design::palette(ui).error,
+                    format!("Last update error: {error}"),
+                );
+            }
+            if self.updater.last_error.is_some()
+                && ui.small_button("Dismiss previous error").clicked()
+            {
+                self.updater.last_error = None;
+            }
+            if let Some((done, total)) = self.updater.progress
+                && total > 0
+            {
+                ui.add(
+                    egui::ProgressBar::new(done as f32 / total as f32).text(format!(
+                        "{} of {}",
+                        format_bytes(done),
+                        format_bytes(total)
+                    )),
+                );
+            }
+            if let Some(release) = &self.updater.release {
+                let tag = release.tag.clone();
+                let notes = release.notes.clone();
+                ui.add_space(14.0);
+                ui.label(RichText::new(format!("Available: {tag}")).strong());
+                if !notes.is_empty() {
+                    egui::CollapsingHeader::new("Release notes").show(ui, |ui| {
+                        ui.label(notes);
+                    });
+                }
+                if self.updater.staged.is_none()
+                    && matches!(
+                        self.updater.mode,
+                        updater::InstallMode::OfficialAppImage { .. }
+                    )
+                    && ui
+                        .add_enabled(!self.updater.busy, egui::Button::new("Download update"))
+                        .clicked()
+                {
+                    self.updater.download(ui.ctx());
+                }
+                if !self.updater.dismissed && ui.button("Later").clicked() {
+                    self.updater.dismissed = true;
+                }
+            }
+            if self.updater.staged.is_some() {
+                let active_transfer = self.snapshot.jobs.iter().any(|job| {
+                    matches!(
+                        job.state.as_str(),
+                        "Queued" | "FetchingInventory" | "Downloading" | "Verifying" | "Committing"
+                    )
+                });
+                let active_launch = self.launch_states.values().any(|(state, _)| {
+                    matches!(state.as_str(), "Starting" | "Preparing" | "Running")
+                });
+                let unsafe_operation =
+                    active_transfer || active_launch || !self.local_operations.is_empty();
+                if unsafe_operation {
+                    ui.label("Finish or pause queued downloads, and finish local operations and running programs before restarting App Depot.");
+                }
+                if ui
+                    .add_enabled(!unsafe_operation, egui::Button::new("Update and restart"))
+                    .clicked()
+                {
+                    match self.updater.handoff() {
+                        Ok(()) => {
+                            self.exit_allowed = true;
+                            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                        Err(error) => self.updater.status = error,
+                    }
+                }
+            }
+            ui.add_space(10.0);
+            ui.label(RichText::new("Updates use the official GitHub release, verify its SHA-256 and keep the previous AppImage for recovery. Your library and credentials remain outside the AppImage.").color(design::palette(ui).muted));
+        });
+    }
     fn titlebar(&mut self, ui: &mut egui::Ui) {
         let p = design::palette(ui);
         let maximized = ui.ctx().input(|i| i.viewport().maximized.unwrap_or(false));
@@ -28,17 +149,14 @@ impl Desktop {
                         egui::vec2(drag_width, 38.0),
                         egui::Sense::click_and_drag(),
                     );
-                    ui.painter().circle_filled(
-                        egui::pos2(rect.left() + 15.0, rect.center().y),
-                        13.0,
-                        p.accent,
-                    );
-                    ui.painter().text(
-                        egui::pos2(rect.left() + 15.0, rect.center().y),
-                        egui::Align2::CENTER_CENTER,
-                        "A",
-                        egui::FontId::proportional(16.0),
-                        p.accent_text,
+                    ui.painter().image(
+                        self.app_icon.id(),
+                        egui::Rect::from_center_size(
+                            egui::pos2(rect.left() + 15.0, rect.center().y),
+                            egui::vec2(28.0, 28.0),
+                        ),
+                        egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                        egui::Color32::WHITE,
                     );
                     ui.painter().text(
                         egui::pos2(rect.left() + 40.0, rect.center().y),
@@ -265,6 +383,26 @@ impl Desktop {
                         }
                     }
                     ui.add_space(5.0);
+                }
+                #[cfg(target_os = "linux")]
+                {
+                    let update_label = if self.updater.last_error.is_some() {
+                        Some("Update needs attention".to_owned())
+                    } else if !self.updater.dismissed {
+                        self.updater
+                            .release
+                            .as_ref()
+                            .map(|release| format!("Update available · {}", release.tag))
+                    } else {
+                        None
+                    };
+                    if let Some(label) = update_label {
+                        ui.add_space(6.0);
+                        if ui.small_button(label).clicked() {
+                            self.screen = Screen::Settings;
+                            self.settings_tab = SettingsTab::Updates;
+                        }
+                    }
                 }
                 ui.add_space((ui.available_height() - 230.0).max(18.0));
                 ui.separator();
@@ -1973,6 +2111,7 @@ impl Desktop {
                 (SettingsTab::Servers, "Servers & accounts"),
                 (SettingsTab::Storage, "Storage"),
                 (SettingsTab::Appearance, "Appearance"),
+                (SettingsTab::Updates, "Updates & about"),
                 (SettingsTab::Diagnostics, "Diagnostics"),
             ] {
                 if ui
@@ -2090,9 +2229,15 @@ impl Desktop {
                     self.prefs.theme=Theme::System; self.prefs.ui_scale=1.15; self.apply_theme(ui.ctx()); self.remember();
                 }
             }); }
+            if self.settings_tab==SettingsTab::Updates {
+                #[cfg(target_os = "linux")]
+                self.updates_settings(ui);
+                #[cfg(not(target_os = "linux"))]
+                ui.label("Automatic updates are currently supported only for official Linux AppImages.");
+            }
             if self.settings_tab==SettingsTab::Diagnostics {
             section(ui,"Diagnostics & about",|ui| {
-                ui.label(format!("App Depot Desktop {}",env!("CARGO_PKG_VERSION")));
+                ui.label(format!("App Depot Desktop {} · {} · {}",env!("CARGO_PKG_VERSION"),env!("APP_DEPOT_BUILD_KIND"),env!("APP_DEPOT_SOURCE_REVISION")));
                 ui.label("Verified downloads and native portable launch on Linux. Installation remains unavailable.");
                 if let Some(p)=self.profile() {
                     egui::CollapsingHeader::new("Server technical details").show(ui,|ui| {
@@ -2719,6 +2864,11 @@ fn open_account(ctx: &egui::Context, url: &str) {
 impl eframe::App for Desktop {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll(ctx);
+        #[cfg(target_os = "linux")]
+        {
+            self.updater.poll();
+            self.updater.periodic(ctx);
+        }
         if let Some(id) = self.selected_job.clone()
             && self.last_tree_details_refresh.elapsed() >= Duration::from_secs(1)
             && self
@@ -2791,6 +2941,20 @@ impl eframe::App for Desktop {
         }
         self.setup_dialog(ui.ctx());
         self.confirmation(ui.ctx());
+        #[cfg(target_os = "linux")]
+        if self.update_ack.is_some() && !self.update_ack_armed {
+            self.update_ack_armed = true;
+            ui.ctx().request_repaint();
+        } else if let Some(marker) = self.update_ack.take() {
+            let result = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&marker)
+                .and_then(|file| file.sync_all());
+            if let Err(error) = result {
+                eprintln!("Update startup acknowledgement failed: {error}");
+            }
+        }
     }
 }
 impl Desktop {

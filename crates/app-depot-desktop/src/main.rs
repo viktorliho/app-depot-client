@@ -2,6 +2,8 @@
 mod design;
 mod preferences;
 mod telemetry;
+#[cfg(target_os = "linux")]
+mod updater;
 mod views;
 mod worker;
 
@@ -55,6 +57,7 @@ enum SettingsTab {
     Servers,
     Storage,
     Appearance,
+    Updates,
     Diagnostics,
 }
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -69,6 +72,13 @@ struct ArtTexture {
 }
 
 struct Desktop {
+    #[cfg(target_os = "linux")]
+    update_ack: Option<PathBuf>,
+    #[cfg(target_os = "linux")]
+    update_ack_armed: bool,
+    app_icon: TextureHandle,
+    #[cfg(target_os = "linux")]
+    updater: updater::Updater,
     worker: Worker,
     snapshot: Snapshot,
     storage_usage: Option<StorageUsage>,
@@ -125,7 +135,23 @@ impl Desktop {
             ),
         };
         let root = paths.metadata.clone();
+        let icon = eframe::icon_data::from_png_bytes(include_bytes!(
+            "../../../assets/io.github.viktorliho.AppDepot-64.png"
+        ))
+        .expect("bundled application icon is valid PNG");
+        let app_icon = ctx.load_texture(
+            "app-depot-icon",
+            egui::ColorImage::from(icon),
+            egui::TextureOptions::LINEAR,
+        );
         let this = Self {
+            #[cfg(target_os = "linux")]
+            update_ack: None,
+            #[cfg(target_os = "linux")]
+            update_ack_armed: false,
+            app_icon,
+            #[cfg(target_os = "linux")]
+            updater: updater::Updater::new(ctx),
             worker: Worker::start(paths, ctx.clone()),
             snapshot: Snapshot::default(),
             storage_usage: None,
@@ -482,6 +508,27 @@ fn library_paths() -> Result<LibraryPaths, String> {
     Ok(p)
 }
 fn main() -> eframe::Result {
+    if env::args_os()
+        .nth(1)
+        .is_some_and(|argument| argument == "--version")
+    {
+        println!(
+            "App Depot Desktop {} ({}, {})",
+            env!("CARGO_PKG_VERSION"),
+            env!("APP_DEPOT_BUILD_KIND"),
+            env!("APP_DEPOT_SOURCE_REVISION")
+        );
+        return Ok(());
+    }
+    #[cfg(target_os = "linux")]
+    let update_ack = {
+        let args: Vec<_> = env::args_os().collect();
+        if args.len() == 3 && args[1] == "--appdepot-update-ack" {
+            Some(PathBuf::from(&args[2]))
+        } else {
+            None
+        }
+    };
     let paths = match library_paths() {
         Ok(v) => v,
         Err(e) => {
@@ -492,6 +539,13 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("App Depot")
+            .with_app_id("io.github.viktorliho.AppDepot")
+            .with_icon(
+                eframe::icon_data::from_png_bytes(include_bytes!(
+                    "../../../assets/io.github.viktorliho.AppDepot-64.png"
+                ))
+                .expect("bundled application icon is valid PNG"),
+            )
             .with_inner_size([1280.0, 820.0])
             .with_min_inner_size([760.0, 540.0])
             .with_decorations(!cfg!(target_os = "linux")),
@@ -500,7 +554,20 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "App Depot",
         options,
-        Box::new(move |cc| Ok(Box::new(Desktop::new(&cc.egui_ctx, paths)))),
+        Box::new(move |cc| {
+            let mut desktop = Desktop::new(&cc.egui_ctx, paths);
+            #[cfg(target_os = "linux")]
+            if let Some(marker) = &update_ack
+                && let (Some(image), Some(parent)) = (env::var_os("APPIMAGE"), marker.parent())
+                && PathBuf::from(image).parent() == Some(parent)
+                && marker
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with(".appdepot-update-ack-"))
+            {
+                desktop.update_ack = Some(marker.clone());
+            }
+            Ok(Box::new(desktop))
+        }),
     )
 }
 #[cfg(test)]

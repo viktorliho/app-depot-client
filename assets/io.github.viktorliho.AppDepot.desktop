@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=App Depot
+Comment=Browse, download and launch software from your App Depot servers
+Exec=app-depot-desktop
+Icon=io.github.viktorliho.AppDepot
+Categories=Network;FileTransfer;
+Terminal=false
+StartupNotify=true
+StartupWMClass=io.github.viktorliho.AppDepot
+X-AppImage-Name=App Depot

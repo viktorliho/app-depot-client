@@ -4,6 +4,8 @@ Native reference client for the open [App Depot Server](https://github.com/vikto
 
 The native egui desktop launcher shares the CLI's HTTP core, profiles, offline cache, verified File/Tree downloads and Linux NativePortableV1 launch operation. Native portable programs use a separate writable local working copy; download-only Artifacts remain valid. See [milestones](docs/MILESTONES.md) and the [server API audit](docs/SERVER_API_AUDIT.md).
 
+The official Linux x86_64 distribution is a [Type 2 AppImage](docs/DISTRIBUTION.md) with a stable desktop ID, the App Depot icon and built-in stable-release update checks. Download the versioned AppImage and checksum from the [GitHub Releases page](https://github.com/viktorliho/app-depot-client/releases); Gear Lever can integrate the user-owned AppImage into the application menu. Updates are independent of any configured App Depot Server. Development Cargo builds do not self-replace.
+
 ## Build and use
 
 ```sh
