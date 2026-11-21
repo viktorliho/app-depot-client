@@ -64,7 +64,6 @@ struct ArtKey {
     usage: ArtUse,
 }
 struct ArtTexture {
-    binding: String,
     texture: TextureHandle,
     aspect: f32,
 }
@@ -135,7 +134,7 @@ impl Desktop {
             settings_tab: SettingsTab::Servers,
             selected_app: None,
             selected_job: None,
-            show_history: false,
+            show_history: true,
             last_tree_details_refresh: Instant::now(),
             tree_progress: HashMap::new(),
             live_progress: HashMap::new(),
@@ -339,14 +338,7 @@ impl Desktop {
                             image,
                             egui::TextureOptions::LINEAR,
                         );
-                        self.textures.insert(
-                            key,
-                            ArtTexture {
-                                binding,
-                                texture,
-                                aspect,
-                            },
-                        );
+                        self.textures.insert(key, ArtTexture { texture, aspect });
                     }
                 }
                 Event::ArtworkMissing {
@@ -436,9 +428,9 @@ impl Desktop {
             usage,
         };
         let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+        let backdrop = design::palette(ui).elevated;
         if let Some(art) = self.textures.get(&key) {
-            ui.painter()
-                .rect_filled(rect, 11.0, ui.visuals().faint_bg_color);
+            ui.painter().rect_filled(rect, 11.0, backdrop);
             let fitted = if art.aspect > size.x / size.y {
                 egui::vec2(size.x, size.x / art.aspect)
             } else {
@@ -451,11 +443,8 @@ impl Desktop {
                 egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
                 Color32::WHITE,
             );
-            ui.interact(rect, ui.scope_id().with(app), egui::Sense::hover())
-                .on_hover_text(format!("Artwork binding {}", art.binding));
         } else {
-            ui.painter()
-                .rect_filled(rect, 11.0, ui.visuals().faint_bg_color);
+            ui.painter().rect_filled(rect, 11.0, backdrop);
             let initials: String = name
                 .split_whitespace()
                 .take(2)
@@ -518,8 +507,8 @@ fn main() -> eframe::Result {
 mod tests {
     use super::*;
     use crate::views::{
-        PrimaryAction, catalog_item_visible, format_time, friendly_job_state, job_actions,
-        primary_action, titlebar_command,
+        PrimaryAction, catalog_item_visible, download_group, format_time, friendly_job_state,
+        group_library_items, job_actions, launch_is_playable, primary_action, titlebar_command,
     };
     fn job(state: &str) -> DownloadJob {
         DownloadJob {
@@ -594,6 +583,46 @@ mod tests {
     fn completion_progress_is_not_premature() {
         assert_eq!(friendly_job_state("Verifying"), "Verifying");
         assert_eq!(friendly_job_state("Completed"), "Downloaded and verified");
+        assert!(download_group("Downloading") < download_group("Queued"));
+        assert!(download_group("Queued") < download_group("Completed"));
+        assert_eq!(download_group("Cancelled"), 5);
+    }
+    #[test]
+    fn compatible_play_is_separate_from_other_platforms() {
+        assert!(launch_is_playable("Ready"));
+        assert!(launch_is_playable("PreparationRequired"));
+        assert!(!launch_is_playable("UnsupportedPlatform"));
+        assert!(!launch_is_playable("NoLaunch"));
+        assert!(!launch_is_playable("MissingTarget"));
+    }
+    #[test]
+    fn library_groups_associations_without_merging_other_apps() {
+        let item = |id: &str| {
+            (
+                "File",
+                id.to_owned(),
+                id.to_owned(),
+                PathBuf::new(),
+                Some(1),
+                None,
+            )
+        };
+        let groups = group_library_items(
+            vec![item("a"), item("c"), item("b")],
+            |association| Some(if association == "c" { "other" } else { "same" }.to_owned()),
+            |association| association == "b",
+        );
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].0, "same");
+        assert_eq!(
+            groups[0]
+                .1
+                .iter()
+                .map(|item| item.1.as_str())
+                .collect::<Vec<_>>(),
+            vec!["b", "a"]
+        );
+        assert_eq!(groups[1].1[0].1, "c");
     }
     #[test]
     fn hero_never_chooses_among_multiple_launches() {

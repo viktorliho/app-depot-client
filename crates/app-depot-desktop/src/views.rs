@@ -2,6 +2,15 @@ use super::*;
 use crate::design;
 use app_depot_core::transfer::TransferPhase;
 
+type LibraryItem = (
+    &'static str,
+    String,
+    String,
+    PathBuf,
+    Option<u64>,
+    Option<usize>,
+);
+
 impl Desktop {
     fn titlebar(&mut self, ui: &mut egui::Ui) {
         let p = design::palette(ui);
@@ -384,47 +393,39 @@ impl Desktop {
                 });
         }
         ui.add_space(18.0);
-        let p = design::palette(ui);
-        egui::Frame::new()
-            .fill(p.surface)
-            .stroke(egui::Stroke::new(1.0, p.border))
-            .corner_radius(10)
-            .inner_margin(egui::Margin::symmetric(14, 10))
-            .show(ui, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    let search = ui.add(
-                        egui::TextEdit::singleline(&mut self.search)
-                            .hint_text("Search your catalog…")
-                            .desired_width(ui.available_width().min(350.0)),
-                    );
-                    if ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::F)) {
-                        search.request_focus();
-                    }
-                    if search.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                        self.search.clear();
-                        search.surrender_focus();
-                    }
-                    ui.add_space(6.0);
-                    if ui.selectable_label(self.prefs.grid, "Grid").clicked() {
-                        self.prefs.grid = true;
-                        self.remember();
-                    }
-                    if ui.selectable_label(!self.prefs.grid, "List").clicked() {
-                        self.prefs.grid = false;
-                        self.remember();
-                    }
-                    if ui
-                        .button(if self.sort_desc {
-                            "Name Z–A"
-                        } else {
-                            "Name A–Z"
-                        })
-                        .clicked()
-                    {
-                        self.sort_desc = !self.sort_desc;
-                    }
-                });
-            });
+        ui.horizontal_wrapped(|ui| {
+            let search = ui.add(
+                egui::TextEdit::singleline(&mut self.search)
+                    .hint_text("Search your catalog…")
+                    .desired_width(ui.available_width().min(350.0)),
+            );
+            if ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::F)) {
+                search.request_focus();
+            }
+            if search.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                self.search.clear();
+                search.surrender_focus();
+            }
+            ui.add_space(6.0);
+            if ui.selectable_label(self.prefs.grid, "Grid").clicked() {
+                self.prefs.grid = true;
+                self.remember();
+            }
+            if ui.selectable_label(!self.prefs.grid, "List").clicked() {
+                self.prefs.grid = false;
+                self.remember();
+            }
+            if ui
+                .button(if self.sort_desc {
+                    "Name Z–A"
+                } else {
+                    "Name A–Z"
+                })
+                .clicked()
+            {
+                self.sort_desc = !self.sort_desc;
+            }
+        });
         ui.add_space(18.0);
         let current_catalog = profile
             .as_ref()
@@ -619,23 +620,25 @@ impl Desktop {
     }
     fn app_card(&mut self, ui: &mut egui::Ui, view: &AppView, width: f32) {
         let p = design::palette(ui);
-        let response = design::surface(ui)
-            .inner_margin(egui::Margin::same(14))
+        let response = egui::Frame::new()
+            .fill(p.surface)
+            .corner_radius(13)
+            .inner_margin(egui::Margin::same(12))
             .show(ui, |ui| {
                 ui.vertical(|ui| {
-                    ui.set_width(width - 28.0);
-                    ui.set_min_height(268.0);
+                    ui.set_width(width - 24.0);
+                    ui.set_min_height(286.0);
                     self.request_art(
                         ui,
                         &view.app.id,
                         ArtUse::Grid,
-                        egui::vec2(width - 28.0, 154.0),
+                        egui::vec2(width - 24.0, 170.0),
                         &view.app.name,
                     );
-                    ui.add_space(10.0);
+                    ui.add_space(12.0);
                     ui.label(
                         RichText::new(truncate(&view.app.name, 42))
-                            .size(18.0)
+                            .size(19.0)
                             .strong(),
                     )
                     .on_hover_text(&view.app.name);
@@ -648,7 +651,7 @@ impl Desktop {
                                     format!("{} releases", view.releases.len())
                                 }
                             }),
-                            72,
+                            68,
                         ))
                         .size(14.0)
                         .color(p.muted),
@@ -658,10 +661,10 @@ impl Desktop {
                         .iter()
                         .flat_map(|r| &r.associations)
                         .any(|a| self.is_verified(&a.association.id));
-                    ui.add_space(6.0);
+                    ui.add_space(10.0);
                     ui.horizontal(|ui| {
                         if verified {
-                            ui.label(RichText::new("●  In your library").size(14.0).color(p.good));
+                            ui.label(RichText::new("In your library").size(14.0).color(p.good));
                         } else if view.stale {
                             ui.label(RichText::new("Saved catalog").size(14.0).color(p.muted));
                         } else {
@@ -812,82 +815,96 @@ impl Desktop {
             .filter(|c| c.association_id == association)
             .cloned()
             .collect();
-        for candidate in choices {
+        let has_playable = choices.iter().any(|c| launch_is_playable(&c.status));
+        let unavailable: Vec<_> = choices
+            .iter()
+            .filter(|c| c.status != "NoLaunch" && !launch_is_playable(&c.status))
+            .collect();
+        for candidate in choices.iter().filter(|c| launch_is_playable(&c.status)) {
             let key = format!("{}:{}", association, candidate.entry_id);
             let state = self.launch_states.get(&key).cloned();
-            if candidate.status == "Ready" || candidate.status == "PreparationRequired" {
-                let label = candidate
-                    .label
-                    .clone()
-                    .unwrap_or_else(|| candidate.entry_id.clone());
-                let multiple = self
-                    .snapshot
-                    .launches
-                    .iter()
-                    .filter(|c| {
-                        c.release_id == candidate.release_id
-                            && matches!(c.status.as_str(), "Ready" | "PreparationRequired")
-                    })
-                    .count()
-                    > 1;
-                let busy = state
-                    .as_ref()
-                    .is_some_and(|(s, _)| s == "Starting" || s == "Preparing" || s == "Running");
-                ui.horizontal_wrapped(|ui| {
-                    if ui
-                        .add_enabled(
-                            !busy,
-                            design::primary(
-                                if multiple {
-                                    format!("Play: {label}")
-                                } else {
-                                    "▶  Play".into()
-                                },
-                                design::palette(ui),
-                            ),
-                        )
-                        .clicked()
-                    {
-                        self.send(Command::Play {
-                            profile: candidate.profile_id.clone(),
-                            release: candidate.release_id.clone(),
-                            association: candidate.association_id.clone(),
-                            entry: candidate.entry_id.clone(),
-                            declaration_revision: candidate.declaration_revision.clone(),
-                        });
-                        self.launch_states.insert(
-                            key.clone(),
-                            ("Starting".into(), "Starting application".into()),
-                        );
-                    }
-                    ui.label(
-                        RichText::new(state.as_ref().map_or(
-                            if candidate.status == "Ready" {
-                                "Ready"
+            let label = candidate
+                .label
+                .clone()
+                .unwrap_or_else(|| candidate.entry_id.clone());
+            let multiple = self
+                .snapshot
+                .launches
+                .iter()
+                .filter(|c| {
+                    c.release_id == candidate.release_id
+                        && matches!(c.status.as_str(), "Ready" | "PreparationRequired")
+                })
+                .count()
+                > 1;
+            let busy = state
+                .as_ref()
+                .is_some_and(|(s, _)| s == "Starting" || s == "Preparing" || s == "Running");
+            ui.horizontal_wrapped(|ui| {
+                if ui
+                    .add_enabled(
+                        !busy,
+                        design::primary(
+                            if multiple {
+                                format!("Play: {label}")
                             } else {
-                                "Preparing on Play"
+                                "Play".into()
                             },
-                            |(s, _)| s.as_str(),
-                        ))
-                        .size(14.0)
-                        .color(design::palette(ui).muted),
+                            design::palette(ui),
+                        ),
+                    )
+                    .clicked()
+                {
+                    self.send(Command::Play {
+                        profile: candidate.profile_id.clone(),
+                        release: candidate.release_id.clone(),
+                        association: candidate.association_id.clone(),
+                        entry: candidate.entry_id.clone(),
+                        declaration_revision: candidate.declaration_revision.clone(),
+                    });
+                    self.launch_states.insert(
+                        key.clone(),
+                        ("Starting".into(), "Starting application".into()),
                     );
-                });
-            } else if candidate.status != "NoLaunch" {
-                ui.label(
-                    RichText::new(format!(
-                        "{}: {}",
-                        candidate.label.as_deref().unwrap_or(&candidate.entry_id),
-                        candidate.reason
-                    ))
-                    .small()
-                    .weak(),
-                );
-            }
+                }
+                if let Some(label) = state.as_ref().map(|(s, _)| s.as_str()).or_else(|| {
+                    (candidate.status == "PreparationRequired").then_some("Prepares on Play")
+                }) {
+                    ui.label(
+                        RichText::new(label)
+                            .size(14.0)
+                            .color(design::palette(ui).muted),
+                    );
+                }
+            });
             if let Some((state, message)) = &state
                 && state != "Starting"
             {
                 ui.label(RichText::new(message).small());
+            }
+        }
+        if !unavailable.is_empty() {
+            let show = |ui: &mut egui::Ui| {
+                for candidate in &unavailable {
+                    ui.label(format!(
+                        "{}: {}",
+                        candidate.label.as_deref().unwrap_or(&candidate.entry_id),
+                        candidate.reason
+                    ));
+                }
+            };
+            if has_playable {
+                egui::CollapsingHeader::new("Other launch options")
+                    .id_salt(("other-launch", association))
+                    .show(ui, show);
+            } else {
+                ui.label(
+                    RichText::new("No compatible Play option on this device")
+                        .color(design::palette(ui).muted),
+                );
+                egui::CollapsingHeader::new("Why?")
+                    .id_salt(("unavailable-launch", association))
+                    .show(ui, show);
             }
         }
     }
@@ -908,16 +925,17 @@ impl Desktop {
         egui::ScrollArea::vertical().auto_shrink([false,false]).show(ui,|ui| {
             let palette = design::palette(ui);
             let info = view.releases.iter().find_map(|r| r.declaration.as_ref().and_then(|s| s.app.convention::<AppConvention>().ok().flatten()));
-            let hero_width=ui.available_width();
-            let art_width=if hero_width < 720.0 { 150.0 } else { 260.0 };
-            let art_height=if hero_width < 720.0 { 140.0 } else { 180.0 };
-            design::surface(ui).inner_margin(egui::Margin::same(24)).show(ui, |ui| {
-                ui.set_width((hero_width-48.0).max(0.0));
-                ui.horizontal_top(|ui| {
+            let hero_width=ui.available_width().min(1240.0);
+            let narrow=hero_width < 650.0;
+            let art_width=if narrow {(hero_width-56.0).min(320.0)} else {300.0};
+            let art_height=if narrow {174.0} else {218.0};
+            egui::Frame::new().fill(palette.surface).corner_radius(14).inner_margin(egui::Margin::same(28)).show(ui, |ui| {
+                ui.set_width((hero_width-56.0).max(0.0));
+                ui.with_layout(if narrow {egui::Layout::top_down(egui::Align::Min)} else {egui::Layout::left_to_right(egui::Align::Min)},|ui| {
                     self.request_art(ui,id,ArtUse::Detail,egui::vec2(art_width,art_height),&view.app.name);
                     ui.add_space(12.0);
                     ui.vertical(|ui| {
-                        ui.set_max_width((hero_width - 48.0 - art_width - 12.0).clamp(250.0, 800.0));
+                        ui.set_max_width(if narrow {hero_width-56.0} else {(hero_width-56.0-art_width-12.0).max(220.0)});
                         ui.label(design::eyebrow("APPLICATION",palette));
                         ui.label(RichText::new(&view.app.name).size(if hero_width < 720.0 { 26.0 } else { 32.0 }).strong());
                         if let Some(developer)=info.as_ref().and_then(|c|c.developer.as_deref()) {
@@ -938,14 +956,29 @@ impl Desktop {
                         let busy=ready.first().is_some_and(|c|self.launch_states.get(&format!("{}:{}",c.association_id,c.entry_id)).is_some_and(|(s,_)|matches!(s.as_str(),"Starting"|"Preparing"|"Running")));
                         if action==PrimaryAction::Play {
                             let candidate=&ready[0];
-                            if ui.add_enabled(!busy,design::primary("▶  Play",palette)).clicked() {
+                            if ui.add_enabled(!busy,design::primary("Play",palette)).clicked() {
                                 self.send(Command::Play {profile:candidate.profile_id.clone(),release:candidate.release_id.clone(),association:candidate.association_id.clone(),entry:candidate.entry_id.clone(),declaration_revision:candidate.declaration_revision.clone()});
                                 self.launch_states.insert(format!("{}:{}",candidate.association_id,candidate.entry_id),("Starting".into(),"Starting application".into()));
                             }
                         } else if action==PrimaryAction::ChooseLaunch {
                             ui.label(RichText::new("Choose a launch option below").color(palette.accent));
+                        } else if let Some(release)=view.releases.first().filter(|_|view.releases.len()==1)
+                            && let Some(item)=release.associations.first().filter(|_|release.associations.len()==1)
+                            && let Some(artifact)=&item.artifact
+                            && !view.stale
+                            && self.association_state(&item.association.id)=="Available to download"
+                            && self.profile().is_some_and(|p|!p.archived)
+                        {
+                            if ui.add(design::primary("Download",palette)).clicked()
+                                && let Some(profile)=self.active.clone() {
+                                    self.send(Command::Download {profile,release:release.release.id.clone(),association:item.association.id.clone(),kind:artifact.kind.clone()});
+                                    self.screen=Screen::Downloads;
+                                }
                         } else {
-                            ui.label(RichText::new(if view.stale {"Saved for offline browsing"} else {"Choose a release and artifact below"}).color(palette.muted));
+                            let message=if view.stale {"Saved for offline browsing"}
+                                else if view.releases.iter().flat_map(|r|&r.associations).any(|a|self.is_verified(&a.association.id)) {"Available in My library"}
+                                else {"Choose a release and artifact below"};
+                            ui.label(RichText::new(message).color(palette.muted));
                         }
                     });
                 });
@@ -1001,7 +1034,7 @@ impl Desktop {
                                         ui.label(RichText::new(self.association_state(&item.association.id)).size(14.0).color(if self.is_verified(&item.association.id){palette.good}else{palette.muted}));
                                     });
                                     let enabled=!view.stale && item.artifact.as_ref().is_some_and(|a|matches!(a.kind.as_str(),"File"|"Tree")) && self.profile().is_some_and(|p|!p.archived) && self.association_state(&item.association.id)=="Available to download";
-                                    let action=if enabled {design::primary("↓  Download",palette)} else {egui::Button::new(if self.is_verified(&item.association.id){"Saved locally"}else{"Unavailable"})};
+                                    let action=if enabled {design::primary("Download",palette)} else {egui::Button::new(if self.is_verified(&item.association.id){"Saved locally"}else{"Unavailable"})};
                                     if ui.add_enabled(enabled,action).clicked() && let (Some(profile),Some(artifact))=(self.active.clone(),&item.artifact) {
                                         self.send(Command::Download {profile,release:release.release.id.clone(),association:item.association.id.clone(),kind:artifact.kind.clone()}); self.screen=Screen::Downloads;
                                     }
@@ -1028,7 +1061,7 @@ impl Desktop {
         self.header(
             ui,
             "My library",
-            "Your applications and saved downloads, available offline.",
+            "Your applications and saved downloads. Available offline.",
         );
         if self.active.is_none() {
             self.empty_panel(
@@ -1079,11 +1112,24 @@ impl Desktop {
                 Some(t.file_count),
             )
         }));
+        ui.horizontal(|ui| {
+            ui.label(design::eyebrow("YOUR COLLECTION", design::palette(ui)));
+            ui.add_space(12.0);
+            if ui.selectable_label(self.prefs.grid, "Grid").clicked() {
+                self.prefs.grid = true;
+                self.remember();
+            }
+            if ui.selectable_label(!self.prefs.grid, "List").clicked() {
+                self.prefs.grid = false;
+                self.remember();
+            }
+        });
+        ui.add_space(12.0);
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 for issue in &self.snapshot.local_issues {
-                    ui.group(|ui| {
+                    egui::Frame::new().fill(design::palette(ui).surface).corner_radius(11).inner_margin(egui::Margin::same(16)).show(ui, |ui| {
                         ui.label(
                             egui::RichText::new(format!("{} download needs repair", issue.kind))
                                 .strong(),
@@ -1105,214 +1151,350 @@ impl Desktop {
                 let isolated:Vec<_>=self.snapshot.installations.iter().filter(|installation|installation.state=="Ready" && !self.snapshot.files.iter().any(|file|file.association_id==installation.association_id) && !self.snapshot.trees.iter().any(|tree|tree.association_id==installation.association_id)).cloned().collect();
                 for installation in isolated {
                     let name=self.snapshot.apps.iter().find(|app|app.app.id==installation.app_id).map_or("Saved application",|app|app.app.name.as_str()).to_owned();
-                    ui.group(|ui|{
-                        ui.label(RichText::new(name.clone()).strong());
-                        ui.label("Writable application copy remains available. Its original verified download needs inspection or repair.");
+                    egui::Frame::new().fill(design::palette(ui).surface).corner_radius(11).inner_margin(egui::Margin::same(16)).show(ui, |ui|{
+                        ui.label(RichText::new(name.clone()).size(19.0).strong());
+                        ui.label(RichText::new("Your writable copy is still available. The original download needs inspection or repair.").color(design::palette(ui).muted));
                         if ui.button("Open working copy").clicked(){self.send(Command::Reveal(installation.path.clone()));}
                         self.play_controls(ui,&installation.association_id);
-                        if ui.button("Remove working copy…").clicked(){self.remove_target=Some((installation.id.clone(),false,name.clone()));self.confirmation=Some(Confirmation::RemoveInstallation);}
-                        if ui.button("Remove completely…").clicked(){self.remove_target=Some((installation.id.clone(),true,name.clone()));self.confirmation=Some(Confirmation::RemoveInstallation);}
+                        egui::CollapsingHeader::new("Manage application").id_salt(&installation.id).show(ui, |ui| {
+                            if ui.button("Remove working copy…").clicked(){self.remove_target=Some((installation.id.clone(),false,name.clone()));self.confirmation=Some(Confirmation::RemoveInstallation);}
+                            if ui.button("Remove completely…").clicked(){self.remove_target=Some((installation.id.clone(),true,name.clone()));self.confirmation=Some(Confirmation::RemoveInstallation);}
+                        });
                     });
                     ui.add_space(8.0);
                 }
-                let columns=if ui.available_width()<850.0 {1}else{2};
-                for row in items.chunks(columns) {
-                    ui.columns(columns,|columns_ui| {
-                        for (index,item) in row.iter().enumerate() {
-                            self.library_card(&mut columns_ui[index],item);
+                let groups = group_library_items(
+                    items,
+                    |association| self.snapshot.apps.iter().find(|app| app.releases.iter().any(|release| release.associations.iter().any(|entry| entry.association.id == association))).map(|app| app.app.id.clone()),
+                    |association| self.snapshot.launches.iter().any(|candidate| candidate.association_id == association && launch_is_playable(&candidate.status)),
+                );
+                let width = ui.available_width();
+                let columns = if self.prefs.grid { (((width + 14.0) / 380.0).floor().max(1.0) as usize).min(groups.len().max(1)) } else { 1 };
+                let card_width = if self.prefs.grid { ((width - 14.0 * columns.saturating_sub(1) as f32) / columns as f32).clamp(260.0, 560.0) } else { width.min(960.0) };
+                for row in groups.chunks(columns) {
+                    ui.horizontal_top(|ui| {
+                        if self.prefs.grid {
+                            let row_width = row.len() as f32 * card_width + 14.0 * row.len().saturating_sub(1) as f32;
+                            ui.add_space(((width - row_width) / 2.0).max(0.0));
+                        }
+                        for (app_id, members) in row {
+                            ui.allocate_ui_with_layout(egui::vec2(card_width, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
+                                if self.prefs.grid {
+                                    self.library_group_card(ui, app_id, members, card_width);
+                                } else {
+                                    self.library_list_row(ui, app_id, members, card_width);
+                                }
+                            });
+                            ui.add_space(14.0);
                         }
                     });
-                    ui.add_space(10.0);
+                    ui.add_space(14.0);
                 }
             });
     }
-    fn library_card(
+    fn library_list_row(
         &mut self,
         ui: &mut egui::Ui,
-        item: &(
-            &'static str,
-            String,
-            String,
-            PathBuf,
-            Option<u64>,
-            Option<usize>,
-        ),
+        app_id: &str,
+        members: &[LibraryItem],
+        width: f32,
     ) {
-        let (kind, association, artifact, path, size, file_count) = item;
-        let context = self
+        let p = design::palette(ui);
+        let app = self
             .snapshot
             .apps
             .iter()
-            .flat_map(|a| a.releases.iter().map(move |r| (a, r)))
-            .find(|(_, r)| {
-                r.associations
+            .find(|app| app.app.id == app_id)
+            .cloned();
+        let title = app
+            .as_ref()
+            .map_or("Saved download", |app| app.app.name.as_str())
+            .to_owned();
+        let ready: Vec<_> = self
+            .snapshot
+            .launches
+            .iter()
+            .filter(|candidate| {
+                members
                     .iter()
-                    .any(|a| a.association.id == *association)
+                    .any(|item| item.1 == candidate.association_id)
+                    && launch_is_playable(&candidate.status)
             })
-            .map(|(a, r)| {
-                (
-                    a.app.id.clone(),
-                    a.app.name.clone(),
-                    r.release.version.clone(),
-                )
-            });
-        let title = context.as_ref().map_or_else(
-            || format!("Saved {kind} artifact"),
-            |(_, name, _)| name.clone(),
-        );
-        let subtitle = context.as_ref().map_or_else(
-            || (*kind).to_owned(),
-            |(_, _, version)| {
-                version.as_ref().map_or_else(
-                    || format!("Release · {kind}"),
-                    |v| format!("Version {v} · {kind}"),
-                )
-            },
-        );
-        let p = design::palette(ui);
-        design::surface(ui).show(ui, |ui| {
-            ui.set_width((ui.available_width() - 36.0).max(240.0));
-            ui.set_min_height(176.0);
-            ui.horizontal_top(|ui| {
-                if let Some((id, name, _)) = &context {
-                    self.request_art(ui, id, ArtUse::Grid, egui::vec2(92.0, 92.0), name);
-                } else {
-                    let (rect, _) =
-                        ui.allocate_exact_size(egui::vec2(92.0, 92.0), egui::Sense::hover());
-                    ui.painter().rect_filled(rect, 10.0, p.elevated);
-                    ui.painter().text(
-                        rect.center(),
-                        egui::Align2::CENTER_CENTER,
-                        "A",
-                        egui::FontId::proportional(32.0),
-                        p.muted,
-                    );
-                }
-                ui.vertical(|ui| {
-                    ui.label(RichText::new(truncate(&title, 48)).size(19.0).strong())
-                        .on_hover_text(&title);
-                    ui.label(RichText::new(subtitle).size(14.0).color(p.muted));
-                    ui.add_space(6.0);
-                    ui.label(
-                        RichText::new(format!(
-                            "Saved locally{}",
-                            size.map(|n| format!(" · {}", format_bytes(n)))
-                                .or_else(|| file_count.map(|n| format!(" · {n} files")))
-                                .unwrap_or_default()
-                        ))
-                        .size(14.0)
-                        .color(p.good),
-                    );
-                });
-            });
-            ui.add_space(10.0);
-            ui.horizontal_wrapped(|ui| {
-                self.play_controls(ui, association);
-                if ui.button("Open folder").clicked() {
-                    self.send(Command::Reveal(path.clone()));
-                }
-            });
-            if let Some(installation) = self
-                .snapshot
-                .installations
-                .iter()
-                .find(|i| i.association_id == *association && i.artifact_id == *artifact)
-                .cloned()
-            {
-                if let Some(phase) = self.local_operations.get(&installation.id) {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label(phase);
-                    });
-                }
-                egui::CollapsingHeader::new("Manage")
-                    .id_salt(&installation.id)
-                    .show(ui, |ui| {
-                        let available = !self.local_operations.contains_key(&installation.id);
-                        if ui
-                            .add_enabled(available, egui::Button::new("Verify integrity"))
-                            .clicked()
-                        {
-                            self.local_operations.insert(
-                                installation.id.clone(),
-                                "Comparing installed files with original download".into(),
-                            );
-                            self.send(Command::VerifyInstallation(installation.id.clone()));
-                        }
-                        if ui
-                            .add_enabled(available, egui::Button::new("Repair…"))
-                            .clicked()
-                        {
-                            self.repair_installation_target =
-                                Some((installation.id.clone(), title.clone()));
-                            self.confirmation = Some(Confirmation::RepairInstallation);
-                        }
-                        if ui
-                            .add_enabled(available, egui::Button::new("Remove application…"))
-                            .clicked()
-                        {
-                            self.remove_target =
-                                Some((installation.id.clone(), false, title.clone()));
-                            self.confirmation = Some(Confirmation::RemoveInstallation);
-                        }
-                        if ui
-                            .add_enabled(available, egui::Button::new("Remove completely…"))
-                            .clicked()
-                        {
-                            self.remove_target =
-                                Some((installation.id.clone(), true, title.clone()));
-                            self.confirmation = Some(Confirmation::RemoveInstallation);
-                        }
-                    });
-                if let Some(report) = self.integrity_reports.get(&installation.id) {
-                    egui::CollapsingHeader::new(if report.matches_original() {
-                        "Integrity: matches original"
+            .cloned()
+            .collect();
+        egui::Frame::new()
+            .fill(p.surface)
+            .corner_radius(11)
+            .inner_margin(egui::Margin::symmetric(16, 12))
+            .show(ui, |ui| {
+                ui.set_width((width - 32.0).max(220.0));
+                ui.horizontal_top(|ui| {
+                    if app.is_some() {
+                        self.request_art(ui, app_id, ArtUse::Grid, egui::vec2(92.0, 76.0), &title);
                     } else {
-                        "Integrity: local changes found"
-                    })
-                    .show(ui, |ui| {
-                        for path in &report.missing {
-                            ui.label(format!("Missing: {path}"));
-                        }
-                        for path in &report.modified {
-                            ui.label(format!("Modified: {path}"));
-                        }
-                        for path in &report.unexpected {
-                            ui.label(format!("Added: {path}"));
-                        }
-                    });
-                }
-            } else if let Some(profile) = self.active.clone() {
-                if let Some(phase) = self.local_operations.get(association) {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label(phase);
-                    });
-                }
-                egui::CollapsingHeader::new("Manage")
-                    .id_salt(association)
-                    .show(ui, |ui| {
-                        if ui
-                            .add_enabled(
-                                !self.local_operations.contains_key(association),
-                                egui::Button::new("Remove local download…"),
-                            )
-                            .clicked()
-                        {
-                            self.remove_artifact_target =
-                                Some((profile, association.clone(), title.clone()));
-                            self.confirmation = Some(Confirmation::RemoveArtifact);
+                        library_placeholder(ui, egui::vec2(92.0, 76.0));
+                    }
+                    ui.vertical(|ui| {
+                        ui.set_max_width((width - 270.0).max(180.0));
+                        ui.label(RichText::new(truncate(&title, 68)).size(19.0).strong())
+                            .on_hover_text(&title);
+                        ui.label(
+                            RichText::new(if members.len() == 1 {
+                                "1 local download".to_owned()
+                            } else {
+                                format!("{} local downloads", members.len())
+                            })
+                            .size(14.0)
+                            .color(p.muted),
+                        );
+                        if app.is_some() && ui.link("View details").clicked() {
+                            self.selected_app = Some(app_id.to_owned());
+                            self.screen = Screen::Catalog;
                         }
                     });
-            }
-            egui::CollapsingHeader::new("Technical details")
-                .id_salt(("lib", association))
-                .show(ui, |ui| {
-                    copy_line(ui, "Association ID", association);
-                    copy_line(ui, "Artifact ID", artifact);
-                    copy_line(ui, "Local path", &path.display().to_string());
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                        if ready.len() == 1 {
+                            let candidate = &ready[0];
+                            let key =
+                                format!("{}:{}", candidate.association_id, candidate.entry_id);
+                            let state = self
+                                .launch_states
+                                .get(&key)
+                                .map(|(state, _)| state.as_str());
+                            let busy = state.is_some_and(|state| {
+                                matches!(state, "Starting" | "Preparing" | "Running")
+                            });
+                            let label = match state {
+                                Some("Running") => "Running",
+                                Some("Starting" | "Preparing") => "Starting…",
+                                _ => "Play",
+                            };
+                            if ui.add_enabled(!busy, design::primary(label, p)).clicked() {
+                                self.send(Command::Play {
+                                    profile: candidate.profile_id.clone(),
+                                    release: candidate.release_id.clone(),
+                                    association: candidate.association_id.clone(),
+                                    entry: candidate.entry_id.clone(),
+                                    declaration_revision: candidate.declaration_revision.clone(),
+                                });
+                                self.launch_states.insert(
+                                    key,
+                                    ("Starting".into(), "Starting application".into()),
+                                );
+                            }
+                        } else if ready.len() > 1 {
+                            ui.label(RichText::new("Choose Play option below").color(p.accent));
+                        } else {
+                            ui.label(RichText::new("Saved locally").color(p.muted));
+                        }
+                    });
                 });
-        });
+                egui::CollapsingHeader::new("Downloads and management")
+                    .id_salt(("library-list-details", app_id))
+                    .default_open(ready.len() > 1)
+                    .show(ui, |ui| {
+                        self.library_group_card(ui, app_id, members, width.min(440.0))
+                    });
+            });
+    }
+    fn library_group_card(
+        &mut self,
+        ui: &mut egui::Ui,
+        app_id: &str,
+        members: &[LibraryItem],
+        width: f32,
+    ) {
+        let p = design::palette(ui);
+        let app = self
+            .snapshot
+            .apps
+            .iter()
+            .find(|app| app.app.id == app_id)
+            .cloned();
+        let title = app
+            .as_ref()
+            .map_or("Saved download", |app| app.app.name.as_str())
+            .to_owned();
+        egui::Frame::new()
+            .fill(p.surface)
+            .corner_radius(14)
+            .inner_margin(egui::Margin::same(16))
+            .show(ui, |ui| {
+                ui.set_width((width - 32.0).max(220.0));
+                let image_size = egui::vec2((width - 32.0).max(220.0), 182.0);
+                if app.is_some() {
+                    self.request_art(ui, app_id, ArtUse::Grid, image_size, &title);
+                } else {
+                    library_placeholder(ui, image_size);
+                }
+                ui.add_space(12.0);
+                ui.label(RichText::new(truncate(&title, 56)).size(21.0).strong())
+                    .on_hover_text(&title);
+                ui.label(
+                    RichText::new(if members.len() == 1 {
+                        "1 local download".to_owned()
+                    } else {
+                        format!("{} local downloads", members.len())
+                    })
+                    .size(14.0)
+                    .color(p.muted),
+                );
+                if app.is_some() && ui.link("View details").clicked() {
+                    self.selected_app = Some(app_id.to_owned());
+                    self.screen = Screen::Catalog;
+                }
+                ui.add_space(10.0);
+                for (index, (kind, association, artifact, path, size, file_count)) in
+                    members.iter().enumerate()
+                {
+                    if index > 0 {
+                        ui.separator();
+                        ui.add_space(6.0);
+                    }
+                    let release = app.as_ref().and_then(|app| {
+                        app.releases.iter().find(|release| {
+                            release
+                                .associations
+                                .iter()
+                                .any(|entry| entry.association.id == *association)
+                        })
+                    });
+                    let context = release
+                        .and_then(|release| release.release.version.as_deref())
+                        .filter(|version| !version.is_empty())
+                        .map_or_else(
+                            || "Saved release".to_owned(),
+                            |version| format!("Version {version}"),
+                        );
+                    ui.label(
+                        RichText::new(format!("{context} · {kind}"))
+                            .size(16.0)
+                            .strong(),
+                    );
+                    let detail = size
+                        .map(format_bytes)
+                        .or_else(|| file_count.map(|count| format!("{count} files")))
+                        .unwrap_or_default();
+                    ui.label(
+                        RichText::new(format!("Available offline · {detail}"))
+                            .size(14.0)
+                            .color(p.muted),
+                    );
+                    ui.add_space(8.0);
+                    let installation = self
+                        .snapshot
+                        .installations
+                        .iter()
+                        .find(|installation| {
+                            installation.association_id == *association
+                                && installation.artifact_id == *artifact
+                        })
+                        .cloned();
+                    self.play_controls(ui, association);
+                    if ui.button("Open folder").clicked() {
+                        self.send(Command::Reveal(
+                            installation
+                                .as_ref()
+                                .filter(|installation| installation.state == "Ready")
+                                .map_or_else(
+                                    || path.clone(),
+                                    |installation| installation.path.clone(),
+                                ),
+                        ));
+                    }
+                    let operation_key = installation
+                        .as_ref()
+                        .map_or(association.as_str(), |installation| {
+                            installation.id.as_str()
+                        });
+                    if let Some(phase) = self.local_operations.get(operation_key) {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.spinner();
+                            ui.label(phase);
+                        });
+                    }
+                    egui::CollapsingHeader::new("Manage download")
+                        .id_salt(("library-manage", association))
+                        .show(ui, |ui| {
+                            let available = !self.local_operations.contains_key(operation_key);
+                            if let Some(installation) = &installation {
+                                if ui
+                                    .add_enabled(available, egui::Button::new("Verify integrity"))
+                                    .clicked()
+                                {
+                                    self.local_operations.insert(
+                                        installation.id.clone(),
+                                        "Comparing installed files with original download".into(),
+                                    );
+                                    self.send(Command::VerifyInstallation(installation.id.clone()));
+                                }
+                                if ui
+                                    .add_enabled(available, egui::Button::new("Repair…"))
+                                    .clicked()
+                                {
+                                    self.repair_installation_target =
+                                        Some((installation.id.clone(), title.clone()));
+                                    self.confirmation = Some(Confirmation::RepairInstallation);
+                                }
+                                if ui
+                                    .add_enabled(
+                                        available,
+                                        egui::Button::new("Remove application…"),
+                                    )
+                                    .clicked()
+                                {
+                                    self.remove_target =
+                                        Some((installation.id.clone(), false, title.clone()));
+                                    self.confirmation = Some(Confirmation::RemoveInstallation);
+                                }
+                                if ui
+                                    .add_enabled(available, egui::Button::new("Remove completely…"))
+                                    .clicked()
+                                {
+                                    self.remove_target =
+                                        Some((installation.id.clone(), true, title.clone()));
+                                    self.confirmation = Some(Confirmation::RemoveInstallation);
+                                }
+                                if let Some(report) = self.integrity_reports.get(&installation.id) {
+                                    egui::CollapsingHeader::new(if report.matches_original() {
+                                        "Matches original download"
+                                    } else {
+                                        "Local changes found"
+                                    })
+                                    .show(ui, |ui| {
+                                        for path in &report.missing {
+                                            ui.label(format!("Missing: {path}"));
+                                        }
+                                        for path in &report.modified {
+                                            ui.label(format!("Modified: {path}"));
+                                        }
+                                        for path in &report.unexpected {
+                                            ui.label(format!("Added: {path}"));
+                                        }
+                                    });
+                                }
+                            } else if let Some(profile) = self.active.clone()
+                                && ui
+                                    .add_enabled(
+                                        available,
+                                        egui::Button::new("Remove local download…"),
+                                    )
+                                    .clicked()
+                            {
+                                self.remove_artifact_target =
+                                    Some((profile, association.clone(), title.clone()));
+                                self.confirmation = Some(Confirmation::RemoveArtifact);
+                            }
+                        });
+                    egui::CollapsingHeader::new("Technical details")
+                        .id_salt(("library-technical", association))
+                        .show(ui, |ui| {
+                            copy_line(ui, "Association ID", association);
+                            copy_line(ui, "Artifact ID", artifact);
+                            copy_line(ui, "Local path", &path.display().to_string());
+                        });
+                }
+            });
     }
     fn downloads(&mut self, ui: &mut egui::Ui) {
         self.header(
@@ -1385,6 +1567,48 @@ impl Desktop {
                         "File"
                     };
                     if group==1 {queue_pos+=1;}
+                    if group >= 4 {
+                        egui::Frame::new()
+                            .fill(design::palette(ui).surface)
+                            .corner_radius(9)
+                            .inner_margin(egui::Margin::symmetric(14, 10))
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width().min(940.0) - 28.0);
+                                let stored = if job.state == "Completed" { job.expected_size } else { job.progress };
+                                let when = if job.updated_at > 0 {
+                                    format!(" · {}", format_time(Some(job.updated_at)))
+                                } else {
+                                    String::new()
+                                };
+                                egui::CollapsingHeader::new(format!("{} · {release} · {kind} · {}{when}", truncate(&title, 48), format_bytes(stored)))
+                                    .id_salt(("history", &job.id))
+                                    .show(ui, |ui| {
+                                        copy_line(ui, "Job ID", &job.id);
+                                        copy_line(ui, "Artifact ID", &job.artifact_id);
+                                        copy_line(ui, "Association ID", &job.association_id);
+                                    });
+                            });
+                        ui.add_space(5.0);
+                        continue;
+                    }
+                    if group == 1 {
+                        egui::Frame::new()
+                            .fill(design::palette(ui).surface)
+                            .corner_radius(10)
+                            .inner_margin(egui::Margin::symmetric(16, 12))
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width().min(940.0) - 32.0);
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.label(RichText::new(format!("{queue_pos}. {title}")).size(17.0).strong());
+                                    ui.label(RichText::new(format!("{release} · {kind} · {} saved", format_bytes(job.progress))).color(design::palette(ui).muted));
+                                    for (label, cmd) in job_actions(job) {
+                                        if ui.button(label).clicked() { self.send(cmd); }
+                                    }
+                                });
+                            });
+                        ui.add_space(7.0);
+                        continue;
+                    }
                     design::surface(ui)
                         .show(ui, |ui| {
                             ui.set_width((ui.available_width() - 36.0).max(300.0));
@@ -1531,7 +1755,11 @@ impl Desktop {
             if self.settings_tab==SettingsTab::Servers {
             section(ui,"Servers & accounts",|ui| {
                 let profiles:Vec<_>=self.snapshot.profiles.iter().map(|p|(p.id.clone(),p.name.clone(),p.archived)).collect();
-                for (id,name,archived) in profiles { if ui.add_sized([ui.available_width().min(430.0),34.0],egui::Button::selectable(self.active.as_ref()==Some(&id),if archived {format!("{name} · archived")}else{name})).clicked() { self.select(id); } }
+                if profiles.len()>1 {
+                    ui.label(RichText::new("Choose a server").size(14.0).color(design::palette(ui).muted));
+                    for (id,name,archived) in profiles { if ui.add_sized([ui.available_width().min(430.0),34.0],egui::Button::selectable(self.active.as_ref()==Some(&id),if archived {format!("{name} · archived")}else{name})).clicked() { self.select(id); } }
+                    ui.add_space(10.0);
+                }
                 if ui.button("+ Add Server").clicked() { self.begin_setup(); }
                 if let Some(p)=self.profile().cloned() {
                     ui.add_space(10.0); ui.label(RichText::new(&p.name).size(17.0).strong()); ui.label(&p.origin);
@@ -1551,11 +1779,17 @@ impl Desktop {
                             ui.horizontal(|ui| { if ui.add_enabled(!self.token.is_empty(),egui::Button::new("Verify & save token")).clicked() { let token=std::mem::take(&mut self.token); self.send(Command::SetToken{id:p.id.clone(),token,persist:self.token_persist}); }
                                 if ui.button("Remove token…").clicked(){self.confirmation=Some(Confirmation::RemoveToken);} });
                         });
-                        ui.add_space(14.0); ui.label(RichText::new("Profile details").strong());
-                        ui.horizontal(|ui| { ui.add(egui::TextEdit::singleline(&mut self.edit_name).hint_text("New display name")); if ui.button("Rename").clicked(){self.send(Command::RenameProfile{id:p.id.clone(),name:self.edit_name.trim().into()});self.edit_name.clear();} });
-                        ui.horizontal(|ui| { ui.add(egui::TextEdit::singleline(&mut self.edit_url).hint_text("New server origin").desired_width(290.0)); if ui.button("Change origin…").clicked(){self.confirmation=Some(Confirmation::Move);} });
-                        ui.checkbox(&mut self.edit_allow_http,"Allow unencrypted HTTP for the new origin");
-                        if ui.button("Archive server…").clicked(){self.confirmation=Some(Confirmation::Archive);}
+                        ui.add_space(14.0);
+                        egui::CollapsingHeader::new("Manage server")
+                            .id_salt(("manage-server", &p.id.0))
+                            .show(ui, |ui| {
+                                ui.label(RichText::new("Name and address").strong());
+                                ui.horizontal(|ui| { ui.add(egui::TextEdit::singleline(&mut self.edit_name).hint_text("New display name")); if ui.button("Rename").clicked(){self.send(Command::RenameProfile{id:p.id.clone(),name:self.edit_name.trim().into()});self.edit_name.clear();} });
+                                ui.horizontal(|ui| { ui.add(egui::TextEdit::singleline(&mut self.edit_url).hint_text("New server origin").desired_width(290.0)); if ui.button("Change origin…").clicked(){self.confirmation=Some(Confirmation::Move);} });
+                                ui.checkbox(&mut self.edit_allow_http,"Allow unencrypted HTTP for the new origin");
+                                ui.add_space(10.0);
+                                if ui.button("Archive server…").clicked(){self.confirmation=Some(Confirmation::Archive);}
+                            });
                     } else { ui.label("Archived server: saved catalog and verified downloads are available offline."); }
                 }
             }); }
@@ -1568,15 +1802,33 @@ impl Desktop {
                 ui.add_space(10.0);
                 if ui.button("Refresh storage usage").clicked(){self.send(Command::StorageUsage);}
                 if let Some(usage)=&self.storage_usage {
-                    for (label,bytes) in [
+                    ui.label(RichText::new("Logical storage by purpose").strong());
+                    ui.label(RichText::new("Physical disk usage and space reclaimable from one app are unknown here. Shared objects, reflinks and compression may overlap these amounts.").size(14.0).color(design::palette(ui).muted));
+                    ui.add_space(8.0);
+                    let categories = [
                         ("Immutable verified objects",usage.immutable_objects_logical_bytes),
                         ("Verified materializations",usage.verified_materializations_logical_bytes),
                         ("Writable application copies",usage.writable_installations_logical_bytes),
                         ("Managed application data",usage.managed_userdata_logical_bytes),
                         ("Staging and recovery",usage.staging_logical_bytes),
                         ("Artwork cache",usage.artwork_logical_bytes),
-                    ] {ui.label(format!("{label}: {}",format_bytes(bytes)));}
-                    ui.label(RichText::new("These are logical sizes. Reflinks, compression and shared objects make physical reclaimable space different.").small().weak());
+                    ];
+                    let largest = categories.iter().map(|(_, bytes)| *bytes).max().unwrap_or(0);
+                    for (label, bytes) in categories {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.add_sized([240.0, 22.0], egui::Label::new(RichText::new(label).size(14.0))).on_hover_text(label);
+                            if largest > 0 {
+                                let (rect, _) = ui.allocate_exact_size(egui::vec2(150.0, 7.0), egui::Sense::hover());
+                                ui.painter().rect_filled(rect, 4.0, design::palette(ui).elevated);
+                                let fill = rect.width() * (bytes as f64 / largest as f64) as f32;
+                                if fill > 0.0 {
+                                    ui.painter().rect_filled(egui::Rect::from_min_size(rect.min, egui::vec2(fill, rect.height())), 4.0, design::palette(ui).accent);
+                                }
+                            }
+                            ui.label(RichText::new(format_bytes(bytes)).color(design::palette(ui).muted));
+                        });
+                        ui.add_space(4.0);
+                    }
                 }
                 egui::CollapsingHeader::new("Locations and migration details").show(ui,|ui| {
                     copy_line(ui,"Metadata",&self.snapshot.library_data.display().to_string());
@@ -1961,6 +2213,39 @@ fn section(ui: &mut egui::Ui, title: &str, body: impl FnOnce(&mut egui::Ui)) {
             body(ui);
         });
 }
+fn library_placeholder(ui: &mut egui::Ui, size: egui::Vec2) {
+    let p = design::palette(ui);
+    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+    ui.painter().rect_filled(rect, 10.0, p.elevated);
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        "A",
+        egui::FontId::proportional(32.0),
+        p.muted,
+    );
+}
+pub(super) fn group_library_items(
+    items: Vec<LibraryItem>,
+    app_for_association: impl Fn(&str) -> Option<String>,
+    playable: impl Fn(&str) -> bool,
+) -> Vec<(String, Vec<LibraryItem>)> {
+    let mut groups: Vec<(String, Vec<LibraryItem>)> = Vec::new();
+    let mut indices: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for item in items {
+        let app_id = app_for_association(&item.1).unwrap_or_else(|| item.1.clone());
+        if let Some(index) = indices.get(&app_id) {
+            groups[*index].1.push(item);
+        } else {
+            indices.insert(app_id.clone(), groups.len());
+            groups.push((app_id, vec![item]));
+        }
+    }
+    for (_, members) in &mut groups {
+        members.sort_by_key(|item| !playable(&item.1));
+    }
+    groups
+}
 fn status_line(ui: &mut egui::Ui, p: &app_depot_core::library::Profile, syncing: bool) {
     let (label, color) = if p.archived {
         ("Saved offline", Color32::GRAY)
@@ -2037,7 +2322,7 @@ fn phase_label(phase: TransferPhase, state: &str) -> &'static str {
         TransferPhase::SavingVerifiedContent => "Saving verified content",
     }
 }
-fn download_group(state: &str) -> u8 {
+pub(super) fn download_group(state: &str) -> u8 {
     match state {
         "FetchingInventory" | "Downloading" | "Verifying" | "Committing" => 0,
         "Queued" => 1,
@@ -2046,6 +2331,9 @@ fn download_group(state: &str) -> u8 {
         "Completed" => 4,
         _ => 5,
     }
+}
+pub(super) fn launch_is_playable(status: &str) -> bool {
+    matches!(status, "Ready" | "PreparationRequired")
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum PrimaryAction {
