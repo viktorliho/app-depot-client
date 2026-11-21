@@ -548,6 +548,7 @@ fn main() -> eframe::Result {
             )
             .with_inner_size([1280.0, 820.0])
             .with_min_inner_size([760.0, 540.0])
+            .with_resizable(true)
             .with_decorations(!cfg!(target_os = "linux")),
         ..Default::default()
     };
@@ -575,7 +576,8 @@ mod tests {
     use super::*;
     use crate::views::{
         PrimaryAction, catalog_item_visible, download_group, format_time, friendly_job_state,
-        group_library_items, job_actions, launch_is_playable, primary_action, titlebar_command,
+        group_library_items, job_actions, launch_is_playable, primary_action, resize_direction,
+        titlebar_command,
     };
     fn job(state: &str) -> DownloadJob {
         DownloadJob {
@@ -718,5 +720,25 @@ mod tests {
             egui::ViewportCommand::Maximized(false)
         );
         assert_eq!(titlebar_command(2, false), egui::ViewportCommand::Close);
+    }
+
+    #[test]
+    fn resize_regions_cover_edges_and_corners_without_content() {
+        use egui::ResizeDirection as D;
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(900.0, 650.0));
+        for (pos, expected) in [
+            ([2.0, 2.0], Some(D::NorthWest)),
+            ([898.0, 2.0], Some(D::NorthEast)),
+            ([2.0, 648.0], Some(D::SouthWest)),
+            ([898.0, 648.0], Some(D::SouthEast)),
+            ([450.0, 2.0], Some(D::North)),
+            ([450.0, 648.0], Some(D::South)),
+            ([2.0, 325.0], Some(D::West)),
+            ([898.0, 325.0], Some(D::East)),
+            ([450.0, 325.0], None),
+            ([-1.0, 325.0], None),
+        ] {
+            assert_eq!(resize_direction(rect, egui::pos2(pos[0], pos[1])), expected);
+        }
     }
 }

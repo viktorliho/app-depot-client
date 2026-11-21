@@ -32,6 +32,8 @@ M2.3.2 refines the existing desktop views: My Library uses stable compact cards 
 
 M2.4 introduces the official Linux x86_64 AppImage distribution, pinned packaging inputs, CI and intentional tag-driven GitHub release workflow. The desktop embeds version, source revision and build kind, shows the selected App Depot icon in its titlebar and native window, and checks newer stable official releases independently of Server profiles. A supported user-owned AppImage can download a verified update and use a separate helper for atomic activation and rollback after a failed start. Development and unsupported installations cannot self-replace. See [distribution and update details](DISTRIBUTION.md).
 
+M2.4.1 fixes interactive resizing of the undecorated Linux window. Edge and corner detection uses the pointer's current viewport position, supplies a resize cursor and requests compositor-managed resizing through eframe/winit. The custom titlebar and minimum size remain. The v0.1.1 AppImage uses the same desktop identity and stable update channel as v0.1.0; no library or Server contract changes are involved.
+
 The original M1 objective was a shared core transport, declaration reader, transfer engine, local library, diagnostic CLI and egui desktop browser on Linux. All M1 network operations use existing Server read APIs. M1 did not include installation, runtime preparation or launch; M2.1 adds only the separately declared native portable launch method.
 
 Acceptance criteria:

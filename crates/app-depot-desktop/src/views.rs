@@ -273,64 +273,14 @@ impl Desktop {
         if ctx.input(|i| i.viewport().maximized.unwrap_or(false)) {
             return;
         }
-        use egui::ResizeDirection as D;
         let rect = ctx.content_rect();
-        let edge = 6.0;
-        let zones = [
-            (
-                D::North,
-                egui::Rect::from_min_max(rect.min, egui::pos2(rect.right(), rect.top() + edge)),
-            ),
-            (
-                D::South,
-                egui::Rect::from_min_max(egui::pos2(rect.left(), rect.bottom() - edge), rect.max),
-            ),
-            (
-                D::West,
-                egui::Rect::from_min_max(rect.min, egui::pos2(rect.left() + edge, rect.bottom())),
-            ),
-            (
-                D::East,
-                egui::Rect::from_min_max(egui::pos2(rect.right() - edge, rect.top()), rect.max),
-            ),
-            (
-                D::NorthWest,
-                egui::Rect::from_min_size(rect.min, egui::vec2(12.0, 12.0)),
-            ),
-            (
-                D::NorthEast,
-                egui::Rect::from_min_size(
-                    egui::pos2(rect.right() - 12.0, rect.top()),
-                    egui::vec2(12.0, 12.0),
-                ),
-            ),
-            (
-                D::SouthWest,
-                egui::Rect::from_min_size(
-                    egui::pos2(rect.left(), rect.bottom() - 12.0),
-                    egui::vec2(12.0, 12.0),
-                ),
-            ),
-            (
-                D::SouthEast,
-                egui::Rect::from_min_size(
-                    rect.max - egui::vec2(12.0, 12.0),
-                    egui::vec2(12.0, 12.0),
-                ),
-            ),
-        ];
-        for (index, (direction, zone)) in zones.into_iter().enumerate() {
-            egui::Area::new(egui::Id::unique(("window-resize", index)))
-                .order(egui::Order::Foreground)
-                .fixed_pos(zone.min)
-                .show(ctx, |ui| {
-                    let response = ui
-                        .allocate_exact_size(zone.size(), egui::Sense::click_and_drag())
-                        .1;
-                    if response.hovered() && ui.input(|i| i.pointer.primary_pressed()) {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::BeginResize(direction));
-                    }
-                });
+        let (pointer, pressed) =
+            ctx.input(|i| (i.pointer.hover_pos(), i.pointer.primary_pressed()));
+        if let Some(direction) = pointer.and_then(|pos| resize_direction(rect, pos)) {
+            ctx.set_cursor_icon(resize_cursor(direction));
+            if pressed {
+                ctx.send_viewport_cmd(egui::ViewportCommand::BeginResize(direction));
+            }
         }
     }
     fn header(&self, ui: &mut egui::Ui, title: &str, subtitle: &str) {
@@ -2739,6 +2689,48 @@ pub(super) fn primary_action(
         PrimaryAction::ChooseArtifact
     }
 }
+pub(super) fn resize_direction(rect: egui::Rect, pos: egui::Pos2) -> Option<egui::ResizeDirection> {
+    use egui::ResizeDirection as D;
+    if !rect.contains(pos) {
+        return None;
+    }
+    let left = pos.x - rect.left();
+    let right = rect.right() - pos.x;
+    let top = pos.y - rect.top();
+    let bottom = rect.bottom() - pos.y;
+    let corner = 18.0;
+    let edge = 10.0;
+    if left <= corner && top <= corner {
+        Some(D::NorthWest)
+    } else if right <= corner && top <= corner {
+        Some(D::NorthEast)
+    } else if left <= corner && bottom <= corner {
+        Some(D::SouthWest)
+    } else if right <= corner && bottom <= corner {
+        Some(D::SouthEast)
+    } else if top <= edge {
+        Some(D::North)
+    } else if bottom <= edge {
+        Some(D::South)
+    } else if left <= edge {
+        Some(D::West)
+    } else if right <= edge {
+        Some(D::East)
+    } else {
+        None
+    }
+}
+
+fn resize_cursor(direction: egui::ResizeDirection) -> egui::CursorIcon {
+    use egui::{CursorIcon as C, ResizeDirection as D};
+    match direction {
+        D::North | D::South => C::ResizeVertical,
+        D::East | D::West => C::ResizeHorizontal,
+        D::NorthEast | D::SouthWest => C::ResizeNeSw,
+        D::NorthWest | D::SouthEast => C::ResizeNwSe,
+    }
+}
+
 pub(super) fn titlebar_command(index: usize, maximized: bool) -> egui::ViewportCommand {
     match index {
         0 => egui::ViewportCommand::Minimized(true),
