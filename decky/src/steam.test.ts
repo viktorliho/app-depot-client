@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { reconcile, steamId } from './steam.ts';
+import { artwork, reconcile, steamId } from './steam.ts';
 import type { Bridge, CatalogApp, Plan } from './steam.ts';
 
 const app = (id: string, name: string): CatalogApp =>
@@ -143,4 +143,37 @@ test('sets fields explicitly after Steam derives the name from the executable', 
   assert.deepEqual(await reconcile(bridge, steam, () => '123', 'profile', [app('app','Fixture App')], wait), []);
   assert.equal(created, 1);
   assert.equal(applied, 1);
+});
+
+test('uninstall grid refresh only changes the existing AppID and leaves other roles alone', async () => {
+  const appid = 0x80000099;
+  const calls: [number, number][] = [];
+  const bridge: Bridge = {
+    async shortcut() { throw new Error('shortcut mutation'); },
+    async acknowledge() { throw new Error('shortcut creation'); },
+    async binding() { return appid; },
+    async artwork(_account, _profile, _app, role, downloaded, observed) {
+      assert.equal(downloaded, false);
+      assert.equal(observed?.appid, appid);
+      assert.match(role, /^steam\.grid\./);
+      return { appid, png: 'fixture' };
+    },
+  };
+  const steam = {
+    async AddShortcut() { throw new Error('shortcut creation'); },
+    RegisterForAppDetails(_id: number, callback: (details: {
+      unAppID: number; strDisplayName: string; strShortcutExe: string; strShortcutLaunchOptions: string; strShortcutStartDir: string;
+    }) => void) {
+      callback({ unAppID: appid, strDisplayName: 'App', strShortcutExe: 'play',
+        strShortcutLaunchOptions: 'original', strShortcutStartDir: 'fixture' });
+      return { unregister() {} };
+    },
+    async SetCustomArtworkForApp(id: number, _png: string, _format: string, role: number) { calls.push([id, role]); },
+  };
+  const grids = ['steam.grid.vertical', 'steam.grid.horizontal'] as const;
+  assert.deepEqual(await artwork(bridge, steam, () => '123', 'profile', app('a', 'App'), '123', grids), []);
+  assert.deepEqual(calls, [[appid, 0], [appid, 3]]);
+  const unavailable = await artwork(bridge, { RegisterForAppDetails: steam.RegisterForAppDetails },
+    () => '123', 'profile', app('a', 'App'), '123', grids);
+  assert.equal(unavailable.length, 2);
 });

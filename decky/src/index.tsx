@@ -33,6 +33,9 @@ const messages: Record<string, string> = {
   secret_service_unavailable: 'Secret Service is unavailable or the saved credential is missing. Unlock the user keyring and try again.',
   saved_credentials: 'This Server already has a saved token. Synchronize its existing profile to keep that configuration.',
   discovery_unavailable: 'LAN discovery is unavailable. Enter the Server address manually.',
+  uninstall_busy: 'Close the game and pause or cancel active downloads before uninstalling.',
+  uninstall_incomplete: 'Uninstall could not finish safely. Reopen Installed to retry recovery.',
+  uninstall_stale: 'Local content changed. Refresh Installed and confirm the current selection.',
   update_busy: 'An update check or verification is already running.',
   update_rate_limited: 'GitHub is limiting release checks. Try again later.',
   update_check_failed: 'Could not check official Decky releases. Try again.',
@@ -62,6 +65,13 @@ const discover = rpcMethod<[], Candidate[]>('discover');
 const test = rpcMethod<[string, string, boolean], Probe>('test');
 const configure = rpcMethod<[string, string, boolean], string>('configure');
 const catalog = rpcMethod<[string, boolean], CatalogApp[]>('catalog');
+type LocalApp = { id: string; name: string; profile: string; profileName: string; origin: string;
+  revision: string; states: string[]; runtimeBytes: number; downloadBytes: number; blocked: boolean };
+const localApps = rpcMethod<[], LocalApp[]>('installed');
+const uninstall = rpcMethod<[string, string, string], { removed: boolean; cleanupComplete: boolean }>('uninstall');
+const gridStates = rpcMethod<[string], { profile: string; app: string; modes: boolean[]; pending: boolean }[]>('grid_states');
+const finishGrids = rpcMethod<[string, string, string], void>('finish_grids');
+const gridRoles = ['steam.grid.vertical', 'steam.grid.horizontal'] as const;
 const rpc: Bridge = {
   shortcut: rpcMethod('shortcut'),
   acknowledge: rpcMethod('acknowledge'),
@@ -90,10 +100,30 @@ async function observeInstallations() {
   if (work) return;
   work = (async () => {
     const id = account();
+    const states = await gridStates(id);
     for (const profile of (await statusRpc()).profiles) {
-      for (const row of await catalog(profile.id, false)) {
+      const rows = await catalog(profile.id, false);
+      const bindings = states.filter(item => item.profile === profile.id);
+      const pendingForProfile = bindings.filter(item => item.pending);
+      for (const { app } of pendingForProfile) {
+        const row = rows.find(item => item.id === app);
+        if (row?.downloaded || row?.installations.some(item => ['Preparing', 'Removing'].includes(item.state))) continue;
+        const problems = await artwork(rpc, steam(), account, profile.id,
+          { id: app, name: row?.name ?? 'App Depot', downloaded: false }, id, gridRoles);
+        if (problems.length) lastOperations = 'Grid artwork update pending · ' + problems.join('\n');
+        else {
+          if (account() !== id) throw new Error('Steam account changed during artwork update');
+          await finishGrids(id, profile.id, app);
+          installed.set(`${id}/${profile.id}/${app}`, false);
+        }
+      }
+      for (const row of rows) {
+        if (pendingForProfile.some(item => item.app === row.id) && !row.downloaded) continue;
         const key = `${id}/${profile.id}/${row.id}`;
-        if (row.stale || !installed.has(key) || installed.get(key) === row.downloaded) continue;
+        const modeChanged = installed.has(key)
+          ? installed.get(key) !== row.downloaded
+          : bindings.find(item => item.app === row.id)?.modes.some(mode => mode !== row.downloaded);
+        if (row.stale || !modeChanged) continue;
         const problems = await artwork(rpc, steam(), account, profile.id, row, id);
         if (problems.length) lastOperations = problems.slice(0, 8).join('\n');
         else installed.set(key, row.downloaded);
@@ -156,7 +186,10 @@ function Updates({ version }: { version?: string }) {
 
 function AppDepot() {
   const [status, setStatus] = useState<Status>();
-  const [rows, setRows] = useState<CatalogApp[]>([]);
+  const [rows, setRows] = useState<LocalApp[]>([]);
+  const [selection, setSelection] = useState<LocalApp>();
+  const [removeBusy, setRemoveBusy] = useState(false);
+  const [removeMessage, setRemoveMessage] = useState('');
   const [origin, setOrigin] = useState('');
   const [token, setToken] = useState('');
   const [useToken, setUseToken] = useState(false);
@@ -175,8 +208,7 @@ function AppDepot() {
   async function update() {
     const info = await statusRpc();
     setStatus(info);
-    const groups = await Promise.all(info.profiles.map(profile => catalog(profile.id, false)));
-    setRows(groups.flat());
+    setRows(await localApps());
   }
 
   useEffect(() => {
@@ -185,6 +217,24 @@ function AppDepot() {
     const timer = setInterval(check, 30_000);
     return () => clearInterval(timer);
   }, []);
+
+  async function confirmRemoval(app: LocalApp) {
+    if (removeBusy) return;
+    setRemoveBusy(true);
+    setRemoveMessage('Uninstalling local content…');
+    try {
+      const result = await uninstall(app.profile, app.id, app.revision);
+      const cleanup = result.cleanupComplete ? '' : ' Some unused storage could not be reclaimed safely.';
+      setRemoveMessage(`${app.name} was uninstalled. Steam Play will prepare it again. Grid artwork will update when available.${cleanup}`);
+      void observeInstallations().catch(error => { lastOperations = String(error); });
+    } catch (error) {
+      setRemoveMessage(String(error));
+    } finally {
+      setSelection(undefined);
+      try { await update(); } catch (error) { setMessage(String(error)); }
+      setRemoveBusy(false);
+    }
+  }
 
   async function search() {
     setSearching(true);
@@ -277,10 +327,23 @@ function AppDepot() {
       {message && <PanelSectionRow><div role="status" style={{ whiteSpace: 'pre-wrap' }}>{message}</div></PanelSectionRow>}
     </PanelSection>
     <PanelSection title="Installed">
-      {rows.filter(row => row.installations.length).map(row => <PanelSectionRow key={row.installations[0].id}>
-        {row.name} · {row.installations.map(item => item.state).join(', ')}
+      {selection ? <>
+        <PanelSectionRow><div>
+          Uninstall {selection.name} from {selection.profileName} ({selection.origin})?
+          Local app files, downloads, saves, configuration and modifications in managed folders may be permanently deleted.
+          Shared files still used by other apps, external data and the Steam shortcut remain.
+        </div></PanelSectionRow>
+        <PanelSectionRow><ButtonItem disabled={removeBusy} onClick={() => confirmRemoval(selection)}>Confirm uninstall</ButtonItem></PanelSectionRow>
+        <PanelSectionRow><ButtonItem disabled={removeBusy} onClick={() => setSelection(undefined)}>Cancel</ButtonItem></PanelSectionRow>
+      </> : rows.map(row => <PanelSectionRow key={`${row.profile}/${row.id}`}>
+        <ButtonItem disabled={removeBusy || row.blocked} onClick={() => setSelection(row)}>
+          <div>Uninstall {row.name} · {row.profileName} ({row.origin})</div>
+          <div>{row.states.join(', ') || 'Downloaded'} · {((row.runtimeBytes + row.downloadBytes) / 1048576).toFixed(1)} MiB logical{row.blocked ? ' · Active operation' : ''}</div>
+        </ButtonItem>
       </PanelSectionRow>)}
-      {!rows.some(row => row.installations.length) && <PanelSectionRow>No local installations</PanelSectionRow>}
+      {!rows.length && <PanelSectionRow>No local installations</PanelSectionRow>}
+      {rows.length > 0 && <PanelSectionRow>Logical storage includes shared content. Actual freed space may be lower.</PanelSectionRow>}
+      {removeMessage && <PanelSectionRow><div role="status">{removeMessage}</div></PanelSectionRow>}
     </PanelSection>
     <PanelSection title="Settings">
       <PanelSectionRow>{status?.library}</PanelSectionRow>

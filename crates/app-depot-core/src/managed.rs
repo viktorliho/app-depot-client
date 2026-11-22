@@ -395,6 +395,33 @@ fn safe_id(id: &str) -> Result<(), LibraryError> {
 }
 
 #[cfg(target_os = "linux")]
+fn local_artifact_digest(id: &str) -> Result<&str, LibraryError> {
+    let digest = id
+        .strip_prefix("adfile:sha256:")
+        .or_else(|| id.strip_prefix("adtree:v1:sha256:"))
+        .ok_or_else(|| invalid("invalid Artifact identity"))?;
+    if digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    {
+        return Err(invalid("invalid Artifact digest"));
+    }
+    Ok(digest)
+}
+
+#[cfg(target_os = "linux")]
+type UninstallTarget = (String, String, String, Option<String>);
+#[cfg(target_os = "linux")]
+pub struct LocalUninstall {
+    pub revision: String,
+    pub states: Vec<String>,
+    pub runtime_bytes: u64,
+    pub download_bytes: u64,
+    pub blocked: bool,
+}
+
+#[cfg(target_os = "linux")]
 fn copy_independent(
     source: &Path,
     destination: &mut File,
@@ -450,6 +477,205 @@ impl Library {
             artwork_logical_bytes: directory_logical_bytes(&root.join("artwork"))?,
         })
     }
+    #[cfg(target_os = "linux")]
+    fn uninstall_targets(
+        &self,
+        profile: &ServerProfileId,
+        app: &str,
+    ) -> Result<Vec<UninstallTarget>, LibraryError> {
+        let mut stmt = self.conn.prepare(
+            "WITH owned AS (
+                 SELECT association_id,artifact_id,release_id FROM installations
+                    WHERE profile_id=?1 AND app_id=?2
+                 UNION
+                 SELECT j.association_id,j.artifact_id,r.id FROM download_jobs j
+                    JOIN associations a ON (a.profile_id,a.id)=(j.profile_id,j.association_id)
+                    JOIN releases r ON (r.profile_id,r.id)=(a.profile_id,a.release_id)
+                    WHERE j.profile_id=?1 AND r.app_id=?2
+                 UNION
+                 SELECT v.association_id,v.artifact_id,r.id FROM verified_content v
+                    JOIN associations a ON (a.profile_id,a.id)=(v.profile_id,v.association_id)
+                    JOIN releases r ON (r.profile_id,r.id)=(a.profile_id,a.release_id)
+                    WHERE v.profile_id=?1 AND r.app_id=?2
+             ) SELECT o.association_id,o.artifact_id,o.release_id,i.id FROM owned o
+                 LEFT JOIN installations i ON (i.profile_id,i.association_id,i.artifact_id)=(?1,o.association_id,o.artifact_id)
+                 ORDER BY o.association_id,o.artifact_id")?;
+        Ok(stmt
+            .query_map(params![profile.0, app], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })?
+            .collect::<Result<_, _>>()?)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn inspect_uninstall(
+        &self,
+        profile: &ServerProfileId,
+        targets: &[UninstallTarget],
+    ) -> Result<Option<LocalUninstall>, LibraryError> {
+        let mut revision = Sha256::new();
+        let mut states = BTreeSet::new();
+        let mut runtime_bytes = 0u64;
+        let mut download_bytes = 0u64;
+        let mut blocked = false;
+        let mut local = false;
+        for (association, artifact, release, id) in targets {
+            revision.update(serde_json::to_vec(&(association, artifact, release, id))?);
+            if let Some(id) = id {
+                let item = self.installation(id)?;
+                let (updated, pid, start): (i64, Option<i64>, Option<String>) =
+                    self.conn.query_row(
+                        "SELECT updated_at,process_id,process_start FROM installations WHERE id=?1",
+                        [id],
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                    )?;
+                revision.update(serde_json::to_vec(&(&item.state, updated, pid, &start))?);
+                blocked |=
+                    item.state == "Preparing" || runtime_busy(&item.path, pid, start.as_deref())?;
+                if item.state != "Removed" || owned_logical_bytes(&item.userdata)? > 0 {
+                    local = true;
+                    states.insert(item.state);
+                }
+                runtime_bytes = runtime_bytes
+                    .saturating_add(owned_logical_bytes(&item.path)?)
+                    .saturating_add(owned_logical_bytes(&item.userdata)?);
+            }
+            let mut jobs = self.conn.prepare("SELECT id,state,COALESCE(expected_size,0),COALESCE(updated_at,created_at) FROM download_jobs WHERE profile_id=?1 AND association_id=?2 AND artifact_id=?3 ORDER BY id")?;
+            for job in jobs.query_map(params![profile.0, association, artifact], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, i64>(3)?,
+                ))
+            })? {
+                let job = job?;
+                revision.update(serde_json::to_vec(&job)?);
+                blocked |= matches!(
+                    job.1.as_str(),
+                    "Queued" | "FetchingInventory" | "Downloading" | "Verifying" | "Committing"
+                );
+            }
+            let verified: i64 = self.conn.query_row(
+                "SELECT COALESCE((SELECT MAX(expected_size) FROM download_jobs WHERE profile_id=?1 AND association_id=?2 AND artifact_id=?3 AND state='Completed'),0)
+                    FROM verified_content WHERE profile_id=?1 AND association_id=?2 AND artifact_id=?3 LIMIT 1",
+                params![profile.0,association,artifact], |r| r.get(0)).optional()?.unwrap_or(-1);
+            revision.update(verified.to_le_bytes());
+            if let Ok(size) = u64::try_from(verified) {
+                local = true;
+                download_bytes = download_bytes.saturating_add(size);
+            }
+        }
+        Ok(local.then(|| LocalUninstall {
+            revision: format!("{:x}", revision.finalize()),
+            states: states.into_iter().collect(),
+            runtime_bytes,
+            download_bytes,
+            blocked,
+        }))
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn local_uninstall_preview(
+        &self,
+        profile: &ServerProfileId,
+        app: &str,
+    ) -> Result<Option<LocalUninstall>, LibraryError> {
+        let mut preview =
+            self.inspect_uninstall(profile, &self.uninstall_targets(profile, app)?)?;
+        if let Some(preview) = &mut preview {
+            for lock in [self.lifecycle_lock(), self.lock_download_slot()] {
+                match lock {
+                    Ok(_) => {}
+                    Err(LibraryError::Invalid(message))
+                        if message == "another library lifecycle operation is active"
+                            || message == "another application download holds the library slot" =>
+                    {
+                        preview.blocked = true
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        Ok(preview)
+    }
+
+    /// Journal every selected Association before the first destructive operation.
+    #[cfg(target_os = "linux")]
+    pub fn uninstall_local_app(
+        &mut self,
+        profile: &ServerProfileId,
+        app: &str,
+        revision: &str,
+    ) -> Result<bool, LibraryError> {
+        let _lifecycle = self.lifecycle_lock()?;
+        let _download = self.lock_download_slot()?;
+        let ids = self.journal_uninstall(profile, app, revision)?;
+        for id in ids {
+            self.remove_installation_locked(&id, true, false, &mut |_| {})?;
+        }
+        Ok(self.collect_unreferenced_objects().is_ok())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn journal_uninstall(
+        &self,
+        profile: &ServerProfileId,
+        app: &str,
+        revision: &str,
+    ) -> Result<BTreeSet<String>, LibraryError> {
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        let targets = self.uninstall_targets(profile, app)?;
+        let preview = self
+            .inspect_uninstall(profile, &targets)?
+            .ok_or_else(|| invalid("local uninstall selection changed"))?;
+        if preview.blocked {
+            return Err(invalid("local uninstall blocked by an active operation"));
+        }
+        if preview.revision != revision {
+            return Err(invalid("local uninstall selection changed"));
+        }
+        self.conn.execute_batch(
+            "CREATE TRIGGER IF NOT EXISTS block_uninstall_enqueue BEFORE INSERT ON download_jobs
+             WHEN EXISTS (SELECT 1 FROM installations i WHERE i.profile_id=NEW.profile_id
+               AND i.association_id=NEW.association_id AND i.state='Removing' AND i.remove_complete=1)
+             BEGIN SELECT RAISE(ABORT,'Association is being uninstalled'); END;
+             CREATE TRIGGER IF NOT EXISTS block_uninstall_requeue BEFORE UPDATE OF state ON download_jobs
+             WHEN NEW.state='Queued' AND EXISTS (SELECT 1 FROM installations i WHERE i.profile_id=NEW.profile_id
+               AND i.association_id=NEW.association_id AND i.state='Removing' AND i.remove_complete=1)
+             BEGIN SELECT RAISE(ABORT,'Association is being uninstalled'); END;",
+        )?;
+        let mut ids = BTreeSet::new();
+        for (association, artifact, release, id) in targets {
+            safe_id(&profile.0)?;
+            safe_id(&association)?;
+            local_artifact_digest(&artifact)?;
+            let owner: String = self.conn.query_row(
+                "SELECT r.app_id FROM associations a JOIN releases r ON (a.profile_id,a.release_id)=(r.profile_id,r.id) WHERE a.profile_id=?1 AND a.id=?2",
+                params![profile.0,association], |row| row.get(0))?;
+            if owner != app {
+                return Err(invalid("local uninstall association owner changed"));
+            }
+            let id = if let Some(id) = id {
+                if self.installation(&id)?.app_id != app {
+                    return Err(invalid("local uninstall association owner changed"));
+                }
+                self.conn.execute("UPDATE installations SET state='Removing',remove_complete=1,updated_at=?2 WHERE id=?1",params![id,now()?])?;
+                id
+            } else {
+                let id = Uuid::new_v4().to_string();
+                self.conn.execute("INSERT INTO installations(id,profile_id,app_id,release_id,association_id,artifact_id,state,created_at,updated_at,remove_complete) VALUES (?1,?2,?3,?4,?5,?6,'Removing',?7,?7,1)", params![id,profile.0,app,release,association,artifact,now()?])?;
+                id
+            };
+            ids.insert(id);
+        }
+        tx.commit()?;
+        Ok(ids)
+    }
+
     /// Remove an explicitly selected local Association reference, including a data-only
     /// download with no portable runtime. The existing installation row is also the
     /// durable removal journal; no Server resource is changed.
@@ -812,6 +1038,18 @@ impl Library {
         observer: &mut dyn FnMut(&str),
     ) -> Result<(), LibraryError> {
         let _lock = self.lifecycle_lock()?;
+        let _download = complete.then(|| self.lock_download_slot()).transpose()?;
+        self.remove_installation_locked(id, complete, complete, observer)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn remove_installation_locked(
+        &mut self,
+        id: &str,
+        complete: bool,
+        collect: bool,
+        observer: &mut dyn FnMut(&str),
+    ) -> Result<(), LibraryError> {
         observer("Checking active processes");
         let item = self.installation(id)?;
         let tracked: (Option<i64>, Option<String>) = self.conn.query_row(
@@ -863,14 +1101,7 @@ impl Library {
             // Remove only paths derived from validated local identity components.
             safe_id(&item.profile_id.0)?;
             safe_id(&item.association_id)?;
-            let digest = item
-                .artifact_id
-                .rsplit(':')
-                .next()
-                .ok_or_else(|| invalid("invalid Artifact identity"))?;
-            if digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit()) {
-                return Err(invalid("invalid Artifact digest"));
-            }
+            let digest = local_artifact_digest(&item.artifact_id)?;
             let association_dir = self
                 .paths
                 .content
@@ -917,8 +1148,10 @@ impl Library {
                 [id],
             )?;
             tx.commit()?;
-            observer("Reclaiming unreferenced content");
-            self.collect_unreferenced_objects()?;
+            if collect {
+                observer("Reclaiming unreferenced content");
+                self.collect_unreferenced_objects()?;
+            }
         } else {
             observer("Finalizing removal");
             self.conn.execute("UPDATE installations SET state='Removed',updated_at=?2,last_error=NULL WHERE id=?1 AND state='Removing'",params![id,now()?])?;
@@ -1591,8 +1824,49 @@ mod tests {
                 .unwrap()
                 .success()
         );
-        lib.remove_installation(&installation.id, true).unwrap();
+        fs::write(installation.userdata.join("owned-save"), b"remove").unwrap();
+        let external = temp.path().join("external-save");
+        fs::write(&external, b"keep").unwrap();
+        std::os::unix::fs::symlink(&external, installation.path.join("external-save")).unwrap();
+        let preview = lib
+            .local_uninstall_preview(&profile, "app")
+            .unwrap()
+            .unwrap();
+        assert_eq!(preview.states, ["Ready"]);
+        assert!(preview.runtime_bytes > bytes.len() as u64);
+        assert!(lib.uninstall_local_app(&profile, "app", "stale").is_err());
+        let _slot = lib.lock_download_slot().unwrap();
+        assert!(
+            lib.local_uninstall_preview(&profile, "app")
+                .unwrap()
+                .unwrap()
+                .blocked
+        );
+        assert!(
+            lib.uninstall_local_app(&profile, "app", &preview.revision)
+                .is_err()
+        );
+        drop(_slot);
+        assert!(
+            lib.uninstall_local_app(&profile, "app", &preview.revision)
+                .unwrap()
+        );
         assert!(!installation.path.exists());
+        assert!(!installation.userdata.exists());
+        assert_eq!(fs::read(external).unwrap(), b"keep");
+        assert!(
+            lib.local_uninstall_preview(&profile, "app")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            lib.uninstall_local_app(&profile, "app", &preview.revision)
+                .is_err()
+        );
+        assert_eq!(
+            lib.launch_candidates(&profile, "release").unwrap()[0].status,
+            "NotDownloaded"
+        );
     }
 
     #[test]
@@ -1915,8 +2189,53 @@ mod tests {
             profiles.push((profile, association, material));
         }
         let (first, association, path) = &profiles[0];
-        lib.remove_local_artifact(first, association).unwrap();
+        let extra = Uuid::new_v4().to_string();
+        let extra_job = Uuid::new_v4().to_string();
+        lib.conn.execute("INSERT INTO releases(profile_id,id,app_id,metadata_json,last_seen) VALUES (?1,'release-2','app',?2,0)",params![first.0,r#"{"id":"release-2","appId":"app","state":"Published"}"#]).unwrap();
+        lib.conn.execute("INSERT INTO associations(profile_id,id,release_id,artifact_id,metadata_json,last_seen) VALUES (?1,?2,'release-2',?3,?4,0)",params![first.0,extra,artifact,serde_json::json!({"id":extra,"releaseId":"release-2","artifactId":artifact}).to_string()]).unwrap();
+        lib.conn.execute("INSERT INTO download_jobs(id,profile_id,artifact_id,state,created_at,association_id,expected_size,updated_at) VALUES (?1,?2,?3,'Completed',0,?4,12,0)",params![extra_job,first.0,artifact,extra]).unwrap();
+        lib.conn.execute("INSERT INTO verified_content(profile_id,artifact_id,local_ref,verified_at,association_id) VALUES (?1,?2,'extra-file',0,?3)",params![first.0,artifact,extra]).unwrap();
+        lib.conn
+            .execute(
+                "UPDATE download_jobs SET state='Queued' WHERE profile_id=?1 AND association_id=?2",
+                params![first.0, association],
+            )
+            .unwrap();
+        let busy = lib.local_uninstall_preview(first, "app").unwrap().unwrap();
+        assert!(busy.blocked);
+        assert!(
+            lib.uninstall_local_app(first, "app", &busy.revision)
+                .is_err()
+        );
+        assert!(path.exists());
+        lib.conn.execute("UPDATE download_jobs SET state='Completed' WHERE profile_id=?1 AND association_id=?2", params![first.0,association]).unwrap();
+        let preview = lib.local_uninstall_preview(first, "app").unwrap().unwrap();
+        assert_eq!(preview.download_bytes, 24);
+        // Reopen after the durable batch commit, before any filesystem work.
+        {
+            let _lifecycle = lib.lifecycle_lock().unwrap();
+            let _download = lib.lock_download_slot().unwrap();
+            assert_eq!(
+                lib.journal_uninstall(first, "app", &preview.revision)
+                    .unwrap()
+                    .len(),
+                2
+            );
+            assert!(
+                lib.conn
+                    .execute(
+                        "UPDATE download_jobs SET state='Queued' WHERE id=?1",
+                        [&extra_job]
+                    )
+                    .is_err()
+            );
+        }
+        assert!(path.exists());
+        let paths = lib.paths.clone();
+        drop(lib);
+        let mut lib = Library::open(paths).unwrap();
         assert!(!path.exists());
+        assert!(lib.local_uninstall_preview(first, "app").unwrap().is_none());
         assert!(object.exists());
         let (second, association, path) = &profiles[1];
         assert!(path.exists());

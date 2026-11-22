@@ -1,6 +1,7 @@
 """Exercise the First Play CLI against a fresh, real loopback Dev Server."""
 
 import argparse
+import base64
 import asyncio
 import hashlib
 import http.cookiejar
@@ -215,6 +216,9 @@ def verify_decky(args, root, origin, token, app, server, opener, server_origin):
             assert any(row["id"] == app and not row["downloaded"] for row in rows)
             media = await backend._rust("decky", "artwork", profile, app, "steam.grid.vertical", "muted", "")
             assert media["revision"].endswith(":true:png1")
+            color = await backend._rust("decky", "artwork", profile, app, "steam.grid.vertical", "color", "")
+            offline_muted = await backend._rust("decky", "mute-grid", image=base64.b64decode(color["png"], validate=True))
+            assert offline_muted["png"] == media["png"]
             unchanged = await backend._rust("decky", "artwork", profile, app, "steam.grid.vertical", "muted", media["revision"])
             assert unchanged == {"revision": media["revision"]}
             return profile
@@ -280,6 +284,40 @@ def verify_decky(args, root, origin, token, app, server, opener, server_origin):
     guest_command = [args.client, "decky", "play", guest_profile, app]
     first = subprocess.run(guest_command, check=True, timeout=45, env=guest_env, capture_output=True, text=True)
     assert "m30 fixture executed" in first.stdout
+    os.environ["DECKY_USER_HOME"] = str(plugin_home)
+    os.environ["XDG_DATA_HOME"] = str(plugin_home / "data")
+
+    async def uninstall_backend(expected=None):
+        backend = module.Plugin()
+        await backend._main()
+        try:
+            items = [row for row in await backend.installed() if row["profile"] == profile and row["id"] == app]
+            assert len(items) == 1 and items[0]["runtimeBytes"] > 0 and items[0]["downloadBytes"] > 0
+            item = items[0]
+            if expected:
+                assert item["blocked"]
+                assert await backend.request("uninstall", profile, app, item["revision"]) == {
+                    "ok": False, "code": expected,
+                }
+                return
+            assert await backend.request("uninstall", profile, app, "0" * 64) == {
+                "ok": False, "code": "uninstall_stale",
+            }
+            assert (await backend.request("uninstall", profile, app, item["revision"]))["value"]["removed"]
+            assert await backend.request("uninstall", profile, app, item["revision"]) == {
+                "ok": False, "code": "uninstall_stale",
+            }
+            assert not await backend.installed()
+            rows = await backend.catalog(profile, False)
+            assert any(row["id"] == app and not row["downloaded"] and not row["installations"] for row in rows)
+            assert (await backend.status())["profiles"][0]["authenticated"]
+        finally:
+            await backend._unload()
+
+    asyncio.run(uninstall_backend())
+    again = subprocess.run(command, check=True, timeout=45, env=env, capture_output=True, text=True)
+    assert "m30 fixture executed" in again.stdout
+    print("PASS stale selection, complete local removal, repeat removal refusal and First Play reacquisition")
     server.terminate()
     server.wait(timeout=20)
     env.pop("DISPLAY", None)
@@ -312,11 +350,15 @@ def verify_decky(args, root, origin, token, app, server, opener, server_origin):
             ready, _, _ = select.select([wrapper.stdout], [], [], 5)
             assert ready and wrapper.stdout.readline().strip() == "signal fixture started"
             assert wrapper.poll() is None
+            asyncio.run(uninstall_backend("uninstall_busy"))
             wrapper.terminate()
             assert wrapper.wait(timeout=5) == 143
         finally:
             if wrapper.poll() is None:
                 wrapper.kill()
+    asyncio.run(uninstall_backend())
+    assert not list((plugin_home / ".appdepot/apps").iterdir())
+    print("PASS offline complete removal and active game refusal")
     print("PASS Decky backend configure/reload, Secret Service, X11 First Play, "
           "display-free offline replay, child exit status and SIGTERM supervision")
 

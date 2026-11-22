@@ -162,7 +162,7 @@ The installable Decky release candidate and hardware acceptance procedure are do
 
 Release discovery and temporary package verification are Decky platform operations. The unprivileged backend does not replace root-owned plugin files. Safe Gaming Mode activation requires a privileged boundary that retains the existing version until the new plugin acknowledges health and rolls back on interruption. The Desktop installer remains the activation path. Steam shortcut installation state remains independent of App Depot runtime readiness. All SteamOS installation-tab integrations are deferred. See [SteamOS Decky](STEAMOS_DECKY.md#updates--about).
 
-Local uninstall is the next functional milestone and can proceed before Gaming Mode update activation is available. The Decky Installed view will call the shared lifecycle operations and keep Steam identity separate from local content ownership. Runtime removal, release of verified-content references and shared-object collection remain distinct. See [SteamOS uninstall scope](STEAMOS_DECKY.md#m33-local-application-uninstall).
+Decky Installed invokes shared local lifecycle operations and keeps Steam identity separate from local content ownership. Complete uninstall includes application-owned local data and requires explicit confirmation. Runtime removal, release of verified-content references and shared-object collection remain distinct. See [SteamOS uninstall scope](STEAMOS_DECKY.md#m33-local-application-uninstall).
 
 ## UI read model
 

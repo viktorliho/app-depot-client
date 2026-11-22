@@ -118,6 +118,17 @@ pub(super) fn error_code(error: &CliError) -> &'static str {
             }
             ApiError::Http { .. } => "server_error",
         },
+        CliError::Library(LibraryError::Invalid(message)) => match message.as_str() {
+            "local uninstall selection changed" | "local uninstall association owner changed" => {
+                "uninstall_stale"
+            }
+            "local uninstall blocked by an active operation"
+            | "another library lifecycle operation is active"
+            | "another application download holds the library slot"
+            | "application is running from this managed runtime"
+            | "a download is active for this Association" => "uninstall_busy",
+            _ => "internal",
+        },
         _ => "internal",
     }
 }
@@ -209,6 +220,17 @@ fn artwork(
         return Ok(json!({"revision":revision}));
     }
     let bytes = client.artwork_bytes(item)?;
+    let png = convert_grid(bytes, muted, item.width, item.height, true)?;
+    Ok(json!({"revision":revision,"png":STANDARD.encode(png)}))
+}
+
+fn convert_grid(
+    bytes: Vec<u8>,
+    muted: bool,
+    width: u32,
+    height: u32,
+    exact: bool,
+) -> Result<Vec<u8>, CliError> {
     let image_error =
         |error: image::ImageError| ApiError::Protocol(format!("Artwork decode: {error}"));
     let mut reader = image::ImageReader::new(Cursor::new(bytes))
@@ -216,11 +238,11 @@ fn artwork(
         .map_err(LibraryError::Io)?;
     let mut limits = image::Limits::default();
     limits.max_alloc = Some(72 * 1024 * 1024);
-    limits.max_image_width = Some(item.width);
-    limits.max_image_height = Some(item.height);
+    limits.max_image_width = Some(width);
+    limits.max_image_height = Some(height);
     reader.limits(limits);
     let mut rgba = reader.decode().map_err(image_error)?.into_rgba8();
-    if rgba.dimensions() != (item.width, item.height) {
+    if exact && rgba.dimensions() != (width, height) {
         return Err(ApiError::Protocol("Artwork dimensions changed".into()).into());
     }
     if muted {
@@ -238,7 +260,7 @@ fn artwork(
     if png.get_ref().len() > 16 * 1024 * 1024 {
         return Err(ApiError::Protocol("Converted artwork exceeds size limit".into()).into());
     }
-    Ok(json!({"revision":revision,"png":STANDARD.encode(png.into_inner())}))
+    Ok(png.into_inner())
 }
 
 pub(super) fn run_decky(options: &Options) -> Result<(), CliError> {
@@ -246,6 +268,24 @@ pub(super) fn run_decky(options: &Options) -> Result<(), CliError> {
         let results = app_depot_core::discovery::discover(Duration::from_secs(3))
             .map_err(|_| CliError::Decky("discovery_unavailable"))?;
         return Ok(print_json(&results)?);
+    }
+    if options
+        .positional
+        .get(1)
+        .is_some_and(|action| action == "mute-grid")
+        && options.positional.len() == 2
+    {
+        let mut bytes = Vec::new();
+        io::stdin()
+            .take(16 * 1024 * 1024 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(LibraryError::Io)?;
+        if bytes.len() > 16 * 1024 * 1024 || !bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+            return Err(CliError::Decky("invalid_artwork"));
+        }
+        return Ok(print_json(
+            &json!({"png":STANDARD.encode(convert_grid(bytes, true, 8192, 8192, false)?)}),
+        )?);
     }
     let mut library = open_library(options)?;
     let args = &options.positional;
@@ -256,6 +296,43 @@ pub(super) fn run_decky(options: &Options) -> Result<(), CliError> {
             "usage": library.storage_usage()?,
             "version": env!("CARGO_PKG_VERSION"),
         }))?,
+        [_, action] if action == "installed" => {
+            let mut rows = Vec::new();
+            for profile in library.profiles(false)? {
+                for app in library.cached_apps(&profile.id)? {
+                    let app = app.value;
+                    if let Some(item) = library.local_uninstall_preview(&profile.id, &app.id)? {
+                        rows.push(json!({"id":app.id,"name":app.name,"profile":profile.id,
+                            "profileName":profile.name,"origin":profile.origin,"revision":item.revision,
+                            "states":item.states,"runtimeBytes":item.runtime_bytes,
+                            "downloadBytes":item.download_bytes,"blocked":item.blocked}));
+                    }
+                }
+            }
+            print_json(&rows)?;
+        }
+        [_, action, profile, app, revision] if action == "uninstall" => {
+            let profile = ServerProfileId(profile.clone());
+            library.profile(&profile)?;
+            if !library
+                .cached_apps(&profile)?
+                .iter()
+                .any(|row| row.value.id == *app)
+            {
+                return Err(CliError::Decky("uninstall_stale"));
+            }
+            let reclaimed = library
+                .uninstall_local_app(&profile, app, revision)
+                .map_err(|error| {
+                    let error = CliError::from(error);
+                    if error_code(&error) == "internal" {
+                        CliError::Decky("uninstall_incomplete")
+                    } else {
+                        error
+                    }
+                })?;
+            print_json(&json!({"removed":true,"cleanupComplete":reclaimed}))?;
+        }
         [_, action, origin] if action == "test" => {
             let mut input = String::new();
             io::stdin()

@@ -147,7 +147,8 @@ export async function reconcile(
 
 export async function artwork(
   bridge: Bridge, steam: SteamMethods, currentAccount: () => string,
-  profile: string, row: CatalogApp, account: string,
+  profile: string, row: Pick<CatalogApp, "id" | "name" | "downloaded">, account: string,
+  selectedRoles?: readonly Role[],
 ): Promise<string[]> {
   const issues: string[] = [];
   let observed: Observation;
@@ -158,10 +159,13 @@ export async function artwork(
   } catch (error) {
     return [`${row.name}: ${String(error)}`];
   }
-  for (const role of roles) {
+  for (const role of selectedRoles ?? roles) {
     try {
       if (currentAccount() !== account) throw new Error('Steam account changed during artwork update');
-      if (role === 'icon' ? !steam.SetShortcutIcon : !steam.SetCustomArtworkForApp) continue;
+      if (role === 'icon' ? !steam.SetShortcutIcon : !steam.SetCustomArtworkForApp) {
+        if (selectedRoles) throw new Error('Steam artwork update is unavailable');
+        continue;
+      }
       const art = await bridge.artwork(account, profile, row.id, role, row.downloaded, observed);
       if (!art) continue;
       if (currentAccount() !== account) throw new Error('Steam account changed during artwork update');

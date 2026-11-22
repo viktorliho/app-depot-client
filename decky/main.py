@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import stat
 import struct
 import tempfile
 from urllib.error import HTTPError
@@ -138,7 +139,7 @@ class Plugin:
                 child.kill()
         await asyncio.gather(*(child.wait() for child in children))
 
-    async def _rust(self, *args, token="", allow_http=False):
+    async def _rust(self, *args, token="", allow_http=False, image=None):
         if self.closing:
             raise RuntimeError("App Depot is reloading")
         # Decky dispatches by method name, including underscore methods.
@@ -148,8 +149,16 @@ class Plugin:
                                or args[:3] == ("--json", "profile", "add")):
             raise ValueError("HTTP consent only applies to Server setup")
         match args:
-            case ("decky", "status" | "discover"):
+            case ("decky", "status" | "discover" | "installed"):
                 pass
+            case ("decky", "uninstall", profile, app, revision):
+                identity(profile)
+                identity(app)
+                if not isinstance(revision, str) or len(revision) != 64 or any(ch not in "0123456789abcdef" for ch in revision):
+                    raise ValueError("Invalid local selection revision")
+            case ("decky", "mute-grid"):
+                if type(image) is not bytes or len(image) > 16 * 1024 * 1024:
+                    raise ValueError("Invalid cached grid")
             case ("decky", "test", origin) | ("--json", "profile", "add", "App Depot Server", origin):
                 self._origin(origin)
             case ("decky", "sync" | "catalog", profile) | ("profile", "token-remove", profile):
@@ -182,7 +191,7 @@ class Plugin:
         try:
             if self.closing:
                 raise RuntimeError("App Depot is reloading")
-            output, error = await asyncio.wait_for(child.communicate(token.encode()), 180)
+            output, error = await asyncio.wait_for(child.communicate(image if args == ("decky", "mute-grid") else token.encode()), 180)
             if child.returncode:
                 try:
                     code = json.loads(error)["code"]
@@ -204,6 +213,8 @@ class Plugin:
             "configure": self.configure, "catalog": self.catalog, "artwork": self.artwork,
             "shortcut": self.shortcut, "acknowledge": self.acknowledge, "binding": self.binding,
             "check_update": self.check_update, "verify_update": self.verify_update,
+            "installed": self.installed, "uninstall": self.uninstall,
+            "grid_states": self.grid_states, "finish_grids": self.finish_grids,
         }
         if not isinstance(method, str) or method not in operations:
             return {"ok": False, "code": "internal"}
@@ -288,6 +299,44 @@ class Plugin:
 
     async def catalog(self, profile, refresh):
         return await self._rust("decky", "sync" if refresh else "catalog", identity(profile))
+
+    async def installed(self):
+        return await self._rust("decky", "installed")
+
+    async def uninstall(self, profile, app, revision):
+        profile, app = identity(profile), identity(app)
+        # Record before starting so interruption can never lose the artwork intent.
+        async with self.lock:
+            ledger = self._load()
+            for key, binding in ledger.items():
+                if key.split("/")[1:] == [profile, app]:
+                    binding["pendingGrids"] = True
+            self._save(ledger)
+        return await self._rust("decky", "uninstall", profile, app, revision)
+
+    async def grid_states(self, account):
+        prefix = account_id(account) + "/"
+        async with self.lock:
+            result = []
+            for key, binding in self._load().items():
+                if not key.startswith(prefix):
+                    continue
+                profile, app = key[len(prefix):].split("/")
+                modes = []
+                for role in ("steam.grid.vertical", "steam.grid.horizontal"):
+                    state = binding["artwork"].get(role, {})
+                    revision = state.get("pendingRevision", state.get("revision", ""))
+                    if revision.endswith((":true:png1", ":false:png1")):
+                        modes.append(revision.endswith(":false:png1"))
+                result.append({"profile": profile, "app": app, "modes": modes,
+                               "pending": bool(binding.get("pendingGrids"))})
+            return result
+
+    async def finish_grids(self, account, profile, app):
+        async with self.lock:
+            ledger, _, binding = self._binding(account, profile, app)
+            if binding and binding.pop("pendingGrids", False):
+                self._save(ledger)
 
     def _config(self, account):
         return self.home / ".steam/root/userdata" / account_id(account) / "config"
@@ -491,8 +540,26 @@ class Plugin:
                         state["path"] = state.pop("pendingPath")
                     self._save(ledger)
             known = state.get("revision", "") if files else ""
-            art = await self._rust("decky", "artwork", profile, app, role,
-                                   "color" if downloaded else "muted", known)
+            if (binding.get("pendingGrids") and not downloaded
+                    and role in ("steam.grid.vertical", "steam.grid.horizontal")):
+                if known.endswith(":true:png1"):
+                    return None
+                if known.endswith(":false:png1") and digest:
+                    # Read the exact previously acknowledged Steam PNG, with no symlink following.
+                    fd = os.open(files[0], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+                    with os.fdopen(fd, "rb") as image:
+                        if not stat.S_ISREG(os.fstat(image.fileno()).st_mode):
+                            raise ValueError("Invalid cached grid")
+                        source = image.read(16 * 1024 * 1024 + 1)
+                    if hashlib.sha256(source).hexdigest() != digest:
+                        raise ValueError("Cached grid changed")
+                    art = await self._rust("decky", "mute-grid", image=source)
+                    art["revision"] = known.removesuffix(":false:png1") + ":true:png1"
+                else:
+                    art = await self._rust("decky", "artwork", profile, app, role, "muted", known)
+            else:
+                art = await self._rust("decky", "artwork", profile, app, role,
+                                       "color" if downloaded else "muted", known)
             if not art or "png" not in art:
                 return None
             data = base64.b64decode(art["png"], validate=True)

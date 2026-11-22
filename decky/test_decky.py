@@ -169,6 +169,45 @@ class ShortcutTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(path.read_bytes(), b"user custom image")
 
 
+    async def test_uninstall_persists_grid_intent_and_uses_owned_cache_offline(self):
+        import base64
+        plan = await self.plugin.shortcut(ACCOUNT, PROFILE, APP, "Same")
+        self.write(self.foreign, self.owned(plan))
+        await self.plugin.shortcut(ACCOUNT, PROFILE, APP, "Same")
+        role = "steam.grid.vertical"
+        path = self.config / "grid" / f"{ID}p.png"
+        original = b"owned color"
+        path.write_bytes(original)
+        ledger, _, binding = self.plugin._binding(ACCOUNT, PROFILE, APP)
+        binding["artwork"][role] = {"revision": "fixture:false:png1",
+                                    "digest": hashlib.sha256(original).hexdigest()}
+        self.plugin._save(ledger)
+
+        async def rust(*args, image=None):
+            if args[:2] == ("decky", "uninstall"):
+                self.assertTrue((await self.plugin.grid_states(ACCOUNT))[0]["pending"])
+                return {"removed": True}
+            if args == ("decky", "mute-grid"):
+                self.assertEqual(image, original)
+                return {"png": base64.b64encode(b"muted").decode()}
+            raise main.RpcFailure("server_unavailable")
+
+        self.plugin._rust = rust
+        snapshot = self.path.read_bytes()
+        self.assertTrue((await self.plugin.uninstall(PROFILE, APP, "0" * 64))["removed"])
+        self.assertEqual(await self.plugin.binding(ACCOUNT, PROFILE, APP), ID)
+        self.assertEqual(self.path.read_bytes(), snapshot)
+        result = await self.plugin.artwork(ACCOUNT, PROFILE, APP, role, False)
+        self.assertEqual(result["revision"], "fixture:true:png1")
+        path.write_bytes(b"muted")
+        self.assertIsNone(await self.plugin.artwork(ACCOUNT, PROFILE, APP, role, False))
+        with self.assertRaises(main.RpcFailure):
+            await self.plugin.artwork(ACCOUNT, PROFILE, APP, "steam.grid.horizontal", False)
+        self.assertTrue((await self.plugin.grid_states(ACCOUNT))[0]["pending"])
+        await self.plugin.finish_grids(ACCOUNT, PROFILE, APP)
+        self.assertFalse((await self.plugin.grid_states(ACCOUNT))[0]["pending"])
+
+
 def archive(version, unsafe=None):
     memory = io.BytesIO()
     with ZipFile(memory, "w") as result:
