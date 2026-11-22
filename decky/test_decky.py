@@ -8,6 +8,7 @@ import stat
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 from urllib.error import HTTPError
 from urllib.request import Request
 from zipfile import ZipFile, ZipInfo
@@ -294,22 +295,102 @@ class InstallerTests(unittest.TestCase):
                     installer.get_package(url + "/one.zip", "0" * 64, True)
                 with self.assertRaises(HTTPError):
                     installer.get_package(url + "/missing.zip", digest, True)
-                with self.assertRaisesRegex(ValueError, "interrupted"):
-                    installer.get_package(url + "/truncated.zip", digest, True)
+                with patch.object(installer.time, "sleep"):
+                    with self.assertRaisesRegex(ValueError, "interrupted"):
+                        installer.get_package(url + "/truncated.zip", digest, True)
                 with self.assertRaises(ValueError):
                     installer.get_package(url + "/one.zip", digest, False)
             finally:
                 server.shutdown()
                 thread.join()
+    def test_download_resume_stall_restart_and_invalid_representation(self):
+        payload = archive("one") * 128
+        digest = hashlib.sha256(payload).hexdigest()
+        cut = 32191
+        calls = {}
+        etag = '"fixture"'
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *_):
+                pass
+
+            def do_GET(self):
+                observed = calls.setdefault(self.path, [])
+                observed.append((self.headers.get("Range"), self.headers.get("If-Range")))
+                first = len(observed) == 1
+                if self.path == "/expired-range.zip" and len(observed) == 2:
+                    self.send_error(416)
+                    return
+                resume = not first and self.path not in ("/restart.zip", "/weak.zip", "/expired-range.zip")
+                self.send_response(206 if resume else 200)
+                validator = (
+                    'W/"fixture"' if self.path == "/weak.zip"
+                    else '"different"' if not first and self.path in ("/restart.zip", "/validator.zip")
+                    else etag
+                )
+                self.send_header("ETag", validator)
+                self.send_header("Content-Length", str(len(payload) - cut if resume else len(payload)))
+                if resume:
+                    start = cut - 1 if self.path == "/offset.zip" else cut
+                    self.send_header("Content-Range", f"bytes {start}-{len(payload) - 1}/{len(payload)}")
+                self.end_headers()
+                if self.path == "/slow.zip":
+                    for start in range(0, len(payload), 8192):
+                        self.wfile.write(payload[start:start + 8192])
+                        self.wfile.flush()
+                        threading.Event().wait(0.025)
+                elif first:
+                    self.wfile.write(payload[:cut])
+                    self.wfile.flush()
+                    if self.path == "/stall.zip":
+                        threading.Event().wait(0.35)
+                else:
+                    body = payload[cut:] if resume else payload
+                    if self.path == "/corrupt.zip":
+                        body = b"X" + body[1:]
+                    self.wfile.write(body)
+
+        with ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                url = f"http://127.0.0.1:{server.server_port}"
+                with patch.object(installer, "CONNECT_TIMEOUT", 0.2), patch.object(
+                    installer, "IDLE_TIMEOUT", 0.2,
+                ), patch.object(installer.time, "sleep"):
+                    for name in ("slow", "resume", "stall", "restart", "weak", "expired-range"):
+                        with self.subTest(name=name):
+                            progress = []
+                            self.assertEqual(
+                                installer.get_package(url + f"/{name}.zip", digest, True,
+                                                      progress=lambda *args: progress.append(args)), payload,
+                            )
+                            self.assertEqual(progress[-1][:2], (len(payload), len(payload)))
+                            self.assertGreater(progress[-1][2], 0)
+                    self.assertEqual(calls["/slow.zip"], [(None, None)])
+                    self.assertEqual(calls["/weak.zip"], [(None, None), (None, None)])
+                    self.assertEqual(calls["/expired-range.zip"], [(None, None), (f"bytes={cut}-", etag), (None, None)])
+                    for name in ("resume", "stall", "restart"):
+                        self.assertEqual(calls[f"/{name}.zip"], [(None, None), (f"bytes={cut}-", etag)])
+                    for name in ("offset", "validator", "corrupt"):
+                        message = "checksum" if name == "corrupt" else "resumed"
+                        with self.subTest(name=name), self.assertRaisesRegex(ValueError, message):
+                            installer.get_package(url + f"/{name}.zip", digest, True)
+            finally:
+                server.shutdown()
+                thread.join()
+
     def test_release_redirect_requires_exact_https_hosts_and_strips_headers(self):
         initial = ("https://github.com/viktorliho/app-depot-client/releases/download/"
                    "decky-v0.1.0-beta.1/AppDepot-Decky-v0.1.0-beta.1-x86_64.zip")
         target = "https://release-assets.githubusercontent.com/github-production-release-asset/fixture"
         redirect = installer.ReleaseRedirect(initial)
-        request = Request(initial, headers={"Authorization": "Bearer fixture"})
+        request = Request(initial, headers={"Authorization": "Bearer fixture", "Range": "bytes=20-", "If-Range": '"fixture"'})
         response = redirect.redirect_request(request, None, 302, "", {}, target)
         self.assertEqual(response.full_url, target)
         self.assertIsNone(response.get_header("Authorization"))
+        self.assertEqual(response.get_header("Range"), "bytes=20-")
+        self.assertEqual(response.get_header("If-range"), '"fixture"')
         self.assertIsNone(redirect.redirect_request(response, None, 302, "", {}, target))
         for changed in (target.replace("https:", "http:"), target.replace(".com/", ".com.evil/"),
                         target.replace(".com/", ".com:8443/"), target.replace(".com/", ".com@evil/")):

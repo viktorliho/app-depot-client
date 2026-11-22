@@ -111,6 +111,12 @@ Inspect the latest native launch record at `$XDG_STATE_HOME/app-depot-decky/last
 
 Debian verification covers the real Server, native X11 under Xvfb, Secret Service, an offline launch without a display, child exit code and SIGTERM propagation, mocked SteamClient and VDF readback, and package extraction/activation rollback with a fixture service. The hardware cases above are still open.
 
+### Interrupted package downloads
+
+The Desktop installer shows received bytes, transfer speed and the current installation phase in its terminal. A single run can resume an interrupted download using a strong ETag and a validated HTTPS Range response. A full response to a resume request starts a fresh transfer. Without a strong validator the installer retries from byte zero. Interrupted attempts use capped exponential backoff.
+
+The connection and TLS setup timeout is 20 seconds, and socket reads allow 30 seconds without progress. The overall operation is bounded by five attempts and 128 MiB per response, with no elapsed-time cutoff for a healthy transfer. The installer checks the complete ZIP against its embedded SHA-256 and validates the archive before activation. A cancelled installer run does not leave a partial package on disk.
+
 ## Updates & About
 
 The M3.2 candidate can check the official Decky beta channel from Gaming Mode. Checks are user initiated. The panel shows the installed Decky package version, the highest applicable Decky version, release notes and the official versioned release page. Diagnostics identifies the shared core version separately. **Download and verify** checks the ZIP in temporary storage, then discards it. To activate an update, download and run that release's `AppDepot-Decky-Installer.desktop` in Desktop Mode after exiting any game. It downloads its own pinned copy and restarts Decky.
