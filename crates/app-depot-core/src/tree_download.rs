@@ -215,7 +215,11 @@ pub(crate) fn rename_tree_noreplace(from: &Path, to: &Path) -> Result<(), Librar
         }
         Ok(())
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(windows)]
+    {
+        crate::windows_fs::rename_directory_noreplace(from, to).map_err(Into::into)
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
     {
         let _ = (from, to);
         Err(invalid(
@@ -993,6 +997,9 @@ impl Library {
         pause_after: Option<u64>,
         observer: &mut dyn FnMut(TransferObservation),
     ) -> Result<DownloadJob, LibraryError> {
+        if cfg!(windows) {
+            return Err(invalid("durable Tree transfers are unavailable on Windows"));
+        }
         let _slot = self.lock_download_slot()?;
         let mut network_bytes = 0;
         let _lock = self.lock_job(id)?;
@@ -1131,6 +1138,9 @@ impl Library {
     }
 
     pub fn reconcile_tree_jobs(&mut self) -> Result<(), LibraryError> {
+        if cfg!(windows) {
+            return Ok(());
+        }
         let ids:Vec<String>=self.conn.prepare("SELECT id FROM download_jobs WHERE artifact_id LIKE 'adtree:v1:sha256:%' AND state IN ('FetchingInventory','Downloading','Verifying','Committing')")?.query_map([],|r|r.get(0))?.collect::<Result<_,_>>()?;
         for id in ids {
             let _lock = match self.lock_job(&id) {

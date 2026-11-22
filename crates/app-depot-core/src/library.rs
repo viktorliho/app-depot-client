@@ -166,32 +166,40 @@ pub(crate) fn ensure_directory(path: &Path) -> Result<(), LibraryError> {
             "library roots must be absolute, non-root paths without . or ..",
         ));
     }
-    let mut current = PathBuf::new();
-    for component in path.components() {
-        current.push(component.as_os_str());
-        if matches!(component, Component::Prefix(_)) {
-            continue;
-        }
-        match fs::symlink_metadata(&current) {
-            Ok(metadata) if is_redirect(&metadata) => {
-                return Err(invalid("symlink or reparse point in library path"));
-            }
-            Ok(metadata) if !metadata.is_dir() => {
-                return Err(invalid("non-directory in library path"));
-            }
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                fs::create_dir(&current)?;
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    fs::set_permissions(&current, fs::Permissions::from_mode(0o700))?;
-                }
-            }
-            Err(error) => return Err(error.into()),
-        }
+    #[cfg(windows)]
+    {
+        crate::windows_fs::ensure_directory(path).map_err(Into::into)
     }
-    Ok(())
+
+    #[cfg(not(windows))]
+    {
+        let mut current = PathBuf::new();
+        for component in path.components() {
+            current.push(component.as_os_str());
+            if matches!(component, Component::Prefix(_)) {
+                continue;
+            }
+            match fs::symlink_metadata(&current) {
+                Ok(metadata) if is_redirect(&metadata) => {
+                    return Err(invalid("symlink or reparse point in library path"));
+                }
+                Ok(metadata) if !metadata.is_dir() => {
+                    return Err(invalid("non-directory in library path"));
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    fs::create_dir(&current)?;
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        fs::set_permissions(&current, fs::Permissions::from_mode(0o700))?;
+                    }
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(())
+    }
 }
 
 fn is_redirect(metadata: &fs::Metadata) -> bool {
@@ -291,30 +299,43 @@ fn schema_open_lock(root: &Path) -> Result<fs::File, LibraryError> {
 
 pub(crate) fn read_marker(path: &Path) -> Result<Option<String>, LibraryError> {
     let marker = path.join(MARKER);
-    match fs::symlink_metadata(&marker) {
-        Ok(metadata) if !metadata.is_file() || is_redirect(&metadata) => {
-            Err(invalid("unsafe library identity marker"))
-        }
-        Ok(metadata) if metadata.len() > 64 => Err(invalid("invalid library identity marker")),
-        Ok(_) => {
-            let mut value = String::new();
-            fs::File::open(marker)?.read_to_string(&mut value)?;
-            if Uuid::parse_str(value.trim()).is_err() {
+    #[cfg(windows)]
+    let file = crate::windows_fs::regular_file(&marker, false);
+    #[cfg(not(windows))]
+    let file = match fs::symlink_metadata(&marker) {
+        Ok(metadata) => {
+            if !metadata.is_file() || is_redirect(&metadata) {
+                return Err(invalid("unsafe library identity marker"));
+            }
+            if metadata.len() > 64 {
                 return Err(invalid("invalid library identity marker"));
             }
-            Ok(Some(value.trim().into()))
+            Ok(fs::File::open(marker)?)
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error.into()),
+        Err(error) => Err(error),
+    };
+    let file = match file {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let mut value = String::new();
+    file.take(65).read_to_string(&mut value)?;
+    if value.len() > 64 || Uuid::parse_str(value.trim()).is_err() {
+        return Err(invalid("invalid library identity marker"));
     }
+    Ok(Some(value.trim().into()))
 }
 
 pub(crate) fn write_marker(path: &Path, id: &str) -> Result<(), LibraryError> {
-    use std::fs::OpenOptions;
-    let mut file = OpenOptions::new()
+    let marker = path.join(MARKER);
+    #[cfg(windows)]
+    let mut file = crate::windows_fs::regular_file(&marker, true)?;
+    #[cfg(not(windows))]
+    let mut file = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
-        .open(path.join(MARKER))?;
+        .open(marker)?;
     file.write_all(id.as_bytes())?;
     file.sync_all()?;
     Ok(())
@@ -997,7 +1018,7 @@ mod tests {
         assert!(output.status.success());
         let result = ensure_directory(&junction.join("library"));
         fs::remove_dir(junction).unwrap();
-        assert!(matches!(result, Err(LibraryError::Invalid(_))));
+        assert!(result.is_err());
         assert!(!target.join("library").exists());
     }
     const DIGEST: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";

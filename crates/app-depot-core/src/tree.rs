@@ -106,6 +106,9 @@ pub fn validate_destination(entries: &[InventoryEntry]) -> Result<(), LibraryErr
     for entry in entries {
         let path = entry.path();
         for component in path.split('/') {
+            #[cfg(windows)]
+            crate::windows_fs::validate_component(component)
+                .map_err(|_| invalid(format!("destination-incompatible path: {path:?}")))?;
             let stem = component
                 .split('.')
                 .next()

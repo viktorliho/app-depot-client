@@ -13,6 +13,8 @@ pub mod secrets;
 pub mod transfer;
 pub mod tree;
 pub mod tree_download;
+#[cfg(windows)]
+mod windows_fs;
 
 /// Locally generated identity for a configured Server profile. A URL is not an identity:
 /// endpoints may move, and different profiles may use the same URL with different credentials.

@@ -859,6 +859,9 @@ impl Library {
         pause_after: Option<u64>,
         observer: &mut dyn FnMut(TransferObservation),
     ) -> Result<DownloadJob, LibraryError> {
+        if cfg!(windows) {
+            return Err(invalid("durable File transfers are unavailable on Windows"));
+        }
         let _slot = self.lock_download_slot()?;
         let mut network_bytes = 0;
         let _lock = self.lock_job(id)?;
@@ -945,6 +948,9 @@ impl Library {
         }
     }
     pub fn reconcile_file_jobs(&mut self) -> Result<(), LibraryError> {
+        if cfg!(windows) {
+            return Ok(());
+        }
         let ids:Vec<String>=self.conn.prepare("SELECT id FROM download_jobs WHERE artifact_id LIKE 'adfile:sha256:%' AND state IN ('Downloading','Verifying','Committing')")?.query_map([],|r|r.get(0))?.collect::<Result<_,_>>()?;
         for id in ids {
             let _lock = match self.lock_job(&id) {
@@ -1060,6 +1066,29 @@ impl Library {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_transfer_and_recovery_do_not_touch_artifact_storage() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().join("library");
+        let mut library = Library::open(crate::library::LibraryPaths {
+            metadata: root.clone(),
+            content: root.clone(),
+        })
+        .unwrap();
+        let client = ApiClient::new("http://127.0.0.1:1", None, false).unwrap();
+        let file_error = library.run_file_job(&client, "unused", None).unwrap_err();
+        let tree_error = library.run_tree_job(&client, "unused", None).unwrap_err();
+        assert!(file_error.to_string().contains("durable File transfers"));
+        assert!(tree_error.to_string().contains("durable Tree transfers"));
+        library.reconcile_file_jobs().unwrap();
+        library.reconcile_tree_jobs().unwrap();
+        assert!(library.jobs(None).unwrap().is_empty());
+        for directory in ["staging", "objects", "artifacts"] {
+            assert!(root.join(directory).read_dir().unwrap().next().is_none());
+        }
+    }
     use std::{
         io::{BufRead, BufReader},
         net::TcpListener,
