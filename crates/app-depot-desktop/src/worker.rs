@@ -122,7 +122,7 @@ pub enum Command {
     },
     VerifyInstallation(String),
     #[cfg(windows)]
-    InstallFile(String),
+    InstallArtifact(String),
     RepairInstallation(String),
     RemoveArtifact {
         profile: ServerProfileId,
@@ -146,25 +146,15 @@ pub enum Command {
     },
 }
 
-pub(crate) const WINDOWS_FILE_ONLY: bool = cfg!(windows);
-pub(crate) const WINDOWS_FILE_NOTICE: &str =
-    "Windows supports File Artifacts. Tree transfers, Play, repair and removal are unavailable.";
+pub(crate) const WINDOWS_INSTALL_ONLY: bool = cfg!(windows);
+pub(crate) const WINDOWS_INSTALL_NOTICE: &str =
+    "Windows supports File and Tree installation. Play, repair and removal are unavailable.";
 
 impl Command {
-    fn blocked_on_windows(&self, lib: &Library) -> Result<bool, String> {
-        Ok(match self {
-            Self::Download { kind, .. } => kind != "File",
-            Self::Pause(id)
-            | Self::Resume(id)
-            | Self::Retry(id)
-            | Self::MoveToTop(id)
-            | Self::Cancel(id) => !lib
-                .job(id)
-                .map_err(|e| e.to_string())?
-                .artifact_id
-                .starts_with("adfile:sha256:"),
-            Self::TreeFiles(_)
-            | Self::Reveal(_)
+    fn blocked_on_windows(&self) -> bool {
+        match self {
+            Self::Download { kind, .. } => !matches!(kind.as_str(), "File" | "Tree"),
+            Self::Reveal(_)
             | Self::StorageUsage
             | Self::RemoveInstallation { .. }
             | Self::RepairInstallation(_)
@@ -173,7 +163,7 @@ impl Command {
             | Self::RepairSource { .. }
             | Self::Play { .. } => true,
             _ => false,
-        })
+        }
     }
 }
 
@@ -371,7 +361,7 @@ fn send_jobs(
     tx: &Sender<Event>,
     ctx: &egui::Context,
 ) -> Result<(), String> {
-    let jobs = desktop_jobs(lib)?;
+    let jobs = lib.jobs(None).map_err(|e| e.to_string())?;
     let context = if with_context {
         let mut context = HashMap::new();
         for job in &jobs {
@@ -396,14 +386,6 @@ fn send_jobs(
         },
     );
     Ok(())
-}
-
-fn desktop_jobs(lib: &Library) -> Result<Vec<DownloadJob>, String> {
-    let mut jobs = lib.jobs(None).map_err(|e| e.to_string())?;
-    if WINDOWS_FILE_ONLY {
-        jobs.retain(|job| job.artifact_id.starts_with("adfile:sha256:"));
-    }
-    Ok(jobs)
 }
 
 fn client(profile: &Profile, memory: &HashMap<String, String>) -> Result<ApiClient, String> {
@@ -435,7 +417,7 @@ pub(crate) fn snapshot(
         library_content: lib.paths.content.clone(),
         ..Snapshot::default()
     };
-    result.jobs = desktop_jobs(lib)?;
+    result.jobs = lib.jobs(None).map_err(|e| e.to_string())?;
     for job in &result.jobs {
         if let Some(context) = lib
             .display_context_for_association(&job.profile_id, &job.association_id)
@@ -484,15 +466,12 @@ pub(crate) fn snapshot(
         result.files = files;
         result.local_issues.extend(file_issues);
         result.installations = lib.installations(Some(id)).map_err(|e| e.to_string())?;
-        if WINDOWS_FILE_ONLY {
-            result
-                .installations
-                .retain(|item| item.artifact_id.starts_with("adfile:sha256:"));
-            return Ok(result);
-        }
         let (trees, tree_issues) = lib.inspect_trees(Some(id)).map_err(|e| e.to_string())?;
         result.trees = trees;
         result.local_issues.extend(tree_issues);
+        if WINDOWS_INSTALL_ONLY {
+            return Ok(result);
+        }
         for app in &result.apps {
             for release in &app.releases {
                 if release.declaration.is_some() {
@@ -521,8 +500,8 @@ fn operation(
     art_tx: &Sender<ArtTask>,
     ctx: &egui::Context,
 ) -> Result<bool, String> {
-    if WINDOWS_FILE_ONLY && cmd.blocked_on_windows(lib)? {
-        return Err(WINDOWS_FILE_NOTICE.into());
+    if WINDOWS_INSTALL_ONLY && cmd.blocked_on_windows() {
+        return Err(WINDOWS_INSTALL_NOTICE.into());
     }
     let jobs_only = matches!(
         &cmd,
@@ -769,7 +748,7 @@ fn operation(
             return Ok(false);
         }
         #[cfg(windows)]
-        Command::InstallFile(id) => {
+        Command::InstallArtifact(id) => {
             let paths = paths.clone();
             let tx = tx.clone();
             let ctx = ctx.clone();
@@ -779,11 +758,11 @@ fn operation(
                     &ctx,
                     Event::LocalOperation {
                         id: id.clone(),
-                        phase: Some("Installing verified File Artifact".into()),
+                        phase: Some("Installing verified Artifact".into()),
                     },
                 );
-                match Library::open(paths).and_then(|mut lib| lib.install_windows_file(&id)) {
-                    Ok(_) => send(&tx, &ctx, Event::Notice("File Artifact installed".into())),
+                match Library::open(paths).and_then(|mut lib| lib.install_windows_artifact(&id)) {
+                    Ok(_) => send(&tx, &ctx, Event::Notice("Artifact installed".into())),
                     Err(error) => send(&tx, &ctx, Event::Error(error.to_string())),
                 }
                 send(&tx, &ctx, Event::LocalOperation { id, phase: None });
@@ -810,8 +789,7 @@ fn operation(
                     Err(error) => send(&tx, &ctx, Event::Error(error.to_string())),
                 }
                 #[cfg(windows)]
-                match Library::open(paths).and_then(|lib| lib.verify_windows_file_installation(&id))
-                {
+                match Library::open(paths).and_then(|lib| lib.verify_windows_installation(&id)) {
                     Ok(()) => send(
                         &tx,
                         &ctx,
@@ -1251,7 +1229,7 @@ fn start_job(
                 lib.run_file_job_observed(&api, &job.id, None, &mut observe)
                     .map_err(|e| e.to_string())?;
             }
-            if !WINDOWS_FILE_ONLY
+            if !WINDOWS_INSTALL_ONLY
                 && lib.job(&job.id).map_err(|e| e.to_string())?.state == "Completed"
             {
                 let release: Option<String> = lib
@@ -1311,7 +1289,7 @@ fn run(
                 send(&tx, &ctx, Event::Error(format!("Job recovery: {e}")));
             }
             #[cfg(windows)]
-            if let Err(error) = lib.reconcile_windows_file_installations() {
+            if let Err(error) = lib.reconcile_windows_installations() {
                 send(
                     &tx,
                     &ctx,

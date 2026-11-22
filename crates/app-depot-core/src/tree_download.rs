@@ -1,5 +1,11 @@
-//! Durable Tree Artifact transfer and materialization. Tree members are content objects, never
-//! standalone File Artifact associations.
+//! Durable Tree Artifact transfer and materialization.
+#[cfg(not(windows))]
+use crate::transfer::existing_dir;
+#[cfg(any(test, not(windows)))]
+use std::fs;
+#[cfg(not(windows))]
+use std::io::Write;
+
 use crate::{
     ServerProfileId,
     api::{ApiClient, ApiError},
@@ -7,8 +13,8 @@ use crate::{
     models::InventoryEntry,
     transfer::{
         BlobOutcome, BlobSpec, DownloadJob, TransferObservation, TransferPhase,
-        create_content_file, existing_dir, hash_file, open_regular, private_dir, publish_content,
-        receive_blob, safe_regular, sync_dir,
+        create_content_file, hash_file, open_regular, private_dir, publish_content, receive_blob,
+        safe_regular, sync_dir,
     },
     tree::{identity, validate_destination},
 };
@@ -17,8 +23,8 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
-    fs::{self, File},
-    io::{Read, Seek, SeekFrom, Write},
+    fs::File,
+    io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     thread,
     time::Duration,
@@ -193,6 +199,7 @@ fn unlink_beneath(root: &File, path: &str, directory: bool) -> Result<(), Librar
     Ok(())
 }
 
+#[cfg(not(windows))]
 pub(crate) fn rename_tree_noreplace(from: &Path, to: &Path) -> Result<(), LibraryError> {
     #[cfg(target_os = "linux")]
     {
@@ -404,6 +411,10 @@ impl Library {
         tx.execute("UPDATE tree_files SET progress=?3,checkpoint_hash=?4,etag=?5 WHERE job_id=?1 AND path=?2",params![job_id,path,next,format!("{:x}",hash.clone().finalize()),etag])?;
         if tx.execute("UPDATE download_jobs SET progress=progress+?2,updated_at=?3 WHERE id=?1 AND progress+?2 BETWEEN 0 AND expected_size",params![job_id,next-previous,now()?])? != 1 { return Err(invalid("invalid aggregate Tree progress")); }
         tx.commit()?;
+        #[cfg(all(test, windows))]
+        if len > 0 && len < size as u64 {
+            crate::windows_fs::pause_tree_test("partial-tree-download");
+        }
         Ok(matches!(
             self.job(job_id)?.state.as_str(),
             "Paused" | "Cancelled"
@@ -459,8 +470,11 @@ impl Library {
         }
         // Promotion may have been interrupted after making staging immutable but before the
         // object link became durable. Reopen by descriptor and restore write access for resume.
+        #[cfg(not(windows))]
         let existing = open_regular(&stage, false)?;
+        #[cfg(not(windows))]
         let mut permissions = existing.metadata()?.permissions();
+        #[cfg(not(windows))]
         if permissions.readonly() {
             #[cfg(unix)]
             {
@@ -573,6 +587,7 @@ impl Library {
                 self.tree_checkpoint(job_id, path, &file, 0, &Sha256::new(), None)?;
                 return Err(invalid("SHA-256 mismatch"));
             }
+            drop(file);
         } else {
             let mut retries = 0;
             let mut first = Some((file, offset, hash, etag));
@@ -666,10 +681,15 @@ impl Library {
             return Err(invalid("staging identity mismatch"));
         }
         private_dir(object.parent().unwrap())?;
+        #[cfg(not(windows))]
         let verified_stage = open_regular(&stage, false)?;
+        #[cfg(not(windows))]
         let mut permissions = verified_stage.metadata()?.permissions();
+        #[cfg(not(windows))]
         permissions.set_readonly(true);
+        #[cfg(not(windows))]
         verified_stage.set_permissions(permissions)?;
+        #[cfg(not(windows))]
         verified_stage.sync_all()?;
         let newly_linked = match publish_content(&stage, &object, *size, sha256) {
             Ok(()) => {
@@ -696,11 +716,23 @@ impl Library {
         }
         #[cfg(not(unix))]
         let _ = (newly_linked, linked);
+        #[cfg(all(test, windows))]
+        crate::windows_fs::pause_tree_test("after-tree-member-cas");
         self.mark_tree_file_verified(job_id, path)?;
         Ok(false)
     }
 
-    fn verify_tree_directory(
+    #[cfg(windows)]
+    pub(crate) fn verify_tree_directory(
+        &self,
+        root: &Path,
+        entries: &[InventoryEntry],
+    ) -> Result<(), LibraryError> {
+        Ok(crate::windows_fs::verify_tree(root, entries)?)
+    }
+
+    #[cfg(not(windows))]
+    pub(crate) fn verify_tree_directory(
         &self,
         root: &Path,
         entries: &[InventoryEntry],
@@ -772,6 +804,7 @@ impl Library {
         scan(root, "", &expected)
     }
 
+    #[cfg(not(windows))]
     fn prepare_tree_materialization(
         &self,
         job: &DownloadJob,
@@ -858,13 +891,8 @@ impl Library {
                 root.sync_all()?;
                 fs::remove_dir(&build)?;
             }
-            #[cfg(windows)]
-            return Err(invalid(
-                "cannot safely clean an interrupted Windows Tree staging directory",
-            ));
             #[cfg(not(any(unix, windows)))]
             fs::remove_dir_all(&build)?;
-            #[cfg(not(windows))]
             sync_dir(&stage)?;
         }
         private_dir(&build)?;
@@ -957,6 +985,28 @@ impl Library {
         let parent = destination.parent().unwrap();
         private_dir(parent.parent().unwrap())?;
         private_dir(parent)?;
+        #[cfg(windows)]
+        {
+            if identity(entries)? != job.artifact_id {
+                return Err(invalid("Tree identity mismatch before materialization"));
+            }
+            validate_destination(entries)?;
+            match self.verify_tree_directory(&destination, entries) {
+                Err(LibraryError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                    match crate::windows_fs::publish_tree(&destination, entries, |hash| {
+                        self.object(&format!("adfile:sha256:{hash}"))
+                            .map_err(std::io::Error::other)
+                    }) {
+                        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                        result => result?,
+                    }
+                    self.verify_tree_directory(&destination, entries)?;
+                }
+                result => result?,
+            }
+            sync_dir(parent)?;
+        }
+        #[cfg(not(windows))]
         if fs::symlink_metadata(&destination).is_ok() {
             self.verify_tree_directory(&destination, entries)?;
         } else {
@@ -978,6 +1028,8 @@ impl Library {
         tx.execute("INSERT OR IGNORE INTO verified_content(profile_id,artifact_id,local_ref,verified_at,association_id) VALUES (?1,?2,?3,?4,?5)",params![job.profile_id.0,job.artifact_id,relative,now()?,job.association_id])?;
         if tx.execute("UPDATE download_jobs SET state='Completed',progress=expected_size,last_error=NULL,updated_at=?2 WHERE id=?1 AND state='Committing'",params![job.id,now()?])?!=1 {return Err(invalid("Tree job left Committing state"));}
         tx.commit()?;
+        #[cfg(all(test, windows))]
+        crate::windows_fs::pause_tree_test("after-tree-download-completion");
         Ok(())
     }
 
@@ -997,9 +1049,6 @@ impl Library {
         pause_after: Option<u64>,
         observer: &mut dyn FnMut(TransferObservation),
     ) -> Result<DownloadJob, LibraryError> {
-        if cfg!(windows) {
-            return Err(invalid("durable Tree transfers are unavailable on Windows"));
-        }
         let _slot = self.lock_download_slot()?;
         let mut network_bytes = 0;
         let _lock = self.lock_job(id)?;
@@ -1138,9 +1187,6 @@ impl Library {
     }
 
     pub fn reconcile_tree_jobs(&mut self) -> Result<(), LibraryError> {
-        if cfg!(windows) {
-            return Ok(());
-        }
         let ids:Vec<String>=self.conn.prepare("SELECT id FROM download_jobs WHERE artifact_id LIKE 'adtree:v1:sha256:%' AND state IN ('FetchingInventory','Downloading','Verifying','Committing')")?.query_map([],|r|r.get(0))?.collect::<Result<_,_>>()?;
         for id in ids {
             let _lock = match self.lock_job(&id) {
@@ -1245,7 +1291,7 @@ impl Library {
 }
 
 // These fixtures construct on-disk Tree objects using directory synchronization.
-#[cfg(all(test, not(windows)))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::library::LibraryPaths;
@@ -1382,6 +1428,7 @@ mod tests {
         assert_eq!(library.job(&job.id).unwrap().progress, 2);
     }
     #[test]
+    #[cfg(not(windows))]
     fn interrupted_readonly_tree_stage_is_writable_on_resume() {
         let (_root, mut library, job, entries) = fixture();
         let (path, file_id, digest) = match &entries[0] {
@@ -1447,13 +1494,22 @@ mod tests {
     #[test]
     fn interrupted_committing_recovers_without_network() {
         let (_root, mut library, job, entries) = fixture();
+        #[cfg(not(windows))]
         let ready = library
             .prepare_tree_materialization(&job, &entries)
             .unwrap();
         let destination = tree_destination(&library, &job).unwrap();
         private_dir(destination.parent().unwrap().parent().unwrap()).unwrap();
         private_dir(destination.parent().unwrap()).unwrap();
+        #[cfg(not(windows))]
         fs::rename(&ready, &destination).unwrap();
+        #[cfg(windows)]
+        crate::windows_fs::publish_tree(&destination, &entries, |hash| {
+            library
+                .object(&format!("adfile:sha256:{hash}"))
+                .map_err(std::io::Error::other)
+        })
+        .unwrap();
         library.reconcile_tree_jobs().unwrap();
         assert_eq!(library.job(&job.id).unwrap().state, "Completed");
         assert_eq!(library.verified_trees(None).unwrap().len(), 1);
@@ -1531,5 +1587,267 @@ mod tests {
         let client = ApiClient::new("https://example.com", None, false).unwrap();
         assert!(library.run_tree_job(&client, &job.id, None).is_err());
         drop(lock);
+    }
+    #[cfg(windows)]
+    #[test]
+    fn windows_tree_install_recovers_after_process_exit() {
+        const TEST_ROOT: &str = "APP_DEPOT_TREE_TEST_ROOT";
+        const TEST_JOB: &str = "APP_DEPOT_TREE_TEST_JOB";
+        fn open(root: &Path) -> Library {
+            Library::open(LibraryPaths {
+                metadata: root.join("metadata"),
+                content: root.join("content"),
+            })
+            .unwrap()
+        }
+        if let Some(root) = std::env::var_os(TEST_ROOT) {
+            let mut library = open(Path::new(&root));
+            let job = std::env::var(TEST_JOB).unwrap();
+            if library.job(&job).unwrap().state == "Committing" {
+                library.reconcile_tree_jobs().unwrap();
+            }
+            if std::env::var("APP_DEPOT_FILE_CRASH_BOUNDARY").as_deref() == Ok("before-tree-ready")
+            {
+                library.reconcile_windows_installations().unwrap();
+            } else {
+                library.install_windows_artifact(&job).unwrap();
+            }
+            panic!("worker missed interruption hook");
+        }
+        for boundary in [
+            "after-tree-download-completion",
+            "after-preparing",
+            "partial-tree-materialization",
+            "before-tree-install-publication",
+            "after-install-publication",
+            "after-activation",
+        ] {
+            let (root, mut library, job, entries) = fixture();
+            if boundary != "after-tree-download-completion" {
+                library.complete_tree(&job, &entries).unwrap();
+            }
+            let staging = library.stage(&job.id).unwrap();
+            private_dir(staging.parent().unwrap()).unwrap();
+            let flag = staging.with_file_name("file-test-ready");
+            let unrelated = root.path().join("keep");
+            fs::write(&unrelated, b"preserve").unwrap();
+            drop(library);
+            let interrupt = |boundary| {
+                let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "tree_download::tests::windows_tree_install_recovers_after_process_exit",
+                    ])
+                    .env(TEST_ROOT, root.path())
+                    .env(TEST_JOB, &job.id)
+                    .env("APP_DEPOT_TREE_TEST_STAGE", &staging)
+                    .env("APP_DEPOT_FILE_CRASH_BOUNDARY", boundary)
+                    .stdout(std::process::Stdio::null())
+                    .spawn()
+                    .unwrap();
+                let deadline = std::time::Instant::now() + Duration::from_secs(20);
+                while !flag.exists() && std::time::Instant::now() < deadline {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                let killed = child.kill();
+                child.wait().unwrap();
+                assert!(flag.exists(), "{boundary}: worker did not pause");
+                killed.unwrap();
+            };
+            interrupt(boundary);
+            let mut library = open(root.path());
+            assert_eq!(library.job(&job.id).unwrap().state, "Completed");
+            assert_eq!(library.verified_trees(None).unwrap().len(), 1);
+            let before = library.installations(None).unwrap();
+            if boundary == "after-tree-download-completion" {
+                assert!(before.is_empty());
+            } else {
+                let expected = if boundary == "after-activation" {
+                    "Ready"
+                } else {
+                    "Preparing"
+                };
+                assert_eq!(before[0].state, expected, "{boundary}");
+            }
+            if boundary == "after-install-publication" {
+                drop(library);
+                fs::remove_file(&flag).unwrap();
+                interrupt("before-tree-ready");
+                library = open(root.path());
+                assert_eq!(
+                    library.installation(&before[0].id).unwrap().state,
+                    "Preparing"
+                );
+            }
+            if boundary == "after-preparing" {
+                let path = &before[0].path;
+                fs::create_dir(path).unwrap();
+                let foreign = path.join("foreign.txt");
+                fs::write(&foreign, b"foreign file").unwrap();
+                assert!(library.install_windows_artifact(&job.id).is_err());
+                assert_eq!(fs::read(&foreign).unwrap(), b"foreign file");
+                fs::rename(path, path.with_file_name("preserved-collision")).unwrap();
+            }
+            for _ in 0..2 {
+                library.reconcile_tree_jobs().unwrap();
+                library.reconcile_windows_installations().unwrap();
+            }
+            if boundary == "after-install-publication" {
+                assert_eq!(library.installation(&before[0].id).unwrap().state, "Ready");
+            }
+            let installed = library.install_windows_artifact(&job.id).unwrap();
+            assert_eq!(installed.state, "Ready");
+            drop(library);
+            let mut library = open(root.path());
+            library.reconcile_windows_installations().unwrap();
+            library.verify_windows_installation(&installed.id).unwrap();
+            assert!(installed.path.join("payload/empty/nested").is_dir());
+            assert_eq!(fs::read(&unrelated).unwrap(), b"preserve");
+        }
+    }
+    #[cfg(windows)]
+    #[test]
+    fn windows_tree_activation_rollback_and_offline_inventory_errors() {
+        let (_root, mut library, job, entries) = fixture();
+        library.complete_tree(&job, &entries).unwrap();
+        library.conn.execute_batch(
+            "CREATE TRIGGER fail_tree_activation BEFORE UPDATE ON installations WHEN NEW.state='Ready' BEGIN SELECT RAISE(ABORT,'fixture rollback'); END;",
+        ).unwrap();
+        assert!(library.install_windows_artifact(&job.id).is_err());
+        let pending = library.installations(None).unwrap().pop().unwrap();
+        assert_eq!(pending.state, "Preparing");
+        assert!(pending.path.join("payload/empty/nested").is_dir());
+        library
+            .conn
+            .execute_batch("DROP TRIGGER fail_tree_activation")
+            .unwrap();
+        for _ in 0..2 {
+            library.reconcile_windows_installations().unwrap();
+            library.verify_windows_installation(&pending.id).unwrap();
+        }
+        let payload = pending.path.join("payload");
+        let unexpected = payload.join("unknown.txt");
+        fs::write(&unexpected, b"sibling data").unwrap();
+        assert!(
+            library
+                .verify_windows_installation(&pending.id)
+                .unwrap_err()
+                .to_string()
+                .contains("unexpected")
+        );
+        assert_eq!(fs::read(&unexpected).unwrap(), b"sibling data");
+        fs::remove_file(unexpected).unwrap();
+        fs::remove_dir(payload.join("empty/nested")).unwrap();
+        assert!(
+            library
+                .verify_windows_installation(&pending.id)
+                .unwrap_err()
+                .to_string()
+                .contains("missing")
+        );
+        assert_eq!(library.verified_trees(None).unwrap().len(), 1);
+    }
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires loopback Tree fixture with two differently sized files and Range/If-Range support"]
+    fn windows_tree_download_recovers_after_process_exit() {
+        let url =
+            std::env::var("APP_DEPOT_TEST_SERVER_URL").expect("isolated Tree fixture required");
+        assert!(matches!(
+            url::Url::parse(&url).unwrap().host_str(),
+            Some("127.0.0.1" | "::1")
+        ));
+        let client = ApiClient::new(&url, None, false).unwrap();
+        let release = std::env::var("APP_DEPOT_TEST_RELEASE_ID").unwrap();
+        let paths = |root: &Path| LibraryPaths {
+            metadata: root.join("metadata"),
+            content: root.join("content"),
+        };
+        if let Some(root) = std::env::var_os("APP_DEPOT_TREE_DOWNLOAD_ROOT") {
+            let mut library = Library::open(paths(Path::new(&root))).unwrap();
+            let job = std::env::var("APP_DEPOT_TREE_TEST_JOB").unwrap();
+            let pause_after = (std::env::var("APP_DEPOT_FILE_CRASH_BOUNDARY").as_deref()
+                == Ok("partial-tree-download"))
+            .then_some(65536);
+            library.run_tree_job(&client, &job, pause_after).unwrap();
+            panic!("worker missed download interruption hook");
+        }
+        let association = client
+            .associated_artifacts(&release, 100)
+            .unwrap()
+            .into_iter()
+            .find(|value| value.artifact.kind == "Tree")
+            .unwrap();
+        for boundary in ["after-tree-member-cas", "partial-tree-download"] {
+            let root = tempfile::tempdir().unwrap();
+            let mut library = Library::open(paths(root.path())).unwrap();
+            let profile = library.add_profile("fixture", &url, false).unwrap();
+            let job = library
+                .queue_tree(&client, &profile.id, &release, &association.association.id)
+                .unwrap();
+            let stage = library.stage(&job.id).unwrap();
+            let ready = stage.with_file_name("file-test-ready");
+            drop(library);
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "tree_download::tests::windows_tree_download_recovers_after_process_exit",
+                ])
+                .env("APP_DEPOT_TREE_DOWNLOAD_ROOT", root.path())
+                .env("APP_DEPOT_TREE_TEST_JOB", &job.id)
+                .env("APP_DEPOT_TREE_TEST_STAGE", stage)
+                .env("APP_DEPOT_FILE_CRASH_BOUNDARY", boundary)
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            while !ready.exists() && std::time::Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(10));
+            }
+            let killed = child.kill();
+            child.wait().unwrap();
+            assert!(ready.exists(), "{boundary}: worker did not pause");
+            killed.unwrap();
+            let mut library = Library::open(paths(root.path())).unwrap();
+            assert_eq!(library.job(&job.id).unwrap().state, "Downloading");
+            assert!(library.verified_trees(None).unwrap().is_empty());
+            let members = library.tree_files(&job.id).unwrap();
+            let object = library
+                .object(&format!(
+                    "adfile:sha256:{}",
+                    match &library.tree_inventory(&job.id).unwrap().unwrap()[0] {
+                        InventoryEntry::File { sha256, .. } => sha256.clone(),
+                        _ => panic!("fixture must start with a small file"),
+                    }
+                ))
+                .unwrap();
+            assert!(object.is_file());
+            if boundary == "after-tree-member-cas" {
+                assert!(!members[0].verified);
+            } else {
+                assert!(
+                    members.iter().any(|file| file.progress > 0
+                        && file.progress < file.size
+                        && !file.verified)
+                );
+            }
+            for _ in 0..2 {
+                library.reconcile_tree_jobs().unwrap();
+                assert_eq!(library.job(&job.id).unwrap().state, "Paused");
+            }
+            let prior = library.retry_job(&job.id).unwrap();
+            let mut transferred = 0;
+            let completed = library
+                .run_tree_job_observed(&client, &job.id, None, &mut |event| {
+                    transferred = event.network_bytes
+                })
+                .unwrap();
+            assert_eq!(completed.state, "Completed");
+            assert!(transferred < completed.expected_size);
+            assert!(transferred <= completed.expected_size - prior.progress);
+            let installed = library.install_windows_artifact(&job.id).unwrap();
+            library.verify_windows_installation(&installed.id).unwrap();
+        }
     }
 }

@@ -402,8 +402,8 @@ impl Library {
 
     pub fn next_queued_job(&self) -> Result<Option<DownloadJob>, LibraryError> {
         let id: Option<String> = self.conn.query_row(
-            "SELECT j.id FROM download_jobs j JOIN profiles p ON p.id=j.profile_id WHERE j.state='Queued' AND p.archived=0 AND (NOT ?1 OR j.artifact_id LIKE 'adfile:sha256:%') ORDER BY j.queue_rank DESC,j.created_at,j.id LIMIT 1",
-            [cfg!(windows)], |r| r.get(0),
+            "SELECT j.id FROM download_jobs j JOIN profiles p ON p.id=j.profile_id WHERE j.state='Queued' AND p.archived=0 ORDER BY j.queue_rank DESC,j.created_at,j.id LIMIT 1",
+            [], |r| r.get(0),
         ).optional()?;
         id.map(|id| self.job(&id)).transpose()
     }
@@ -432,7 +432,7 @@ impl Library {
             }
             Err(error) => return Err(error),
         };
-        self.conn.execute("UPDATE download_jobs SET state='Queued',auto_resume=0 WHERE state='Paused' AND auto_resume=1 AND (NOT ?1 OR artifact_id LIKE 'adfile:sha256:%')",[cfg!(windows)])?;
+        self.conn.execute("UPDATE download_jobs SET state='Queued',auto_resume=0 WHERE state='Paused' AND auto_resume=1",[])?;
         Ok(())
     }
 
@@ -1266,7 +1266,7 @@ mod tests {
                 if boundary == "after-preparing" {
                     fs::create_dir(&item.path).unwrap();
                     fs::write(item.path.join("unrelated"), b"preserve").unwrap();
-                    reopened.reconcile_windows_file_installations().unwrap();
+                    reopened.reconcile_windows_installations().unwrap();
                     assert!(reopened.install_windows_file(&job.id).is_err());
                     assert_eq!(reopened.installation(&item.id).unwrap().state, "Preparing");
                     assert_eq!(fs::read(item.path.join("unrelated")).unwrap(), b"preserve");
@@ -1285,7 +1285,7 @@ mod tests {
                 );
                 assert_eq!(fs::read(&unrelated).unwrap(), b"keep");
             }
-            reopened.reconcile_windows_file_installations().unwrap();
+            reopened.reconcile_windows_installations().unwrap();
             if boundary == "after-install-publication" {
                 assert_eq!(
                     reopened.installation(&installed[0].id).unwrap().state,
@@ -1296,10 +1296,8 @@ mod tests {
             assert_eq!(installed.state, "Ready");
             drop(reopened);
             let mut reopened = Library::open(paths(fixture._root.path())).unwrap();
-            reopened.reconcile_windows_file_installations().unwrap();
-            reopened
-                .verify_windows_file_installation(&installed.id)
-                .unwrap();
+            reopened.reconcile_windows_installations().unwrap();
+            reopened.verify_windows_installation(&installed.id).unwrap();
             assert_eq!(
                 reopened.install_windows_file(&job.id).unwrap().id,
                 installed.id
@@ -1326,7 +1324,7 @@ mod tests {
         assert!(
             fixture
                 .library
-                .verify_windows_file_installation(&item.id)
+                .verify_windows_installation(&item.id)
                 .is_err()
         );
         assert!(item.path.join("payload").is_file());
@@ -1336,11 +1334,11 @@ mod tests {
             .conn
             .execute_batch("DROP TRIGGER fail_activation")
             .unwrap();
-        reopened.reconcile_windows_file_installations().unwrap();
-        reopened.reconcile_windows_file_installations().unwrap();
-        reopened.verify_windows_file_installation(&item.id).unwrap();
+        reopened.reconcile_windows_installations().unwrap();
+        reopened.reconcile_windows_installations().unwrap();
+        reopened.verify_windows_installation(&item.id).unwrap();
         fs::write(item.path.join("payload"), b"local modification").unwrap();
-        assert!(reopened.verify_windows_file_installation(&item.id).is_err());
+        assert!(reopened.verify_windows_installation(&item.id).is_err());
         assert_eq!(
             hash_file(
                 &reopened.object(&job.artifact_id).unwrap(),
@@ -1501,7 +1499,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn windows_tree_transfer_and_recovery_do_not_touch_artifact_storage() {
+    fn unknown_tree_job_and_empty_recovery_do_not_touch_artifact_storage() {
         let fixture = tempfile::tempdir().unwrap();
         let root = fixture.path().join("library");
         let mut library = Library::open(crate::library::LibraryPaths {
@@ -1511,7 +1509,7 @@ mod tests {
         .unwrap();
         let client = ApiClient::new("http://127.0.0.1:1", None, false).unwrap();
         let tree_error = library.run_tree_job(&client, "unused", None).unwrap_err();
-        assert!(tree_error.to_string().contains("durable Tree transfers"));
+        assert!(!tree_error.to_string().contains("durable Tree transfers"));
         library.reconcile_tree_jobs().unwrap();
         assert!(library.jobs(None).unwrap().is_empty());
         for directory in ["staging", "objects", "artifacts"] {

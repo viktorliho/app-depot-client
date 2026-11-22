@@ -276,6 +276,17 @@ fn downloads_and_resumes_real_tree_artifact() {
             |event| event.phase == app_depot_core::transfer::TransferPhase::PreparingLocalFiles
         )
     );
+    #[cfg(windows)]
+    let installed = {
+        let installation = library.install_windows_artifact(&job.id).unwrap();
+        assert_eq!(installation.state, "Ready");
+        assert_eq!(
+            library.install_windows_artifact(&job.id).unwrap().id,
+            installation.id
+        );
+        assert!(installation.path.join("payload/empty/nested").is_dir());
+        installation
+    };
     drop(library);
     let library = Library::open(paths).unwrap();
     let tree = library
@@ -286,6 +297,53 @@ fn downloads_and_resumes_real_tree_artifact() {
     assert_eq!(tree.artifact_id, association.artifact.id);
     assert!(tree.path.join("empty/nested").is_dir());
     assert!(tree.path.join("data/large.bin").is_file());
+    #[cfg(windows)]
+    {
+        library.verify_windows_installation(&installed.id).unwrap();
+        let changed = installed.path.join("payload/data/large.bin");
+        let original = std::fs::read(&changed).unwrap();
+        std::fs::write(&changed, vec![0; original.len()]).unwrap();
+        assert!(library.verify_windows_installation(&installed.id).is_err());
+        assert_eq!(
+            std::fs::read(tree.path.join("data/large.bin")).unwrap(),
+            original
+        );
+    }
+    #[cfg(windows)]
+    if let Ok(corrupt_url) = env::var("APP_DEPOT_TEST_CORRUPT_TREE_URL") {
+        assert!(matches!(
+            url::Url::parse(&corrupt_url).unwrap().host_str(),
+            Some("127.0.0.1" | "::1")
+        ));
+        let corrupt = ApiClient::new(&corrupt_url, None, false).unwrap();
+        let isolated = tempfile::tempdir().unwrap();
+        let mut library = Library::open(LibraryPaths {
+            metadata: isolated.path().join("metadata"),
+            content: isolated.path().join("content"),
+        })
+        .unwrap();
+        let profile = library
+            .add_profile("corrupt fixture", &corrupt_url, false)
+            .unwrap();
+        let job = library
+            .queue_tree(
+                &corrupt,
+                &profile.id,
+                &release_id,
+                &association.association.id,
+            )
+            .unwrap();
+        assert!(
+            library
+                .run_tree_job(&corrupt, &job.id, None)
+                .unwrap_err()
+                .to_string()
+                .contains("SHA-256")
+        );
+        assert_eq!(library.job(&job.id).unwrap().state, "Failed");
+        assert!(library.verified_trees(None).unwrap().is_empty());
+        assert!(library.install_windows_artifact(&job.id).is_err());
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

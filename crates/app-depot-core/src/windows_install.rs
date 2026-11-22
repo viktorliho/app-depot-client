@@ -1,7 +1,8 @@
-//! Windows managed File installation using the shared installation journal.
+//! Windows managed Artifact installation using the shared installation journal.
 use crate::{
     library::{Library, LibraryError, now},
     managed::Installation,
+    models::InventoryEntry,
     transfer::{DownloadJob, hash_file, hash_open_file},
     windows_fs,
 };
@@ -26,14 +27,21 @@ fn verify(file: &File, size: u64, digest: &str) -> io::Result<()> {
 impl Library {
     /// Explicitly install a completed File job. This operation does not interpret launch declarations.
     pub fn install_windows_file(&mut self, job_id: &str) -> Result<Installation, LibraryError> {
+        if !self.job(job_id)?.artifact_id.starts_with("adfile:sha256:") {
+            return Err(invalid("expected File Artifact"));
+        }
+        self.install_windows_artifact(job_id)
+    }
+
+    pub fn install_windows_artifact(&mut self, job_id: &str) -> Result<Installation, LibraryError> {
         let _slot = self.lock_download_slot()?;
         let job = self.job(job_id)?;
-        let digest = self.verified_windows_file(&job)?;
+        let payload = self.verified_windows_payload(&job)?;
         let existing =
             self.installation_for(&job.profile_id, &job.association_id, &job.artifact_id)?;
         let id = match existing {
             Some(item) if item.state == "Ready" => {
-                self.verify_windows_file_installation(&item.id)?;
+                self.verify_windows_installation(&item.id)?;
                 return Ok(item);
             }
             Some(item) if item.state == "Preparing" => item.id,
@@ -55,23 +63,31 @@ impl Library {
         #[cfg(test)]
         crate::transfer::pause_file_commit_test(&self.stage(job_id)?, "after-preparing");
         let item = self.installation(&id)?;
-        match windows_fs::inspect_installed_payload(&item.path, &id) {
-            Ok(file) => verify(&file, job.expected_size, digest)?,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                let object = self.object(&job.artifact_id)?;
-                windows_fs::publish_file_install(
-                    &object,
-                    &item.path,
-                    &id,
-                    job.expected_size,
-                    |file| verify(file, job.expected_size, digest),
-                )?;
-            }
+        match payload.verify_installation(&item, &job) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => match payload {
+                WindowsPayload::File(digest) => {
+                    let object = self.object(&job.artifact_id)?;
+                    windows_fs::publish_file_install(
+                        &object,
+                        &item.path,
+                        &id,
+                        job.expected_size,
+                        |file| verify(file, job.expected_size, digest),
+                    )?;
+                }
+                WindowsPayload::Tree(entries) => {
+                    windows_fs::publish_tree_install(&item.path, &id, &entries, |digest| {
+                        self.object(&format!("adfile:sha256:{digest}"))
+                            .map_err(io::Error::other)
+                    })?;
+                }
+            },
             Err(error) => return Err(error.into()),
         }
         #[cfg(test)]
         crate::transfer::pause_file_commit_test(&self.stage(job_id)?, "after-install-publication");
-        self.activate_windows_file(&item, &job)?;
+        self.activate_windows_installation(&item, &job)?;
         #[cfg(test)]
         crate::transfer::pause_file_commit_test(&self.stage(job_id)?, "after-activation");
         self.installation(&id)
@@ -79,15 +95,15 @@ impl Library {
 
     /// Activate a previously published, verified File install. An absent directory is left for
     /// explicit retry. Existing unexpected data is preserved rather than treated as staging.
-    pub fn reconcile_windows_file_installations(&mut self) -> Result<(), LibraryError> {
+    pub fn reconcile_windows_installations(&mut self) -> Result<(), LibraryError> {
         let _slot = self.lock_download_slot()?;
         for item in self.installations(None)? {
-            if item.state != "Preparing" || !item.artifact_id.starts_with("adfile:sha256:") {
+            if item.state != "Preparing" {
                 continue;
             }
             if let Err(error) = self
                 .completed_install_job(&item)
-                .and_then(|job| self.activate_windows_file(&item, &job))
+                .and_then(|job| self.activate_windows_installation(&item, &job))
             {
                 if matches!(&error, LibraryError::Io(error) if error.kind() == io::ErrorKind::NotFound)
                 {
@@ -102,39 +118,51 @@ impl Library {
         Ok(())
     }
 
-    pub fn verify_windows_file_installation(&self, id: &str) -> Result<(), LibraryError> {
+    pub fn verify_windows_installation(&self, id: &str) -> Result<(), LibraryError> {
         let item = self.installation(id)?;
         if item.state != "Ready" {
             return Err(invalid("installation is not ready"));
         }
         let job = self.completed_install_job(&item)?;
-        let digest = self.verified_windows_file(&job)?;
-        let file = windows_fs::inspect_installed_payload(&item.path, id)?;
-        verify(&file, job.expected_size, digest)?;
+        let payload = self.verified_windows_payload(&job)?;
+        payload.verify_installation(&item, &job)?;
         Ok(())
     }
 
-    fn verified_windows_file<'a>(&self, job: &'a DownloadJob) -> Result<&'a str, LibraryError> {
-        let digest = job
-            .artifact_id
-            .strip_prefix("adfile:sha256:")
-            .ok_or_else(|| invalid("only File Artifacts can be installed on Windows"))?;
-        // object() validates the digest before it can be used as a path.
-        let object = self.object(&job.artifact_id)?;
+    fn verified_windows_payload<'a>(
+        &self,
+        job: &'a DownloadJob,
+    ) -> Result<WindowsPayload<'a>, LibraryError> {
         let registered: bool = self.conn.query_row(
             "SELECT EXISTS (SELECT 1 FROM verified_content WHERE profile_id=?1 AND association_id=?2 AND artifact_id=?3)",
             params![job.profile_id.0, job.association_id, job.artifact_id],
             |row| row.get(0),
         )?;
         if job.state != "Completed" || !registered {
-            return Err(invalid("a completed verified File download is required"));
+            return Err(invalid(
+                "a completed verified Artifact download is required",
+            ));
         }
-        if hash_file(&object, job.expected_size)? != digest
-            || hash_file(&self.materialized(job)?, job.expected_size)? != digest
-        {
-            return Err(invalid("verified File bytes are missing or modified"));
+        if let Some(digest) = job.artifact_id.strip_prefix("adfile:sha256:") {
+            let object = self.object(&job.artifact_id)?;
+            if hash_file(&object, job.expected_size)? != digest
+                || hash_file(&self.materialized(job)?, job.expected_size)? != digest
+            {
+                return Err(invalid("verified File bytes are missing or modified"));
+            }
+            return Ok(WindowsPayload::File(digest));
         }
-        Ok(digest)
+        let entries = self
+            .tree_inventory(&job.id)?
+            .ok_or_else(|| invalid("Tree inventory missing"))?;
+        if crate::tree::identity(&entries)? != job.artifact_id {
+            return Err(invalid("Tree identity mismatch"));
+        }
+        crate::tree::validate_destination(&entries)?;
+        let visible = crate::tree_download::tree_destination(self, job)?;
+        self.verify_tree_directory(&visible, &entries)
+            .map_err(|error| invalid(&format!("verified Tree download is unavailable: {error}")))?;
+        Ok(WindowsPayload::Tree(entries))
     }
 
     fn completed_install_job(&self, item: &Installation) -> Result<DownloadJob, LibraryError> {
@@ -142,19 +170,20 @@ impl Library {
             "SELECT id FROM download_jobs WHERE profile_id=?1 AND association_id=?2 AND artifact_id=?3 AND state='Completed' ORDER BY updated_at DESC LIMIT 1",
             params![item.profile_id.0, item.association_id, item.artifact_id],
             |row| row.get(0),
-        ).optional()?.ok_or_else(|| invalid("installation lacks a completed File job"))?;
+        ).optional()?.ok_or_else(|| invalid("installation lacks a completed download job"))?;
         self.job(&id)
     }
 
-    fn activate_windows_file(
+    fn activate_windows_installation(
         &mut self,
         item: &Installation,
         job: &DownloadJob,
     ) -> Result<(), LibraryError> {
-        let digest = self.verified_windows_file(job)?;
-        let file = windows_fs::inspect_installed_payload(&item.path, &item.id)?;
-        verify(&file, job.expected_size, digest)?;
+        self.verified_windows_payload(job)?
+            .verify_installation(item, job)?;
         windows_fs::sync_directory(item.path.parent().unwrap())?;
+        #[cfg(test)]
+        windows_fs::pause_tree_test("before-tree-ready");
         if self.conn.execute(
             "UPDATE installations SET state='Ready',updated_at=?2,last_error=NULL WHERE id=?1 AND state='Preparing'",
             params![item.id, now()?],
@@ -162,5 +191,23 @@ impl Library {
             return Err(invalid("installation left Preparing before activation"));
         }
         Ok(())
+    }
+}
+
+enum WindowsPayload<'a> {
+    File(&'a str),
+    Tree(Vec<InventoryEntry>),
+}
+
+impl WindowsPayload<'_> {
+    fn verify_installation(&self, item: &Installation, job: &DownloadJob) -> io::Result<()> {
+        match self {
+            Self::File(digest) => verify(
+                &windows_fs::inspect_installed_payload(&item.path, &item.id)?,
+                job.expected_size,
+                digest,
+            ),
+            Self::Tree(entries) => windows_fs::verify_tree_install(&item.path, &item.id, entries),
+        }
     }
 }

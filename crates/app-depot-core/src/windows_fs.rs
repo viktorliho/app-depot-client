@@ -346,6 +346,7 @@ const _: () = {
     assert!(offset_of!(RenameInformation, name) == offset_of!(FILE_RENAME_INFORMATION, FileName));
 };
 
+#[cfg(test)]
 pub(crate) fn rename_directory_noreplace(from: &Path, to: &Path) -> io::Result<()> {
     let (Some(from_parent), Some(from_name), Some(to_parent), Some(to_name)) =
         (from.parent(), from.file_name(), to.parent(), to.file_name())
@@ -439,6 +440,40 @@ pub(crate) fn publish_file_install(
     size: u64,
     verify: impl FnOnce(&File) -> io::Result<()>,
 ) -> io::Result<()> {
+    publish_install(to, id, |stage| {
+        publish_copy_at(
+            from,
+            stage,
+            &name_utf16(OsStr::new("payload"))?,
+            size,
+            false,
+            verify,
+        )
+    })
+}
+
+pub(crate) fn publish_tree_install(
+    to: &Path,
+    id: &str,
+    entries: &[crate::models::InventoryEntry],
+    object: impl Fn(&str) -> io::Result<std::path::PathBuf>,
+) -> io::Result<()> {
+    publish_install(to, id, |stage| {
+        let payload = directory_child(
+            stage,
+            OsStr::new("payload"),
+            true,
+            DIRECTORY_ACCESS | GENERIC_WRITE,
+        )?;
+        write_tree(&payload, entries, object)
+    })
+}
+
+fn publish_install(
+    to: &Path,
+    id: &str,
+    write_payload: impl FnOnce(&File) -> io::Result<()>,
+) -> io::Result<()> {
     if to.file_name() != Some(OsStr::new(id)) {
         return Err(invalid("invalid installation identity"));
     }
@@ -456,14 +491,7 @@ pub(crate) fn publish_file_install(
         true,
         DIRECTORY_ACCESS | DELETE | GENERIC_WRITE,
     )?;
-    publish_copy_at(
-        from,
-        &stage,
-        &name_utf16(OsStr::new("payload"))?,
-        size,
-        false,
-        verify,
-    )?;
+    write_payload(&stage)?;
     let mut marker = open_child(
         &stage,
         OsStr::new(".app-depot-installation-id"),
@@ -476,45 +504,232 @@ pub(crate) fn publish_file_install(
     marker.sync_all()?;
     drop(marker);
     stage.sync_all()?;
+    #[cfg(test)]
+    pause_tree_test("before-tree-install-publication");
     rename_noreplace(&stage, parent, &name_utf16(OsStr::new(id))?)?;
     sync_directory(to.parent().unwrap())
 }
 
 pub(crate) fn inspect_installed_payload(to: &Path, id: &str) -> io::Result<File> {
+    let chain = installation_chain(to, id)?;
+    open_installed_file(chain.last().unwrap(), "payload")
+}
+
+pub(crate) fn verify_tree_install(
+    to: &Path,
+    id: &str,
+    entries: &[crate::models::InventoryEntry],
+) -> io::Result<()> {
+    let _installation = installation_chain(to, id)?;
+    verify_tree(&to.join("payload"), entries).map_err(|error| {
+        if error.kind() == io::ErrorKind::NotFound {
+            invalid("installed Tree is incomplete")
+        } else {
+            error
+        }
+    })
+}
+
+fn installation_chain(to: &Path, id: &str) -> io::Result<Vec<File>> {
     let chain = directory_chain(to, false)?;
     let directory = chain.last().unwrap();
-    let open = |name| {
-        let file = open_child(
-            directory,
-            OsStr::new(name),
-            GENERIC_READ | SYNCHRONIZE,
-            FILE_OPEN,
-            FILE_OPEN_REPARSE_POINT,
-            FILE_SHARE_READ,
-        )?;
-        let metadata = file.metadata()?;
-        if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-            return Err(invalid("unsafe file in installation"));
-        }
-        Ok(file)
-    };
     let mut marker = String::new();
-    let present = |name| {
-        open(name).map_err(|error| {
-            if error.kind() == io::ErrorKind::NotFound {
-                invalid("existing installation lacks marker or payload")
-            } else {
-                error
-            }
-        })
-    };
-    present(".app-depot-installation-id")?
+    open_installed_file(directory, ".app-depot-installation-id")?
         .take(37)
         .read_to_string(&mut marker)?;
     if marker != id {
         return Err(invalid("installation ownership marker mismatch"));
     }
-    present("payload")
+    Ok(chain)
+}
+
+fn open_installed_file(directory: &File, name: &str) -> io::Result<File> {
+    let file = open_child(
+        directory,
+        OsStr::new(name),
+        GENERIC_READ | SYNCHRONIZE,
+        FILE_OPEN,
+        FILE_OPEN_REPARSE_POINT,
+        FILE_SHARE_READ,
+    )
+    .map_err(|error| {
+        if error.kind() == io::ErrorKind::NotFound {
+            invalid("existing installation lacks marker or payload")
+        } else {
+            error
+        }
+    })?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(invalid("unsafe file in installation"));
+    }
+    Ok(file)
+}
+
+/// Constructs a new tree under an exclusive directory handle and publishes it by that handle.
+pub(crate) fn publish_tree(
+    destination: &Path,
+    entries: &[crate::models::InventoryEntry],
+    object: impl Fn(&str) -> io::Result<std::path::PathBuf>,
+) -> io::Result<()> {
+    let parent_path = destination
+        .parent()
+        .ok_or_else(|| invalid("Tree has no parent"))?;
+    let chain = directory_chain(parent_path, false)?;
+    let parent = chain.last().unwrap();
+    require_case_insensitive(parent)?;
+    let name = destination
+        .file_name()
+        .ok_or_else(|| invalid("Tree has no name"))?;
+    let stage_name = format!(".app-depot-tree-{}", uuid::Uuid::new_v4());
+    let stage = directory_child(
+        parent,
+        OsStr::new(&stage_name),
+        true,
+        DIRECTORY_ACCESS | DELETE | GENERIC_WRITE,
+    )?;
+    write_tree(&stage, entries, object)?;
+    rename_noreplace(&stage, parent, &name_utf16(name)?)?;
+    sync_directory(parent_path)
+}
+
+fn write_tree(
+    stage: &File,
+    entries: &[crate::models::InventoryEntry],
+    object: impl Fn(&str) -> io::Result<std::path::PathBuf>,
+) -> io::Result<()> {
+    use crate::models::InventoryEntry;
+    for entry in entries {
+        let mut components = entry.path().rsplitn(2, '/');
+        let leaf = OsStr::new(components.next().unwrap());
+        let mut ancestors = Vec::new();
+        for part in components
+            .next()
+            .into_iter()
+            .flat_map(|prefix| prefix.split('/'))
+        {
+            let ancestor = directory_child(
+                ancestors.last().unwrap_or(stage),
+                OsStr::new(part),
+                false,
+                DIRECTORY_ACCESS | GENERIC_WRITE,
+            )?;
+            ancestors.push(ancestor);
+        }
+        let target = ancestors.last().unwrap_or(stage);
+        require_case_insensitive(target)?;
+        match entry {
+            InventoryEntry::Directory { .. } => {
+                directory_child(target, leaf, true, DIRECTORY_ACCESS | GENERIC_WRITE)?
+                    .sync_all()?;
+            }
+            InventoryEntry::File { size, sha256, .. } => {
+                publish_copy_at(
+                    &object(sha256)?,
+                    target,
+                    &name_utf16(leaf)?,
+                    *size,
+                    false,
+                    |file| {
+                        let actual = crate::transfer::hash_open_file(file, *size)
+                            .map_err(io::Error::other)?;
+                        if actual != *sha256 {
+                            return Err(invalid("Tree source hash mismatch"));
+                        }
+                        Ok(())
+                    },
+                )?;
+            }
+        }
+        target.sync_all()?;
+        #[cfg(test)]
+        pause_tree_test("partial-tree-materialization");
+    }
+    stage.sync_all()
+}
+
+/// The open directory chain pins each enumerated path. Entries are reopened relative to
+/// pinned handles and checked for reparse points before reading or descending.
+pub(crate) fn verify_tree(
+    path: &Path,
+    entries: &[crate::models::InventoryEntry],
+) -> io::Result<()> {
+    use crate::models::InventoryEntry;
+    use std::collections::HashMap;
+    fn scan(
+        dir: &File,
+        path: &Path,
+        prefix: &str,
+        remaining: &mut HashMap<&str, &InventoryEntry>,
+    ) -> io::Result<()> {
+        require_case_insensitive(dir)?;
+        for child in std::fs::read_dir(path)? {
+            let child = child?;
+            let name = child.file_name();
+            let component = name
+                .to_str()
+                .ok_or_else(|| invalid("Tree name is not Unicode"))?;
+            validate_component(component)?;
+            let relative = if prefix.is_empty() {
+                component.to_owned()
+            } else {
+                format!("{prefix}/{component}")
+            };
+            let entry = remaining.remove(relative.as_str()).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("unexpected Tree entry: {relative}"),
+                )
+            })?;
+            match entry {
+                InventoryEntry::Directory { .. } => {
+                    let subdir = directory_child(dir, &name, false, DIRECTORY_ACCESS)?;
+                    scan(&subdir, &child.path(), &relative, remaining)?;
+                }
+                InventoryEntry::File { size, sha256, .. } => {
+                    let file = open_child(
+                        dir,
+                        &name,
+                        GENERIC_READ | SYNCHRONIZE,
+                        FILE_OPEN,
+                        FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT,
+                        FILE_SHARE_READ,
+                    )?;
+                    let meta = file.metadata()?;
+                    if !meta.is_file() || meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+                    {
+                        return Err(invalid("unsafe Tree file"));
+                    }
+                    if crate::transfer::hash_open_file(&file, *size).map_err(io::Error::other)?
+                        != *sha256
+                    {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("Tree hash mismatch: {relative}"),
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+    let chain = directory_chain(path, false)?;
+    let mut remaining = entries.iter().map(|entry| (entry.path(), entry)).collect();
+    scan(chain.last().unwrap(), path, "", &mut remaining)?;
+    if let Some(missing) = remaining.keys().min() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("missing Tree entry: {missing}"),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn pause_tree_test(boundary: &str) {
+    if let Some(stage) = std::env::var_os("APP_DEPOT_TREE_TEST_STAGE") {
+        crate::transfer::pause_file_commit_test(Path::new(&stage), boundary);
+    }
 }
 
 fn volume(file: &File) -> io::Result<u64> {
