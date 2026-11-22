@@ -21,9 +21,55 @@ fn profile_client(library: &Library, id: &ServerProfileId) -> Result<ApiClient, 
     }
     Ok(ApiClient::new(
         &profile.origin,
-        selected_token(&profile)?,
+        profile_token(&profile)?,
         profile.origin.starts_with("http://"),
     )?)
+}
+
+pub(super) fn profile_token(
+    profile: &app_depot_core::library::Profile,
+) -> Result<Option<String>, CliError> {
+    profile
+        .credential_ref
+        .as_deref()
+        .map(|reference| NativeSecrets.get(reference))
+        .transpose()
+        .map_err(Into::into)
+}
+
+pub(super) fn error_code(error: &CliError) -> &'static str {
+    match error {
+        CliError::Decky(code) => code,
+        CliError::Secret(SecretError::Unavailable | SecretError::Missing) => {
+            "secret_service_unavailable"
+        }
+        CliError::Secret(SecretError::Invalid) => "invalid_token",
+        CliError::Api(error) | CliError::Library(LibraryError::Api(error)) => match error {
+            ApiError::Authentication(_) => "authentication_required",
+            ApiError::Authorization(_) => "catalog_forbidden",
+            ApiError::Incompatible(_) | ApiError::Protocol(_) => "unsupported_protocol",
+            ApiError::Config(message) if message.starts_with("remote HTTP requires") => {
+                "http_consent_required"
+            }
+            ApiError::Config(message) if message == "invalid Bearer token" => "invalid_token",
+            ApiError::Config(_) => "invalid_url",
+            ApiError::Transport(details) => {
+                let details = details.to_ascii_lowercase();
+                if details.contains("timed out") || details.contains("timeout") {
+                    "timeout"
+                } else if details.contains("tls")
+                    || details.contains("certificate")
+                    || details.contains("ssl")
+                {
+                    "tls_failure"
+                } else {
+                    "server_unavailable"
+                }
+            }
+            ApiError::Http { .. } => "server_error",
+        },
+        _ => "internal",
+    }
 }
 
 fn public_profile(profile: &app_depot_core::library::Profile) -> Value {
@@ -146,6 +192,11 @@ fn artwork(
 }
 
 pub(super) fn run_decky(options: &Options) -> Result<(), CliError> {
+    if options.positional.len() == 2 && options.positional[1] == "discover" {
+        let results = app_depot_core::discovery::discover(Duration::from_secs(3))
+            .map_err(|_| CliError::Decky("discovery_unavailable"))?;
+        return Ok(print_json(&results)?);
+    }
     let mut library = open_library(options)?;
     let args = &options.positional;
     match args.as_slice() {
@@ -164,14 +215,28 @@ pub(super) fn run_decky(options: &Options) -> Result<(), CliError> {
             if input.len() > 16_384 {
                 return Err(SecretError::Invalid.into());
             }
+            let authenticated = !input.is_empty();
             let client = ApiClient::new(
                 origin,
                 (!input.is_empty()).then_some(input),
                 options.allow_insecure_http,
             )?;
-            let caps = client.ensure_read_compatible()?;
-            client.list_apps(caps.page_size().map_err(ApiError::Incompatible)?)?;
-            print_json(&json!({"connected":true,"origin":client.origin()}))?;
+            let probe = || {
+                let caps = client.ensure_read_compatible().map_err(|e| match e {
+                    ApiError::Http { status: 404, .. } => {
+                        ApiError::Incompatible("Capabilities route absent".into())
+                    }
+                    error => error,
+                })?;
+                client.list_apps(caps.page_size().map_err(ApiError::Incompatible)?)
+            };
+            let apps = probe().map_err(|error| match error {
+                ApiError::Authentication(_) if authenticated => CliError::Decky("invalid_token"),
+                ApiError::Authentication(_) => CliError::Decky("anonymous_reading_disabled"),
+                error => error.into(),
+            })?;
+            print_json(&json!({"connected":true,"origin":client.origin(),
+                "guest":!authenticated,"appCount":apps.len()}))?;
         }
         [_, action, id] if action == "sync" || action == "catalog" => {
             let profile = ServerProfileId(id.clone());
@@ -409,6 +474,7 @@ impl PlayUi {
                 &choice.entry_id,
                 &choice.declaration_revision,
             ])
+            .env("APP_DEPOT_DECKY_RPC", "1")
             .stderr(Stdio::piped())
             .spawn()
             .map_err(LibraryError::Io)?;
@@ -478,7 +544,20 @@ impl eframe::App for PlayUi {
         }
         if let Some(receiver) = &self.worker {
             for line in receiver.try_iter() {
-                self.phase = line;
+                self.phase = if let Ok(data) = serde_json::from_str::<Value>(&line) {
+                    match data["code"].as_str() {
+                        Some("authentication_required" | "invalid_token") => "This server requires authentication to access its catalog.",
+                        Some("secret_service_unavailable") => "Unlock Secret Service before retrying.",
+                        Some("server_unavailable") => "The Server is unavailable. Check the connection and retry.",
+                        Some("timeout") => "The Server did not respond in time. Try again.",
+                        Some("tls_failure") => "The HTTPS certificate or TLS connection could not be verified.",
+                        Some("catalog_forbidden") => "This profile cannot access the selected content.",
+                        Some("unsupported_protocol") => "The Server protocol is not supported.",
+                        _ => "App Depot could not prepare the application. Synchronize the Server profile and try again.",
+                    }.into()
+                } else {
+                    line
+                };
             }
             let exited = self
                 .active

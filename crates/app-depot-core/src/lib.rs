@@ -3,6 +3,7 @@
 //! HTTP catalog, local metadata, and verified file transfer live here.
 
 pub mod api;
+pub mod discovery;
 pub mod launch;
 pub mod library;
 pub mod managed;

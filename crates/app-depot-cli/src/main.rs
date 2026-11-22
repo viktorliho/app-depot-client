@@ -230,6 +230,8 @@ enum CliError {
     Secret(SecretError),
     #[cfg(all(feature = "decky", target_os = "linux"))]
     Child(std::process::ExitStatus),
+    #[cfg(all(feature = "decky", target_os = "linux"))]
+    Decky(&'static str),
 }
 fn api_exit(error: &ApiError) -> u8 {
     match error {
@@ -273,6 +275,8 @@ impl std::fmt::Display for CliError {
             Self::Api(error) => error.fmt(f),
             Self::Library(error) => error.fmt(f),
             Self::Secret(error) => error.fmt(f),
+            #[cfg(all(feature = "decky", target_os = "linux"))]
+            Self::Decky(code) => write!(f, "{code}"),
             #[cfg(all(feature = "decky", target_os = "linux"))]
             Self::Child(status) => write!(f, "Application exited with {status}"),
         }
@@ -740,9 +744,17 @@ fn run_first_play(options: &Options, prepare_only: bool) -> Result<(), CliError>
             )
             .into());
         }
+        #[cfg(all(feature = "decky", target_os = "linux"))]
+        let token = if prepare_only {
+            decky::profile_token(&profile)?
+        } else {
+            selected_token(&profile)?
+        };
+        #[cfg(not(all(feature = "decky", target_os = "linux")))]
+        let token = selected_token(&profile)?;
         let client = ApiClient::new(
             &profile.origin,
-            selected_token(&profile)?,
+            token,
             options.allow_insecure_http || (prepare_only && profile.origin.starts_with("http://")),
         )?;
         client.ensure_read_compatible()?;
@@ -1305,6 +1317,11 @@ fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
+            #[cfg(all(feature = "decky", target_os = "linux"))]
+            if env::var_os("APP_DEPOT_DECKY_RPC").is_some() {
+                eprintln!("{}", serde_json::json!({"code":decky::error_code(&error)}));
+                return ExitCode::FAILURE;
+            }
             eprintln!("{error}");
             ExitCode::from(match &error {
                 CliError::Api(error) | CliError::Library(LibraryError::Api(error)) => {
@@ -1312,6 +1329,8 @@ fn main() -> ExitCode {
                 }
                 CliError::Library(_) => 9,
                 CliError::Secret(_) => 10,
+                #[cfg(all(feature = "decky", target_os = "linux"))]
+                CliError::Decky(_) => 9,
                 #[cfg(all(feature = "decky", target_os = "linux"))]
                 CliError::Child(status) => {
                     use std::os::unix::process::ExitStatusExt;

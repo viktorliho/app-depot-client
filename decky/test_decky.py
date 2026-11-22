@@ -26,6 +26,27 @@ ACCOUNT = "111"
 ID = 0x80000004
 
 
+class ConnectionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_rpc_reports_expected_errors_and_hides_exception_details(self):
+        plugin = main.Plugin()
+
+        async def rejected(*_):
+            raise main.RpcFailure("anonymous_reading_disabled")
+
+        plugin.test = rejected
+        self.assertEqual(await plugin.request("test", "http://test.local", "", True),
+                         {"ok": False, "code": "anonymous_reading_disabled"})
+
+        async def broken():
+            raise RuntimeError("fixture secret and private path")
+
+        plugin.discover = broken
+        with self.assertLogs("main", level="WARNING") as logs:
+            self.assertEqual(await plugin.request("discover"), {"ok": False, "code": "internal"})
+        self.assertNotIn("fixture secret", str(logs.output))
+        self.assertEqual(await plugin.request("_rust"), {"ok": False, "code": "internal"})
+
+
 class ShortcutTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.temporary = tempfile.TemporaryDirectory()

@@ -111,6 +111,51 @@ def publish_fixture(opener, origin, token, program):
     return app, release, association
 
 
+def set_with_etag(opener, origin, token, path, data):
+    headers = {"Authorization": f"Bearer {token}"}
+    with opener.open(Request(origin + "/api/v1" + path, headers=headers), timeout=10) as response:
+        etag = response.headers["ETag"]
+    return request(opener, origin, "PATCH", path, data, {**headers, "If-Match": etag})
+
+
+def enable_guest(opener, origin, token, app):
+    anonymous = build_opener(ProxyHandler({}))
+    assert set_with_etag(opener, origin, token, "/settings", {"anonymousReadEnabled": True})[
+        "anonymousReadEnabled"
+    ]
+    assert request(anonymous, origin, "GET", "/apps")["items"] == []
+    headers = {"Authorization": f"Bearer {token}", "Idempotency-Key": "guest-draft"}
+    draft = request(opener, origin, "POST", "/apps", {"name": "Public Draft Fixture"}, headers)["id"]
+    set_with_etag(opener, origin, token, f"/apps/{draft}", {"visibility": "Public"})
+    # A Published release on a separate Private App stays outside the guest catalog.
+    payload = b"private fixture"
+    upload = request(opener, origin, "POST", "/uploads", {
+        "mode": "BareFile", "target": {"newAppName": "Private Published Fixture"},
+        "file": {"sha256": hashlib.sha256(payload).hexdigest(), "size": len(payload)},
+    }, {**headers, "Idempotency-Key": "guest-private-upload"})
+    upload_path = f"/uploads/{upload['id']}"
+    request(opener, origin, "PUT", f"{upload_path}/files/{upload['file']['fileId']}", payload,
+            {**headers, "Content-Type": "application/octet-stream", "Content-Range": f"bytes 0-{len(payload)-1}/{len(payload)}"})
+    private = request(opener, origin, "POST", upload_path + "/finalize",
+                      headers={**headers, "Idempotency-Key": "guest-private-finalize"})
+    release_path = f"/releases/{private['releaseId']}"
+    with opener.open(Request(origin + "/api/v1" + release_path, headers=headers), timeout=10) as response:
+        release_etag = response.headers["ETag"]
+    request(opener, origin, "POST", release_path + "/publish",
+            headers={**headers, "If-Match": release_etag, "Idempotency-Key": "guest-private-publish"})
+    set_with_etag(opener, origin, token, f"/apps/{app}", {"visibility": "Public"})
+    assert {row["id"] for row in request(anonymous, origin, "GET", "/apps")["items"]} == {app}
+    for path in (f"/apps/{draft}", f"/apps/{private['appId']}", f"{release_path}/declaration-snapshot",
+                 f"/artifacts/{private['artifactId']}/content"):
+        try:
+            request(anonymous, origin, "GET", path)
+        except HTTPError as error:
+            assert error.code == 404, path
+        else:
+            raise AssertionError(f"Guest reached {path}")
+    return anonymous
+
+
 def wait_ready(server, log):
     for _ in range(200):
         if server.poll() is not None:
@@ -130,7 +175,7 @@ def wait_ready(server, log):
     raise TimeoutError("Dev Server did not start")
 
 
-def verify_decky(args, root, origin, token, app, server):
+def verify_decky(args, root, origin, token, app, server, opener, server_origin):
     """Exercise the packaged backend, OS credential store and wrapper."""
     package_root = root / "plugin"
     (package_root / "bin").mkdir(parents=True)
@@ -152,11 +197,17 @@ def verify_decky(args, root, origin, token, app, server):
             if args.decky_lan_host:
                 try:
                     await backend.test(origin, token)
-                except RuntimeError as error:
-                    assert "explicit --allow-insecure-http" in str(error)
+                except module.RpcFailure as error:
+                    assert error.code == "http_consent_required"
                 else:
                     raise AssertionError("LAN HTTP connected without consent")
             allow_http = bool(args.decky_lan_host)
+            assert await backend.request("test", origin, "", allow_http) == {
+                "ok": False, "code": "anonymous_reading_disabled",
+            }
+            assert await backend.request("test", origin, "invalid-fixture-token", allow_http) == {
+                "ok": False, "code": "invalid_token",
+            }
             assert (await backend.test(origin, token, allow_http))["connected"]
             profile = await backend.configure(origin, token, allow_http)
             assert (await backend.status())["profiles"][0]["authenticated"]
@@ -187,10 +238,52 @@ def verify_decky(args, root, origin, token, app, server):
             await backend._unload()
 
     asyncio.run(check_after_reload())
+    anonymous = enable_guest(opener, server_origin, token, app)
+    assert request(anonymous, server_origin, "GET", f"/apps/{app}/artwork/steam.grid.vertical/content")
+    guest_home = root / "steam-guest"
+    guest_home.mkdir()
+
+    async def configure_guest():
+        backend = module.Plugin()
+        await backend._main()
+        try:
+            allow_http = bool(args.decky_lan_host)
+            assert await backend.request("configure", origin, "", allow_http) == {
+                "ok": False, "code": "saved_credentials",
+            }
+            assert (await backend.status())["profiles"][0]["authenticated"]
+        finally:
+            await backend._unload()
+        os.environ["DECKY_USER_HOME"] = str(guest_home)
+        os.environ["XDG_DATA_HOME"] = str(guest_home / "data")
+        guest = module.Plugin()
+        await guest._main()
+        try:
+            result = await guest.request("test", origin, "", allow_http)
+            assert result["ok"] and result["value"]["guest"] and result["value"]["appCount"] == 1
+            guest_profile = await guest.configure(origin, "", allow_http)
+            assert not (await guest.status())["profiles"][0]["authenticated"]
+            assert [row["id"] for row in await guest.catalog(guest_profile, True)] == [app]
+            image = await guest._rust("decky", "artwork", guest_profile, app, "steam.grid.vertical", "muted", "")
+            assert image["png"]
+            return guest_profile
+        finally:
+            await guest._unload()
+
+    guest_profile = asyncio.run(configure_guest())
+    guest_env = dict(os.environ, HOME=str(guest_home), APP_DEPOT_TOKEN="invalid-fixture-token")
+    guest_command = [args.client, "decky", "play", guest_profile, app]
+    first = subprocess.run(guest_command, check=True, timeout=45, env=guest_env, capture_output=True, text=True)
+    assert "m30 fixture executed" in first.stdout
     server.terminate()
     server.wait(timeout=20)
     env.pop("DISPLAY", None)
     env.pop("WAYLAND_DISPLAY", None)
+    guest_env.pop("DISPLAY", None)
+    guest_env.pop("WAYLAND_DISPLAY", None)
+    guest_offline = subprocess.run(guest_command, check=True, timeout=15, env=guest_env, capture_output=True, text=True)
+    assert "m30 fixture executed" in guest_offline.stdout
+    print("PASS guest access, private and draft isolation, disabled access, invalid token, artwork and guest offline replay")
     offline = subprocess.run(command, check=True, timeout=15, env=env, capture_output=True, text=True)
     assert "m30 fixture executed" in offline.stdout
 
@@ -330,7 +423,7 @@ def run(args, root):
             decky_origin = origin
             if args.decky_lan_host:
                 decky_origin = origin.replace("127.0.0.1", args.decky_lan_host)
-            verify_decky(args, root, decky_origin, token, app, server)
+            verify_decky(args, root, decky_origin, token, app, server, opener, origin)
         else:
             server.terminate()
             server.wait(timeout=20)

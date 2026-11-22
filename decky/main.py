@@ -106,6 +106,12 @@ def atomic(path, data, mode=0o600):
             tmp.unlink(missing_ok=True)
 
 
+class RpcFailure(RuntimeError):
+    def __init__(self, code):
+        super().__init__(code)
+        self.code = code
+
+
 class Plugin:
     async def _main(self):
         if os.geteuid() == 0:
@@ -139,7 +145,7 @@ class Plugin:
                                or args[:3] == ("--json", "profile", "add")):
             raise ValueError("HTTP consent only applies to Server setup")
         match args:
-            case ("decky", "status"):
+            case ("decky", "status" | "discover"):
                 pass
             case ("decky", "test", origin) | ("--json", "profile", "add", "App Depot Server", origin):
                 self._origin(origin)
@@ -157,12 +163,13 @@ class Plugin:
         env = {key: value for key, value in os.environ.items()
                if not key.startswith("APP_DEPOT_")}
         env["HOME"] = str(self.home)
+        env["APP_DEPOT_DECKY_RPC"] = "1"
         runtime = Path("/run/user") / str(os.getuid())
         if (runtime / "bus").is_socket():
             env.setdefault("XDG_RUNTIME_DIR", str(runtime))
             env.setdefault("DBUS_SESSION_BUS_ADDRESS", f"unix:path={runtime / 'bus'}")
-        if len(token.encode()) > 16384 or any(c in token for c in ("\r", "\n", "\0")):
-            raise ValueError("Invalid token")
+        if not isinstance(token, str) or len(token.encode()) > 16384 or any(c in token for c in ("\r", "\n", "\0")):
+            raise RpcFailure("invalid_token")
         flags = ["--allow-insecure-http"] if allow_http else []
         child = await asyncio.create_subprocess_exec(
             str(self.plugin / "bin/app-depot"), *flags, *args, stdin=asyncio.subprocess.PIPE,
@@ -174,11 +181,11 @@ class Plugin:
                 raise RuntimeError("App Depot is reloading")
             output, error = await asyncio.wait_for(child.communicate(token.encode()), 180)
             if child.returncode:
-                # CLI errors do not echo stdin. Suppress it defensively if present.
-                message = error.decode(errors="replace").strip()[:1000]
-                if token:
-                    message = message.replace(token, "[redacted]")
-                raise RuntimeError(message or "App Depot command failed")
+                try:
+                    code = json.loads(error)["code"]
+                except (ValueError, KeyError, TypeError):
+                    code = "internal"
+                raise RpcFailure(code)
             if args[:2] in (("profile", "token-set"), ("profile", "token-remove")):
                 return None
             return json.loads(output) if output else None
@@ -187,6 +194,32 @@ class Plugin:
                 child.kill()
                 await child.wait()
             self.children.discard(child)
+
+    async def request(self, method, *args):
+        operations = {
+            "status": self.status, "discover": self.discover, "test": self.test,
+            "configure": self.configure, "catalog": self.catalog, "artwork": self.artwork,
+            "shortcut": self.shortcut, "acknowledge": self.acknowledge, "binding": self.binding,
+        }
+        if not isinstance(method, str) or method not in operations:
+            return {"ok": False, "code": "internal"}
+        try:
+            return {"ok": True, "value": await operations[method](*args)}
+        except RpcFailure as error:
+            return {"ok": False, "code": error.code}
+        except asyncio.TimeoutError:
+            return {"ok": False, "code": "timeout"}
+        except Exception as error:
+            # Details can contain Server response text or user paths. Record only
+            # the action and exception class for local diagnostics.
+            import logging
+            logging.getLogger(__name__).warning("App Depot RPC %s: %s",
+                                                method,
+                                                type(error).__name__)
+            return {"ok": False, "code": "internal"}
+
+    async def discover(self):
+        return await self._rust("decky", "discover")
 
     async def status(self):
         return await self._rust("decky", "status")
@@ -198,7 +231,7 @@ class Plugin:
     @staticmethod
     def _origin(origin):
         if not isinstance(origin, str) or len(origin) > 2048 or origin.startswith("-"):
-            raise ValueError("Enter a valid Server URL")
+            raise RpcFailure("invalid_url")
 
     async def configure(self, origin, token, allow_http=False):
         origin = (await self.test(origin, token, allow_http))["origin"]
@@ -212,7 +245,7 @@ class Plugin:
             if token:
                 await self._rust("profile", "token-set", ident, "--token-stdin", token=token)
             elif profile.get("authenticated"):
-                await self._rust("profile", "token-remove", ident)
+                raise RpcFailure("saved_credentials")
             return ident
 
     async def catalog(self, profile, refresh):

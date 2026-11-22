@@ -14,15 +14,55 @@ const environment = window as unknown as {
 const account = () => steamId(environment.App?.m_CurrentUser?.strSteamID ?? '');
 const steam = () => environment.SteamClient?.Apps ?? {};
 const bridgeReady = () => Boolean(steam().AddShortcut && steam().RegisterForAppDetails);
-const statusRpc = callable<[], Status>('status');
-const test = callable<[string, string, boolean], { connected: boolean }>('test');
-const configure = callable<[string, string, boolean], string>('configure');
-const catalog = callable<[string, boolean], CatalogApp[]>('catalog');
+type Candidate = { name: string; origin: string };
+type Probe = { connected: boolean; guest: boolean; appCount: number };
+type Result<T> = { ok: true; value: T } | { ok: false; code: string };
+const request = callable<[string, ...unknown[]], Result<unknown>>('request');
+const messages: Record<string, string> = {
+  authentication_required: 'This server requires authentication to access its catalog.',
+  anonymous_reading_disabled: 'This server requires authentication to access its catalog. Use an access token or ask the administrator to enable anonymous reading.',
+  invalid_token: 'This server rejected the access token. Check it and try again.',
+  invalid_url: 'Enter a valid HTTP or HTTPS Server address.',
+  http_consent_required: 'Enable Allow unencrypted HTTP before connecting to this address.',
+  catalog_forbidden: 'This account is not allowed to read the catalog.',
+  unsupported_protocol: 'This endpoint does not provide a compatible App Depot Server API.',
+  server_unavailable: 'The Server is unavailable. Check the address and try again.',
+  timeout: 'The Server did not respond in time. Try again.',
+  tls_failure: 'The HTTPS certificate or TLS connection could not be verified.',
+  server_error: 'The Server could not complete this request.',
+  secret_service_unavailable: 'Secret Service is unavailable or the saved credential is missing. Unlock the user keyring and try again.',
+  saved_credentials: 'This Server already has a saved token. Synchronize its existing profile to keep that configuration.',
+  discovery_unavailable: 'LAN discovery is unavailable. Enter the Server address manually.',
+  internal: 'App Depot could not complete this operation. Check the plugin diagnostics.',
+};
+
+class ConnectionFailure extends Error {
+  constructor(code: string) { super(messages[code] ?? messages.internal); this.code = code; }
+  readonly code: string;
+}
+
+function rpcMethod<A extends unknown[], T>(method: string) {
+  return async (...args: A): Promise<T> => {
+    let result: Result<unknown>;
+    try {
+      result = await request(method, ...args);
+    } catch {
+      throw new ConnectionFailure('internal');
+    }
+    if (!result.ok) throw new ConnectionFailure(result.code);
+    return result.value as T;
+  };
+}
+const statusRpc = rpcMethod<[], Status>('status');
+const discover = rpcMethod<[], Candidate[]>('discover');
+const test = rpcMethod<[string, string, boolean], Probe>('test');
+const configure = rpcMethod<[string, string, boolean], string>('configure');
+const catalog = rpcMethod<[string, boolean], CatalogApp[]>('catalog');
 const rpc: Bridge = {
-  shortcut: callable('shortcut'),
-  acknowledge: callable('acknowledge'),
-  binding: callable('binding'),
-  artwork: callable('artwork'),
+  shortcut: rpcMethod('shortcut'),
+  acknowledge: rpcMethod('acknowledge'),
+  binding: rpcMethod('binding'),
+  artwork: rpcMethod('artwork'),
 };
 
 let lastOperations = 'Steam synchronization pending';
@@ -64,6 +104,14 @@ function AppDepot() {
   const [rows, setRows] = useState<CatalogApp[]>([]);
   const [origin, setOrigin] = useState('');
   const [token, setToken] = useState('');
+  const [useToken, setUseToken] = useState(false);
+  const [manual, setManual] = useState(false);
+  const [selected, setSelected] = useState<Candidate>();
+  const [candidates, setCandidates] = useState<Candidate[]>([]);
+  const [searching, setSearching] = useState(false);
+  const [verified, setVerified] = useState<Record<string, string>>({});
+  const [searched, setSearched] = useState(false);
+  const [discoveryError, setDiscoveryError] = useState('');
   const [allowHttp, setAllowHttp] = useState(false);
   const isHttp = /^http:\/\//i.test(origin.trim());
   const [message, setMessage] = useState('');
@@ -83,6 +131,34 @@ function AppDepot() {
     return () => clearInterval(timer);
   }, []);
 
+  async function search() {
+    setSearching(true);
+    setSearched(true);
+    setCandidates([]);
+    setDiscoveryError('');
+    try {
+      setCandidates(await discover());
+    } catch (error) {
+      setDiscoveryError(error instanceof Error ? error.message : messages.internal);
+    } finally {
+      setSearching(false);
+    }
+  }
+
+  useEffect(() => {
+    if (status && status.profiles.length === 0 && !searched) void search();
+  }, [status, searched]);
+
+  function choose(candidate?: Candidate) {
+    setSelected(candidate);
+    setManual(!candidate);
+    setOrigin(candidate?.origin ?? '');
+    setUseToken(false);
+    setToken('');
+    setAllowHttp(false);
+    setMessage('');
+  }
+
   async function operation(action: () => Promise<void>) {
     setBusy(true);
     setMessage('');
@@ -90,7 +166,8 @@ function AppDepot() {
       await action();
       await update();
     } catch (error) {
-      setMessage(String(error));
+      if (error instanceof ConnectionFailure && error.code === 'anonymous_reading_disabled') setUseToken(true);
+      setMessage(error instanceof Error ? error.message : messages.internal);
     } finally {
       setBusy(false);
     }
@@ -98,23 +175,46 @@ function AppDepot() {
 
   return <>
     <PanelSection title="Server">
-      <PanelSectionRow><TextField label="Server URL" value={origin} onChange={event => { setOrigin(event.target.value); setAllowHttp(false); }} /></PanelSectionRow>
-      {isHttp && <PanelSectionRow><ToggleField label="Allow unencrypted HTTP"
-        description="HTTP sends access tokens without transport encryption. Only enable this if you accept that someone on the network could read the token."
-        checked={allowHttp} onChange={setAllowHttp} disabled={busy} /></PanelSectionRow>}
-      <PanelSectionRow><TextField label="Access token (optional)" bIsPassword value={token} onChange={event => setToken(event.target.value)} /></PanelSectionRow>
-      <PanelSectionRow><ButtonItem layout="below" disabled={busy || !origin} onClick={() => operation(async () => {
-        await test(origin.trim(), token, isHttp && allowHttp);
-        setMessage('Connection and catalog access verified.');
-      })}>Test connection</ButtonItem></PanelSectionRow>
-      <PanelSectionRow><ButtonItem layout="below" disabled={busy || !origin} onClick={() => operation(async () => {
-        const profile = await configure(origin.trim(), token, isHttp && allowHttp);
-        setToken('');
-        await refresh(profile);
-        setMessage(lastOperations);
-      })}>Save and synchronize</ButtonItem></PanelSectionRow>
+      {searching && <PanelSectionRow><div role="status">Searching for App Depot Servers…</div></PanelSectionRow>}
+      {discoveryError && <PanelSectionRow>{discoveryError}</PanelSectionRow>}
+      {searched && !searching && !discoveryError && !candidates.length && <PanelSectionRow>No Servers discovered</PanelSectionRow>}
+      {candidates.map(candidate => <PanelSectionRow key={candidate.origin}>
+        <ButtonItem layout="below" disabled={busy} description={`${candidate.origin} · ${verified[candidate.origin] ?? 'Unverified'}`}
+          onClick={() => choose(candidate)}>{candidate.name}</ButtonItem>
+      </PanelSectionRow>)}
+      <PanelSectionRow><ButtonItem layout="below" disabled={searching || busy} onClick={search}>Discover Servers</ButtonItem></PanelSectionRow>
+      <PanelSectionRow><ButtonItem layout="below" disabled={busy} onClick={() => choose()}>Enter address manually</ButtonItem></PanelSectionRow>
+      {(selected || manual) && <>
+        {manual ? <PanelSectionRow><TextField label="Server URL" value={origin}
+          onChange={event => { setOrigin(event.target.value); setAllowHttp(false); setToken(''); setMessage(''); }} /></PanelSectionRow>
+          : <PanelSectionRow>{selected?.origin}</PanelSectionRow>}
+        {isHttp && <PanelSectionRow><ToggleField label="Allow unencrypted HTTP"
+          description="HTTP sends access tokens without transport encryption. Only enable this if you accept that someone on the network could read the token."
+          checked={allowHttp} onChange={setAllowHttp} disabled={busy} /></PanelSectionRow>}
+        <PanelSectionRow><ToggleField label="Use an access token" checked={useToken} disabled={busy}
+          description="Guest access includes only Public Published items. Use a token to access other items you have permission to read."
+          onChange={checked => { setUseToken(checked); if (!checked) setToken(''); }} /></PanelSectionRow>
+        {useToken && <PanelSectionRow><TextField label="Access token" bIsPassword value={token}
+          onChange={event => setToken(event.target.value)} /></PanelSectionRow>}
+        <PanelSectionRow><ButtonItem layout="below" disabled={busy || !origin || (useToken && !token)}
+          onClick={() => operation(async () => {
+            const result = await test(origin.trim(), useToken ? token : '', isHttp && allowHttp);
+            setVerified(previous => ({ ...previous, [origin.trim()]: result.guest ? 'Guest verified' : 'Token verified' }));
+            setMessage(result.guest
+              ? `Guest access verified. ${result.appCount} Public Published Apps are currently accessible.`
+              : 'Authenticated catalog access verified.');
+          })}>Test connection</ButtonItem></PanelSectionRow>
+        <PanelSectionRow><ButtonItem layout="below" disabled={busy || !origin || (useToken && !token)}
+          onClick={() => operation(async () => {
+            const profile = await configure(origin.trim(), useToken ? token : '', isHttp && allowHttp);
+            setToken('');
+            setVerified(previous => ({ ...previous, [origin.trim()]: useToken ? 'Token verified' : 'Guest verified' }));
+            await refresh(profile);
+            setMessage(useToken ? lastOperations : `Guest · ${lastOperations}. Guest access includes only Public Published items.`);
+          })}>Save and synchronize</ButtonItem></PanelSectionRow>
+      </>}
       {status?.profiles.map(profile => <PanelSectionRow key={profile.id}>
-        <ButtonItem layout="below" disabled={busy} description={`${profile.origin.startsWith("http://") ? "HTTP · unencrypted · " : ""}${profile.status} · ${profile.lastSync ? new Date(profile.lastSync).toLocaleString() : 'Never synchronized'}`}
+        <ButtonItem layout="below" disabled={busy} description={`${profile.origin.startsWith("http://") ? "HTTP · unencrypted · " : ""}${profile.authenticated ? "Token" : "Guest"} · ${profile.status} · ${profile.lastSync ? new Date(profile.lastSync).toLocaleString() : 'Never synchronized'}`}
           onClick={() => operation(async () => { await refresh(profile.id); setMessage(lastOperations); })}>
           Synchronize {profile.origin}
         </ButtonItem>
