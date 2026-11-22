@@ -538,6 +538,23 @@ pub(crate) struct LaunchBinding {
     _image: File,
 }
 
+impl LaunchBinding {
+    pub(crate) fn matches(&self, other: &Self) -> io::Result<bool> {
+        let work = |binding: &Self| {
+            let file = binding
+                ._working_directory
+                .last()
+                .or_else(|| binding._installation.last())
+                .unwrap();
+            file_identity(file)
+        };
+        Ok(
+            file_identity(&self._image)? == file_identity(&other._image)?
+                && work(self)? == work(other)?,
+        )
+    }
+}
+
 pub(crate) fn bind_launch_target(
     installation: &Path,
     id: &str,
@@ -810,7 +827,7 @@ pub(crate) fn pause_tree_test(boundary: &str) {
     }
 }
 
-fn volume(file: &File) -> io::Result<u64> {
+fn file_identity(file: &File) -> io::Result<(u64, [u8; 16])> {
     let mut info = FILE_ID_INFO::default();
     // SAFETY: FileIdInfo writes to a FILE_ID_INFO buffer and file stays open during the call.
     let ok = unsafe {
@@ -824,7 +841,11 @@ fn volume(file: &File) -> io::Result<u64> {
     if ok == 0 {
         return Err(io::Error::last_os_error());
     }
-    Ok(info.VolumeSerialNumber)
+    Ok((info.VolumeSerialNumber, info.FileId.Identifier))
+}
+
+fn volume(file: &File) -> io::Result<u64> {
+    Ok(file_identity(file)?.0)
 }
 
 fn delete_open_file(file: File) -> io::Result<()> {

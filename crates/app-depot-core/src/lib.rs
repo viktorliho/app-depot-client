@@ -17,6 +17,8 @@ pub mod tree_download;
 mod windows_fs;
 #[cfg(windows)]
 mod windows_install;
+#[cfg(windows)]
+pub mod windows_process;
 
 /// Locally generated identity for a configured Server profile. A URL is not an identity:
 /// endpoints may move, and different profiles may use the same URL with different credentials.

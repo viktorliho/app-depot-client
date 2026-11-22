@@ -147,8 +147,7 @@ pub enum Command {
 }
 
 pub(crate) const WINDOWS_INSTALL_ONLY: bool = cfg!(windows);
-pub(crate) const WINDOWS_INSTALL_NOTICE: &str =
-    "Windows supports File and Tree installation. Play, repair and removal are unavailable.";
+pub(crate) const WINDOWS_INSTALL_NOTICE: &str = "Windows supports File and Tree installation and native Play. Repair and removal are unavailable.";
 
 impl Command {
     fn blocked_on_windows(&self) -> bool {
@@ -160,8 +159,7 @@ impl Command {
             | Self::RepairInstallation(_)
             | Self::RemoveArtifact { .. }
             | Self::RemoveApp { .. }
-            | Self::RepairSource { .. }
-            | Self::Play { .. } => true,
+            | Self::RepairSource { .. } => true,
             _ => false,
         }
     }
@@ -469,9 +467,7 @@ pub(crate) fn snapshot(
         let (trees, tree_issues) = lib.inspect_trees(Some(id)).map_err(|e| e.to_string())?;
         result.trees = trees;
         result.local_issues.extend(tree_issues);
-        if WINDOWS_INSTALL_ONLY {
-            return Ok(result);
-        }
+
         for app in &result.apps {
             for release in &app.releases {
                 if release.declaration.is_some() {
@@ -1316,7 +1312,23 @@ fn run(
     if let Ok(value) = snapshot(&lib, None) {
         send(&tx, &ctx, Event::Snapshot(Box::new(value)));
     }
+    #[cfg(windows)]
+    let mut previous_processes = Vec::new();
+    #[cfg(windows)]
+    let mut next_process_poll = Instant::now();
     loop {
+        #[cfg(windows)]
+        if Instant::now() >= next_process_poll {
+            next_process_poll = Instant::now() + Duration::from_secs(1);
+            if let Ok(processes) = lib.windows_active_processes()
+                && processes != previous_processes
+            {
+                previous_processes = processes;
+                if let Ok(value) = snapshot(&lib, selected.as_ref()) {
+                    send(&tx, &ctx, Event::Snapshot(Box::new(value)));
+                }
+            }
+        }
         while let Ok(done) = background_rx.try_recv() {
             match done {
                 Background::DownloadFinished { id, result } => {

@@ -865,7 +865,7 @@ impl Library {
         Ok(child)
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", windows)))]
     pub fn play_declared(
         &self,
         _profile: &ServerProfileId,

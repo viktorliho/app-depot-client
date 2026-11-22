@@ -949,6 +949,13 @@ impl Desktop {
             .filter(|c| c.association_id == association)
             .cloned()
             .collect();
+        if let Some(process) = choices
+            .iter()
+            .find(|candidate| matches!(candidate.status.as_str(), "Running" | "ProcessUnknown"))
+        {
+            ui.label(&process.reason);
+            return;
+        }
         let has_playable = choices.iter().any(|c| launch_is_playable(&c.status));
         let unavailable: Vec<_> = choices
             .iter()
@@ -1080,7 +1087,8 @@ impl Desktop {
                             ui.label(RichText::new(summary).size(17.0).color(palette.text));
                         }
                         ui.add_space(14.0);
-                        let ready:Vec<_>=self.snapshot.launches.iter().filter(|c|launch_is_playable(&c.status) && view.releases.iter().any(|r|r.associations.iter().any(|item|item.association.id==c.association_id))).cloned().collect();
+                        let mut candidates=self.snapshot.launches.iter().filter(|c|view.releases.iter().any(|r|r.associations.iter().any(|item|item.association.id==c.association_id)));
+                        let ready:Vec<_>=candidates.clone().filter(|c|launch_is_playable(&c.status)).cloned().collect();
                         let action = primary_action(
                             ready.len(),
                             view.releases.len(),
@@ -1097,6 +1105,8 @@ impl Desktop {
                             ui.label(RichText::new(format!("{version} · {}",candidate.label.as_deref().unwrap_or(&candidate.entry_id))).size(13.0).color(palette.muted));
                         } else if action==PrimaryAction::ChooseLaunch {
                             ui.menu_button("Choose Play", |ui| self.play_options_menu(ui, &ready));
+                        } else if let Some(process) = candidates.find(|c| matches!(c.status.as_str(), "Running" | "ProcessUnknown")) {
+                            ui.label(&process.reason);
                         } else if let Some(release)=view.releases.first().filter(|_|view.releases.len()==1)
                             && let Some(item)=release.associations.first().filter(|_|release.associations.len()==1)
                             && let Some(artifact)=&item.artifact

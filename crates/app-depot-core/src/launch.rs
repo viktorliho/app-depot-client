@@ -100,8 +100,8 @@ fn arguments(value: Option<&Value>) -> Option<Vec<String>> {
         })
         .collect()
 }
-#[cfg(target_os = "linux")]
-fn sensitive_env_name(key: &std::ffi::OsStr) -> bool {
+#[cfg(any(target_os = "linux", windows))]
+pub(crate) fn sensitive_env_name(key: &std::ffi::OsStr) -> bool {
     let name = key.to_string_lossy().to_ascii_uppercase();
     name.starts_with("APP_DEPOT_")
         || name.contains("TOKEN")
@@ -109,6 +109,19 @@ fn sensitive_env_name(key: &std::ffi::OsStr) -> bool {
         || name.contains("PASSWORD")
         || name == "SSH_AUTH_SOCK"
 }
+#[cfg(windows)]
+fn windows_paths(file: bool, target: &str, work: &str) -> (String, String) {
+    if file {
+        return ("payload".into(), String::new());
+    }
+    let work = if work.is_empty() {
+        "payload".into()
+    } else {
+        format!("payload/{work}")
+    };
+    (format!("payload/{target}"), work)
+}
+
 impl Library {
     /// Assess every entry in a cached, consistent Release declaration snapshot.
     /// Assessment is local and does not contact the Server or execute anything.
@@ -384,37 +397,44 @@ impl Library {
                     }
                     #[cfg(windows)]
                     {
-                        let runtime = runtime.expect("resolved installation");
-                        let target = if file {
-                            "payload".into()
-                        } else {
-                            format!("payload/{target_path}")
-                        };
-                        let work = if file || work.is_empty() {
-                            if file {
-                                String::new()
-                            } else {
-                                "payload".into()
-                            }
-                        } else {
-                            format!("payload/{work}")
-                        };
-                        match crate::windows_fs::bind_launch_target(
-                            &runtime.path,
-                            &runtime.id,
-                            &target,
-                            &work,
-                        ) {
-                            Ok(_) => issue(
-                                &mut c,
-                                "UnsupportedPlatform",
-                                "Windows launch target validated. Native execution is unavailable.",
-                            ),
-                            Err(error) => issue(
+                        if referenced != 1 {
+                            issue(
                                 &mut c,
                                 "LocalUnavailable",
-                                &format!("Invalid Windows launch target: {error}"),
+                                "Verified download reference is unavailable",
+                            );
+                            out.push(c);
+                            continue;
+                        }
+                        let runtime = runtime.expect("resolved installation");
+                        let (target, work) = windows_paths(file, &target_path, &work);
+                        use crate::windows_process::ProcessState;
+                        match self.windows_process_state(&runtime.id)? {
+                            ProcessState::Running => {
+                                issue(&mut c, "Running", "The launched Windows process is running")
+                            }
+                            ProcessState::Unknown => issue(
+                                &mut c,
+                                "ProcessUnknown",
+                                "A previous launch cannot be safely classified",
                             ),
+                            ProcessState::Idle => match crate::windows_fs::bind_launch_target(
+                                &runtime.path,
+                                &runtime.id,
+                                &target,
+                                &work,
+                            ) {
+                                Ok(_) => {
+                                    c.target = Some(target);
+                                    c.working_directory = Some(work);
+                                    issue(&mut c, "Ready", "Windows launch target is available");
+                                }
+                                Err(error) => issue(
+                                    &mut c,
+                                    "LocalUnavailable",
+                                    &format!("Invalid Windows launch target: {error}"),
+                                ),
+                            },
                         }
                     }
                     #[cfg(not(any(target_os = "linux", windows)))]
