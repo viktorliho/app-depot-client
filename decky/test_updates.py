@@ -1,13 +1,15 @@
 import asyncio
 import hashlib
+import io
+import ssl
 import json
 from pathlib import Path
 import sys
 import tempfile
 import threading
 import unittest
-from unittest.mock import patch
-from urllib.error import HTTPError
+from unittest.mock import ANY, MagicMock, patch
+from urllib.error import HTTPError, URLError
 from urllib.request import Request
 
 import installer
@@ -44,6 +46,27 @@ class UpdateTests(unittest.TestCase):
         first_page = [desktop] * updates.PAGE_SIZE
         listing = {1: first_page, 2: [latest, release("0.1.0-beta.9")]}
         self.assertEqual(updates.find_update("0.1.0-beta.3", listing.__getitem__)["version"], "0.1.0-beta.10")
+
+    def test_explicit_system_ca_etag_and_up_to_date(self):
+        response = MagicMock()
+        response.__enter__.return_value = response
+        response.headers = {"ETag": '"fixture"'}
+        response.read.return_value = json.dumps([release("0.1.0-beta.4"), {"tag_name": "v0.1.3"}]).encode()
+        opener = MagicMock()
+        opener.open.side_effect = [response, HTTPError(updates.API, 304, "", {}, io.BytesIO())]
+        fetch = updates.ReleasePages()
+        with patch.object(updates, "build_opener", return_value=opener) as build, patch.object(
+            updates, "monotonic", side_effect=[0, 1, 61, 61],
+        ):
+            self.assertIsNone(updates.find_update("0.1.0-beta.4", fetch))
+            self.assertIsNone(updates.find_update("0.1.0-beta.4", fetch))
+            self.assertIsNone(updates.find_update("0.1.0-beta.4", fetch))
+        request = opener.open.call_args.args[0]
+        self.assertEqual(request.get_header("If-none-match"), '"fixture"')
+        self.assertEqual(opener.open.call_count, 2)
+        context = build.call_args.args[1]._context
+        self.assertTrue(context.check_hostname)
+        self.assertEqual(context.verify_mode, ssl.CERT_REQUIRED)
 
     def test_missing_duplicate_untrusted_and_malformed_metadata(self):
         for field, value in (
@@ -82,7 +105,7 @@ class UpdateTests(unittest.TestCase):
                             updates.verify_update(candidate)
                     else:
                         self.assertIsNone(updates.verify_update(candidate))
-                        download.assert_called_once_with(candidate["package"], candidate["sha256"], False)
+                        download.assert_called_once_with(candidate["package"], candidate["sha256"], False, context=ANY)
                 with patch.object(updates, "get_package", side_effect=ValueError("wrong digest")):
                     with self.assertRaises(ValueError):
                         updates.verify_update(candidate)
@@ -92,19 +115,20 @@ class UpdateRpcTests(unittest.IsolatedAsyncioTestCase):
     async def test_concurrent_check_retry_reload_and_user_data(self):
         with tempfile.TemporaryDirectory() as scratch, patch.dict(sys.modules, {"decky_updates": updates}):
             root = Path(scratch)
-            (root / "package.json").write_text(json.dumps({"version": "0.1.0-beta.3"}))
+            (root / "package.json").write_text(json.dumps({"name": "app-depot-decky", "version": "0.1.0-beta.3"}))
             data = root / "bindings.json"
             data.write_text("persistent test data")
             plugin = main.Plugin()
             plugin.plugin = root
             plugin.update_lock = asyncio.Lock()
             plugin.update_candidate = None
+            plugin.release_pages = None
             candidate = updates.find_update("0.1.0-beta.3", lambda _: [release("0.1.0-beta.4")])
             loop = asyncio.get_running_loop()
             started = asyncio.Event()
             resume = threading.Event()
 
-            def slow_check(version):
+            def slow_check(version, _fetch):
                 self.assertEqual(version, "0.1.0-beta.3")
                 loop.call_soon_threadsafe(started.set)
                 if not resume.wait(3):
@@ -128,14 +152,28 @@ class UpdateRpcTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(await plugin.request("verify_update"), {"ok": True, "value": None})
             with patch.object(updates, "find_update", side_effect=OSError("network failure")):
                 self.assertEqual(await plugin.request("check_update"),
-                                 {"ok": False, "code": "update_check_failed"})
+                                 {"ok": False, "code": "update_network_failed"})
             self.assertEqual(await plugin.request("verify_update"), {"ok": False, "code": "update_check_failed"})
             reloaded = main.Plugin()
             reloaded.plugin = root
             reloaded.update_lock = asyncio.Lock()
             reloaded.update_candidate = None
+            reloaded.release_pages = None
             self.assertEqual(await reloaded.request("verify_update"), {"ok": False, "code": "update_check_failed"})
             rate_limit = HTTPError(updates.API, 403, "limited", {"X-RateLimit-Remaining": "0"}, None)
             with patch.object(updates, "find_update", side_effect=rate_limit):
                 self.assertEqual(await reloaded.request("check_update"), {"ok": False, "code": "update_rate_limited"})
+            for error, code in (
+                (URLError(ssl.SSLCertVerificationError("no trusted issuer")), "update_tls_failed"),
+                (URLError(TimeoutError("timed out")), "update_network_failed"),
+                (ValueError("malformed release"), "update_metadata_invalid"),
+                (HTTPError(updates.API, 502, "upstream", {}, None), "update_http_failed"),
+            ):
+                with patch.object(updates, "find_update", side_effect=error):
+                    self.assertEqual(await reloaded.request("check_update"), {"ok": False, "code": code})
+            async def status(*args):
+                return {"version": "0.1.3"}
+            reloaded._rust = status
+            self.assertEqual((await reloaded.request("status"))["value"],
+                             {"version": "0.1.0-beta.3", "coreVersion": "0.1.3"})
             self.assertEqual(data.read_text(), "persistent test data")

@@ -106,7 +106,7 @@ class ShortcutTests(unittest.IsolatedAsyncioTestCase):
         cwd = str(Path(target).parent)
         damaged = {"appid": ID, "appname": 'play"', "exe": f'""{target}""',
                    "startdir": f'"{cwd}/', "launchoptions": ""}
-        with self.assertRaisesRegex(RuntimeError, "ownership"):
+        with self.assertRaisesRegex(main.RpcFailure, "shortcut_(ownership|unconfirmed)"):
             await self.plugin.shortcut(ACCOUNT, PROFILE, APP, "Fixture App", damaged)
         disk = dict(damaged, appid=ID - (1 << 32))
         self.write(self.foreign, disk)
@@ -119,7 +119,7 @@ class ShortcutTests(unittest.IsolatedAsyncioTestCase):
         partial = {**damaged, "exe": f'"{target}"'}
         resumed = await self.plugin.shortcut(ACCOUNT, PROFILE, APP, "Fixture App", partial)
         self.assertNotIn("exe", resumed["fields"])
-        with self.assertRaisesRegex(RuntimeError, "changed during repair"):
+        with self.assertRaisesRegex(main.RpcFailure, "shortcut_changed"):
             await self.plugin.shortcut(ACCOUNT, PROFILE, APP, "Fixture App",
                                        {**partial, "appname": "My custom name"})
         completed = {**damaged, **planned["fields"]}
@@ -132,11 +132,11 @@ class ShortcutTests(unittest.IsolatedAsyncioTestCase):
         plan = await self.plugin.shortcut(ACCOUNT, PROFILE, APP, "Same")
         await self.plugin.acknowledge(ACCOUNT, PROFILE, APP, ID)
         foreign = {key.lower(): value for key, value in {**self.foreign, "appid": ID}.items()}
-        with self.assertRaisesRegex(RuntimeError, "ownership"):
+        with self.assertRaisesRegex(main.RpcFailure, "shortcut_(ownership|unconfirmed)"):
             await self.plugin.shortcut(ACCOUNT, PROFILE, APP, "Same", foreign)
         owned = {key.lower(): value for key, value in self.owned(plan).items()}
         owned["appid"] = ID + 1
-        with self.assertRaisesRegex(RuntimeError, "ownership"):
+        with self.assertRaisesRegex(main.RpcFailure, "shortcut_(ownership|unconfirmed)"):
             await self.plugin.shortcut(ACCOUNT, PROFILE, APP, "Same", owned)
         with self.assertRaises(ValueError):
             await self.plugin.shortcut("../etc", PROFILE, APP, "Same")

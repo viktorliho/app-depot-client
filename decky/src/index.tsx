@@ -1,11 +1,12 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { callable, definePlugin } from '@decky/api';
-import { ButtonItem, PanelSection, PanelSectionRow, TextField, ToggleField } from '@decky/ui';
+import { ButtonItem, ConfirmModal, PanelSection, PanelSectionRow, showModal, Spinner, TextField, ToggleField } from '@decky/ui';
 import { artwork, reconcile, steamId } from './steam.ts';
 import type { Bridge, CatalogApp } from './steam.ts';
+import { describeInstalled, removalPrompt } from './installed.ts';
 
 type Profile = { id: string; origin: string; name: string; authenticated: boolean; status: string; lastSync: number | null };
-type Status = { profiles: Profile[]; library: string; usage: { writableInstallationsLogicalBytes: number }; version: string };
+type Status = { profiles: Profile[]; library: string; usage: { writableInstallationsLogicalBytes: number }; version: string; coreVersion: string };
 type Steam = Parameters<typeof reconcile>[1];
 const environment = window as unknown as {
   SteamClient?: { Apps?: Steam };
@@ -38,6 +39,18 @@ const messages: Record<string, string> = {
   uninstall_stale: 'Local content changed. Refresh Installed and confirm the current selection.',
   update_busy: 'An update check or verification is already running.',
   update_rate_limited: 'GitHub is limiting release checks. Try again later.',
+  update_tls_failed: 'The GitHub TLS certificate could not be verified.',
+  update_network_failed: 'Could not reach GitHub. Check your network connection and retry.',
+  update_metadata_invalid: 'GitHub returned invalid Decky release information.',
+  update_http_failed: 'GitHub rejected the release check. Try again later.',
+  package_metadata_invalid: 'The installed Decky package metadata is invalid. Reinstall from Desktop Mode.',
+  shortcut_ownership: 'Steam shortcut ownership could not be verified. The entry was preserved.',
+  shortcut_ambiguous: 'Steam returned conflicting shortcut identities. The entries were preserved.',
+  shortcut_changed: 'Steam shortcut settings changed during inspection. Synchronize again.',
+  shortcut_unconfirmed: 'Steam has not confirmed this shortcut. Synchronize again after Steam saves the library.',
+  shortcut_identity: 'Steam returned an unexpected shortcut ID.',
+  shortcut_storage: 'Steam account storage is unavailable.',
+  shortcut_launcher: 'The shortcut launcher path could not be verified.',
   update_check_failed: 'Could not check official Decky releases. Try again.',
   update_verification_failed: 'The update could not be downloaded or verified. Retry or check again.',
   internal: 'App Depot could not complete this operation. Check the plugin diagnostics.',
@@ -79,9 +92,20 @@ const rpc: Bridge = {
   artwork: rpcMethod('artwork'),
 };
 
+type Background = { sync: string; artwork: string };
+const background: Background = { sync: '', artwork: '' };
+const backgroundListeners = new Set<(value: Background) => void>();
+function reportBackground(kind: keyof Background, detail: string) {
+  background[kind] = detail;
+  for (const listener of backgroundListeners) listener({ ...background });
+}
+function diagnostic(error: unknown) {
+  return error instanceof ConnectionFailure ? error.code : 'unexpected_error';
+}
 let lastOperations = 'Steam synchronization pending';
 let work: Promise<void> | undefined;
 const installed = new Map<string, boolean>();
+const artworkRetry = new Set<string>();
 const wait = () => new Promise<void>(resolve => setTimeout(resolve, 650));
 const refresh = (profile: string): Promise<void> => {
   if (work) return work.catch(() => {}).then(() => refresh(profile));
@@ -89,8 +113,17 @@ const refresh = (profile: string): Promise<void> => {
     const id = account();
     const rows = await catalog(profile, true);
     if (account() !== id) throw new Error('Steam account changed during catalog refresh');
-    const problems = await reconcile(rpc, steam(), account, profile, rows, wait);
-    lastOperations = problems.length ? problems.slice(0, 8).join('\n') : `${rows.filter(row => !row.stale).length} Steam shortcuts reconciled`;
+    const artIssues: string[] = [];
+    const problems = await reconcile(rpc, steam(), account, profile, rows, wait, (app, issues) => {
+      const key = `${id}/${profile}/${app}`;
+      if (issues.length) {
+        artIssues.push(...issues);
+        artworkRetry.add(key);
+      } else artworkRetry.delete(key);
+    });
+    reportBackground('artwork', artIssues.length ? `${artIssues.length} artwork issue(s) · ${artIssues[0]}` : '');
+    reportBackground('sync', problems.length ? `${problems.length} Steam reconciliation issue(s) · ${problems[0]}` : '');
+    lastOperations = problems.length ? 'Synchronization finished with issues. See Diagnostics.' : `${rows.filter(row => !row.stale).length} Steam shortcuts reconciled`;
     for (const row of rows) installed.set(`${id}/${profile}/${row.id}`, row.downloaded);
   })().finally(() => { work = undefined; });
   return work;
@@ -101,6 +134,7 @@ async function observeInstallations() {
   work = (async () => {
     const id = account();
     const states = await gridStates(id);
+    const issues: string[] = [];
     for (const profile of (await statusRpc()).profiles) {
       const rows = await catalog(profile.id, false);
       const bindings = states.filter(item => item.profile === profile.id);
@@ -110,10 +144,11 @@ async function observeInstallations() {
         if (row?.downloaded || row?.installations.some(item => ['Preparing', 'Removing'].includes(item.state))) continue;
         const problems = await artwork(rpc, steam(), account, profile.id,
           { id: app, name: row?.name ?? 'App Depot', downloaded: false }, id, gridRoles);
-        if (problems.length) lastOperations = 'Grid artwork update pending · ' + problems.join('\n');
+        if (problems.length) issues.push(...problems);
         else {
           if (account() !== id) throw new Error('Steam account changed during artwork update');
           await finishGrids(id, profile.id, app);
+          artworkRetry.delete(`${id}/${profile.id}/${app}`);
           installed.set(`${id}/${profile.id}/${app}`, false);
         }
       }
@@ -123,13 +158,19 @@ async function observeInstallations() {
         const modeChanged = installed.has(key)
           ? installed.get(key) !== row.downloaded
           : bindings.find(item => item.app === row.id)?.modes.some(mode => mode !== row.downloaded);
-        if (row.stale || !modeChanged) continue;
+        if (row.stale || (!modeChanged && !artworkRetry.has(key))) continue;
         const problems = await artwork(rpc, steam(), account, profile.id, row, id);
-        if (problems.length) lastOperations = problems.slice(0, 8).join('\n');
-        else installed.set(key, row.downloaded);
+        if (problems.length) issues.push(...problems);
+        else {
+          artworkRetry.delete(key);
+          installed.set(key, row.downloaded);
+        }
       }
     }
-  })().finally(() => { work = undefined; });
+    reportBackground('artwork', issues.length ? `${issues.length} artwork update issue(s) · ${issues[0]}` : '');
+  })().catch(error => {
+    reportBackground('artwork', diagnostic(error));
+  }).finally(() => { work = undefined; });
   return work;
 }
 
@@ -171,7 +212,7 @@ function Updates({ version }: { version?: string }) {
   };
 
   return <PanelSection title="Updates & About">
-    <PanelSectionRow>Installed version · {version ?? 'Loading…'}</PanelSectionRow>
+    <PanelSectionRow>{version ? `App Depot Decky ${version}` : 'Loading version…'}</PanelSectionRow>
     <PanelSectionRow>Gaming Mode can check and verify updates. To install an update, use its installer in Desktop Mode.</PanelSectionRow>
     <PanelSectionRow><ButtonItem disabled={busy} onClick={check}>Check for updates</ButtonItem></PanelSectionRow>
     {message && <PanelSectionRow><div role="status">{message}</div></PanelSectionRow>}
@@ -187,9 +228,13 @@ function Updates({ version }: { version?: string }) {
 function AppDepot() {
   const [status, setStatus] = useState<Status>();
   const [rows, setRows] = useState<LocalApp[]>([]);
-  const [selection, setSelection] = useState<LocalApp>();
-  const [removeBusy, setRemoveBusy] = useState(false);
-  const [removeMessage, setRemoveMessage] = useState('');
+  const [removal, setRemoval] = useState<{ app: LocalApp; started: number }>();
+  const [elapsed, setElapsed] = useState(0);
+  const removing = useRef(false);
+  const [removeResult, setRemoveResult] = useState('');
+  const [diagnostics, setDiagnostics] = useState({ ...background });
+  const [inventoryIssue, setInventoryIssue] = useState('');
+  const [showDiagnostics, setShowDiagnostics] = useState(false);
   const [origin, setOrigin] = useState('');
   const [token, setToken] = useState('');
   const [useToken, setUseToken] = useState(false);
@@ -212,28 +257,48 @@ function AppDepot() {
   }
 
   useEffect(() => {
-    const check = () => { void update().catch(error => setMessage(String(error))); };
+    backgroundListeners.add(setDiagnostics);
+    const check = () => { void update().then(() => setInventoryIssue(''), error => setInventoryIssue(diagnostic(error))); };
     check();
     const timer = setInterval(check, 30_000);
-    return () => clearInterval(timer);
+    return () => { backgroundListeners.delete(setDiagnostics); clearInterval(timer); };
   }, []);
 
+  useEffect(() => {
+    if (!removal) return;
+    const timer = setInterval(() => setElapsed(Math.floor((performance.now() - removal.started) / 1000)), 1000);
+    return () => clearInterval(timer);
+  }, [removal]);
+
   async function confirmRemoval(app: LocalApp) {
-    if (removeBusy) return;
-    setRemoveBusy(true);
-    setRemoveMessage('Uninstalling local content…');
+    if (removing.current) return;
+    removing.current = true;
+    setElapsed(0);
+    setRemoval({ app, started: performance.now() });
+    setRemoveResult('');
     try {
       const result = await uninstall(app.profile, app.id, app.revision);
-      const cleanup = result.cleanupComplete ? '' : ' Some unused storage could not be reclaimed safely.';
-      setRemoveMessage(`${app.name} was uninstalled. Steam Play will prepare it again. Grid artwork will update when available.${cleanup}`);
-      void observeInstallations().catch(error => { lastOperations = String(error); });
+      setRows(current => current.filter(row => row.id !== app.id || row.profile !== app.profile));
+      setRemoveResult(result.cleanupComplete ? `${app.name} uninstalled. Some unused storage could not be reclaimed.`
+        : `${app.name} uninstalled.`);
+      void observeInstallations();
     } catch (error) {
-      setRemoveMessage(String(error));
+      setRemoveResult(`${app.name}: ${error instanceof ConnectionFailure && error.code !== 'internal'
+        ? error.message : 'Uninstall could not be confirmed. Refresh Installed before retrying.'}`);
     } finally {
-      setSelection(undefined);
-      try { await update(); } catch (error) { setMessage(String(error)); }
-      setRemoveBusy(false);
+      setRemoval(undefined);
+      removing.current = false;
+      void update().then(() => setInventoryIssue(''), error => setInventoryIssue(diagnostic(error)));
     }
+  }
+
+  function askUninstall(app: LocalApp) {
+    if (removing.current) return;
+    const modal = showModal(<ConfirmModal
+      {...removalPrompt(app.name)}
+      bDestructiveWarning strOKButtonText="Uninstall" strCancelButtonText="Cancel"
+      onOK={() => { modal.Close(); void confirmRemoval(app); }}
+      onCancel={() => modal.Close()} />);
   }
 
   async function search() {
@@ -327,29 +392,33 @@ function AppDepot() {
       {message && <PanelSectionRow><div role="status" style={{ whiteSpace: 'pre-wrap' }}>{message}</div></PanelSectionRow>}
     </PanelSection>
     <PanelSection title="Installed">
-      {selection ? <>
-        <PanelSectionRow><div>
-          Uninstall {selection.name} from {selection.profileName} ({selection.origin})?
-          Local app files, downloads, saves, configuration and modifications in managed folders may be permanently deleted.
-          Shared files still used by other apps, external data and the Steam shortcut remain.
-        </div></PanelSectionRow>
-        <PanelSectionRow><ButtonItem disabled={removeBusy} onClick={() => confirmRemoval(selection)}>Confirm uninstall</ButtonItem></PanelSectionRow>
-        <PanelSectionRow><ButtonItem disabled={removeBusy} onClick={() => setSelection(undefined)}>Cancel</ButtonItem></PanelSectionRow>
-      </> : rows.map(row => <PanelSectionRow key={`${row.profile}/${row.id}`}>
-        <ButtonItem disabled={removeBusy || row.blocked} onClick={() => setSelection(row)}>
-          <div>Uninstall {row.name} · {row.profileName} ({row.origin})</div>
-          <div>{row.states.join(', ') || 'Downloaded'} · {((row.runtimeBytes + row.downloadBytes) / 1048576).toFixed(1)} MiB logical{row.blocked ? ' · Active operation' : ''}</div>
-        </ButtonItem>
-      </PanelSectionRow>)}
-      {!rows.length && <PanelSectionRow>No local installations</PanelSectionRow>}
-      {rows.length > 0 && <PanelSectionRow>Logical storage includes shared content. Actual freed space may be lower.</PanelSectionRow>}
-      {removeMessage && <PanelSectionRow><div role="status">{removeMessage}</div></PanelSectionRow>}
+      {(removal && !rows.some(row => row.id === removal.app.id && row.profile === removal.app.profile)
+        ? [...rows, removal.app] : rows).map(row => {
+        const item = describeInstalled(row, removal?.app, elapsed);
+        return <PanelSectionRow key={item.key}>
+          <ButtonItem layout="inline" label={<span style={{ overflowWrap: 'anywhere' }}>{item.label}</span>}
+            description={item.active ? <span role="status" style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+              <Spinner style={{ width: 16, height: 16 }} /> {item.description}
+            </span> : item.description}
+            disabled={item.disabled} onClick={() => askUninstall(row)}>Uninstall</ButtonItem>
+        </PanelSectionRow>;
+      })}
+      {!rows.length && !removal && <PanelSectionRow>{inventoryIssue ? 'Installed list unavailable' : 'No local installations'}</PanelSectionRow>}
+      {removeResult && <PanelSectionRow><div role="status">{removeResult}</div></PanelSectionRow>}
     </PanelSection>
     <PanelSection title="Settings">
       <PanelSectionRow>{status?.library}</PanelSectionRow>
       <PanelSectionRow>Runtime storage · {((status?.usage.writableInstallationsLogicalBytes ?? 0) / 1048576).toFixed(0)} MiB</PanelSectionRow>
-      <PanelSectionRow>App Depot {status?.version} · {bridgeReady() ? 'Steam bridge available' : 'Steam bridge unavailable'}</PanelSectionRow>
-      <PanelSectionRow><div style={{ whiteSpace: 'pre-wrap' }}>{lastOperations}</div></PanelSectionRow>
+      <PanelSectionRow>{status ? `App Depot Decky ${status.version}` : 'Loading version…'}</PanelSectionRow>
+      {diagnostics.sync && <PanelSectionRow>Steam synchronization needs attention.</PanelSectionRow>}
+      {diagnostics.artwork && <PanelSectionRow>Artwork refresh deferred. App Depot will retry.</PanelSectionRow>}
+      <PanelSectionRow><ToggleField label="Diagnostics" checked={showDiagnostics} onChange={setShowDiagnostics} /></PanelSectionRow>
+      {showDiagnostics && <PanelSectionRow><div style={{ overflowWrap: 'anywhere' }}>
+        <div>Core {status?.coreVersion ?? 'unavailable'} · {bridgeReady() ? 'Steam bridge available' : 'Steam bridge unavailable'}</div>
+        <div>Sync · {diagnostics.sync || lastOperations}</div>
+        {diagnostics.artwork && <div>Artwork · {diagnostics.artwork}</div>}
+        {inventoryIssue && <div>Installed list · {inventoryIssue}</div>}
+      </div></PanelSectionRow>}
     </PanelSection>
     <Updates version={status?.version} />
   </>;
@@ -366,12 +435,12 @@ export default definePlugin(() => {
         await refresh(profile.id);
       }
     } catch (error) {
-      lastOperations = String(error);
+      reportBackground('sync', diagnostic(error));
     }
   };
   const initial = setTimeout(() => { void start(); }, 1800);
   const timer = setInterval(() => {
-    void observeInstallations()?.catch(error => { lastOperations = String(error); });
+    void observeInstallations();
   }, 30_000);
   return {
     name: 'App Depot', titleView: <div>App Depot</div>,

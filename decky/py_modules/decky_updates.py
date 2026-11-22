@@ -2,9 +2,12 @@
 
 import json
 import re
+import ssl
+from time import monotonic
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
+from urllib.error import HTTPError
+from urllib.request import HTTPSHandler, HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
 from app_depot_installer import get_package, unpack
 
@@ -29,20 +32,47 @@ def version_key(version):
     return tuple(map(int, match.groups()))
 
 
-def read_page(page):
-    url = f"{API}?per_page={PAGE_SIZE}&page={page}"
-    request = Request(url, headers={
-        "Accept": "application/vnd.github+json",
-        "User-Agent": "AppDepot-Decky",
-    })
-    with build_opener(ProxyHandler({}), NoRedirect()).open(request, timeout=10) as response:
-        body = response.read(MAX_METADATA + 1)
-    if len(body) > MAX_METADATA:
-        raise ValueError("Release metadata too large")
-    return json.loads(body)
+def release_tls_context():
+    # Decky's bundled OpenSSL uses Debian build-time paths, which may not
+    # exist on SteamOS. Use the operating system's trust bundle explicitly.
+    system_ca = Path("/etc/ssl/certs/ca-certificates.crt")
+    return ssl.create_default_context(cafile=str(system_ca) if system_ca.is_file() else None)
 
 
-def find_update(current, fetch=read_page):
+class ReleasePages:
+    def __init__(self):
+        self.cache = {}
+
+    def __call__(self, page):
+        cached = self.cache.get(page)
+        if cached and monotonic() < cached[0]:
+            return cached[2]
+        url = f"{API}?per_page={PAGE_SIZE}&page={page}"
+        headers = {"Accept": "application/vnd.github+json", "User-Agent": "AppDepot-Decky"}
+        if cached and cached[1]:
+            headers["If-None-Match"] = cached[1]
+        request = Request(url, headers=headers)
+        opener = build_opener(ProxyHandler({}), HTTPSHandler(context=release_tls_context()), NoRedirect())
+        try:
+            with opener.open(request, timeout=10) as response:
+                body = response.read(MAX_METADATA + 1)
+                etag = response.headers.get("ETag")
+            if len(body) > MAX_METADATA:
+                raise ValueError("Release metadata too large")
+            entries = json.loads(body)
+            if not isinstance(entries, list) or len(entries) > PAGE_SIZE:
+                raise ValueError("Invalid release listing")
+        except HTTPError as error:
+            if error.code != 304 or not cached or not cached[1]:
+                raise
+            etag, entries = cached[1:]
+        self.cache[page] = (monotonic() + 60, etag, entries)
+        return entries
+
+
+def find_update(current, fetch=None):
+    if fetch is None:
+        fetch = ReleasePages()
     installed = version_key(current)
     candidates = {}
     for page in range(1, MAX_PAGES + 1):
@@ -97,6 +127,6 @@ def find_update(current, fetch=read_page):
 
 
 def verify_update(update):
-    payload = get_package(update["package"], update["sha256"], False)
+    payload = get_package(update["package"], update["sha256"], False, context=release_tls_context())
     with TemporaryDirectory(prefix="app-depot-update-") as scratch:
         unpack(payload, Path(scratch), update["version"])

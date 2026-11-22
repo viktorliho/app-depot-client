@@ -74,6 +74,7 @@ function details(steam: SteamMethods, appid: number): Promise<Observation> {
 export async function reconcile(
   bridge: Bridge, steam: SteamMethods, currentAccount: () => string,
   profile: string, rows: CatalogApp[], wait: () => Promise<void>,
+  onArtworkIssues?: (app: string, issues: string[]) => void,
 ): Promise<string[]> {
   const account = currentAccount();
   const guard = () => {
@@ -140,7 +141,9 @@ export async function reconcile(
       issues.push(`${row.name}: ${String(error)}`);
       continue;
     }
-    issues.push(...await artwork(bridge, steam, currentAccount, profile, row, account));
+    const artIssues = await artwork(bridge, steam, currentAccount, profile, row, account);
+    if (onArtworkIssues) onArtworkIssues(row.id, artIssues);
+    else issues.push(...artIssues);
   }
   return issues;
 }

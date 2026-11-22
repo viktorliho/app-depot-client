@@ -53,14 +53,14 @@ class ReleaseRedirect(HTTPRedirectHandler):
         return None
 
 
-def get_package(url, checksum, development):
+def get_package(url, checksum, development, *, context=None):
     location = urlparse(url)
     if (not re.fullmatch(r"[0-9a-f]{64}", checksum) or location.username or location.password
             or location.fragment or not location.path.endswith(".zip")
             or not (location.scheme == "https" and location.hostname
                     or development and location.scheme == "http" and location.hostname == "127.0.0.1")):
         raise ValueError("Invalid pinned package location")
-    opener = build_opener(ProxyHandler({}), HTTPSHandler(), ReleaseRedirect(url))
+    opener = build_opener(ProxyHandler({}), HTTPSHandler(context=context), ReleaseRedirect(url))
     with opener.open(Request(url, headers={"User-Agent": "AppDepot-Decky-Installer"}), timeout=20) as response:
         expected_size = response.headers.get("Content-Length")
         payload = response.read(MAX_PACKAGE + 1)

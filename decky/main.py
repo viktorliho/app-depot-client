@@ -4,12 +4,15 @@ import asyncio
 import base64
 import hashlib
 import json
+import logging
 import os
+import re
+import ssl
 from pathlib import Path
 import stat
 import struct
 import tempfile
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from uuid import UUID
 
 
@@ -130,6 +133,7 @@ class Plugin:
         self.closing = False
         self.update_lock = asyncio.Lock()
         self.update_candidate = None
+        self.release_pages = None
 
     async def _unload(self):
         self.closing = True
@@ -221,34 +225,55 @@ class Plugin:
         try:
             return {"ok": True, "value": await operations[method](*args)}
         except RpcFailure as error:
+            if method in {"check_update", "verify_update", "shortcut", "artwork", "uninstall"}:
+                logging.getLogger(__name__).info("App Depot RPC %s: %s", method, error.code)
             return {"ok": False, "code": error.code}
         except asyncio.TimeoutError:
             return {"ok": False, "code": "timeout"}
         except Exception as error:
             # Details can contain Server response text or user paths. Record only
             # the action and exception class for local diagnostics.
-            import logging
             logging.getLogger(__name__).warning("App Depot RPC %s: %s",
                                                 method,
                                                 type(error).__name__)
             return {"ok": False, "code": "internal"}
 
+    def package_version(self):
+        package = json.loads((self.plugin / "package.json").read_text())
+        version = package.get("version")
+        if package.get("name") != "app-depot-decky" or not isinstance(version, str) or not re.fullmatch(
+            r"(?:0|[1-9][0-9]{0,8})\.(?:0|[1-9][0-9]{0,8})\.(?:0|[1-9][0-9]{0,8})-beta\.(?:0|[1-9][0-9]{0,8})",
+            version,
+        ):
+            raise RpcFailure("package_metadata_invalid")
+        return version
+
     async def check_update(self):
-        from decky_updates import find_update
+        from decky_updates import ReleasePages, find_update
 
         if self.update_lock.locked():
             raise RpcFailure("update_busy")
         async with self.update_lock:
             self.update_candidate = None
-            version = json.loads((self.plugin / "package.json").read_text())["version"]
+            if self.release_pages is None:
+                self.release_pages = ReleasePages()
             try:
-                self.update_candidate = await asyncio.to_thread(find_update, version)
+                self.update_candidate = await asyncio.to_thread(find_update, self.package_version(), self.release_pages)
             except HTTPError as error:
-                if error.code == 429 or (error.code == 403 and error.headers.get("X-RateLimit-Remaining") == "0"):
+                if error.code == 429 or (error.code == 403 and (
+                    error.headers.get("X-RateLimit-Remaining") == "0" or error.headers.get("Retry-After")
+                )):
                     raise RpcFailure("update_rate_limited") from None
-                raise RpcFailure("update_check_failed") from None
-            except (OSError, ValueError, TypeError):
-                raise RpcFailure("update_check_failed") from None
+                raise RpcFailure("update_http_failed") from None
+            except URLError as error:
+                code = "update_tls_failed" if isinstance(error.reason, ssl.SSLError) else "update_network_failed"
+                raise RpcFailure(code) from None
+            except ssl.SSLError:
+                raise RpcFailure("update_tls_failed") from None
+            except OSError:
+                raise RpcFailure("update_network_failed") from None
+            except (ValueError, TypeError):
+                raise RpcFailure("update_metadata_invalid") from None
             if self.update_candidate:
                 return {key: self.update_candidate[key] for key in ("version", "notes", "url")}
             return None
@@ -271,7 +296,10 @@ class Plugin:
         return await self._rust("decky", "discover")
 
     async def status(self):
-        return await self._rust("decky", "status")
+        result = await self._rust("decky", "status")
+        result["coreVersion"] = result["version"]
+        result["version"] = self.package_version()
+        return result
 
     async def test(self, origin, token, allow_http=False):
         self._origin(origin)
@@ -363,14 +391,14 @@ class Plugin:
                     or observation.get("launchoptions") != binding["options"]
                     or observation.get("exe", "").strip('"') != binding["target"]
                     or not isinstance(observation.get("appname"), str)):
-                raise RuntimeError("Live Steam shortcut ownership could not be verified")
+                raise RpcFailure("shortcut_ownership")
             return observation
         rows = read_shortcuts(self._config(account) / "shortcuts.vdf")
         matches = [row for row in rows
                    if row.get("launchoptions") == binding["options"]
                    and row.get("exe", "").strip('"') == binding["target"]]
         if len(matches) > 1:
-            raise RuntimeError("Ambiguous owned shortcut marker")
+            raise RpcFailure("shortcut_ambiguous")
         actual = matches[0] if matches else None
         expected = binding.get("appid")
         if expected is not None and (
@@ -380,7 +408,7 @@ class Plugin:
                 or any(row["appid"] == expected for row in rows)
             )
         ):
-            raise RuntimeError("Shortcut ownership could not be verified. Existing Steam entry preserved.")
+            raise RpcFailure("shortcut_ownership")
         return actual
 
     def _setup_shortcut(self, account, profile, app, binding, row):
@@ -415,7 +443,7 @@ class Plugin:
                 return None
             before = values
         if any(values[field] not in (before[field], desired) for field, desired in expected.items()):
-            raise RuntimeError("Steam shortcut settings changed during repair")
+            raise RpcFailure("shortcut_changed")
         if values == expected:
             binding.pop("repair", None)
             binding.pop("initializing", None)
@@ -441,12 +469,12 @@ class Plugin:
                         self._save(ledger)
                         return setup
                     if binding.get("repair") or binding.get("initializing"):
-                        raise RuntimeError("Steam shortcut ownership or initial metadata could not be verified")
+                        raise RpcFailure("shortcut_unconfirmed")
                 actual = self._owned(account, binding, observation)
                 if actual is None:
                     return {"action": "pending"}
                 if not actual["appid"] & 0x80000000:
-                    raise RuntimeError("Steam did not return a non-Steam AppID")
+                    raise RpcFailure("shortcut_identity")
                 rename = binding.get("rename")
                 if rename and actual.get("appname") == rename:
                     binding["name"] = binding.pop("rename")
@@ -462,21 +490,21 @@ class Plugin:
                     return {"action": "rename", "appid": actual["appid"], "name": name}
                 return {"action": "keep", "appid": actual["appid"]}
             if not self._config(account).is_dir():
-                raise RuntimeError("Steam account storage is unavailable")
+                raise RpcFailure("shortcut_storage")
             alias = self.data / "launchers" / profile / app / "play"
             alias.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
             if alias.is_symlink():
                 if alias.readlink() != self.plugin / "bin/app-depot":
-                    raise RuntimeError("Launcher alias points outside App Depot")
+                    raise RpcFailure("shortcut_launcher")
             else:
                 alias.symlink_to(self.plugin / "bin/app-depot")
             target = str(alias)
             if any(character in target for character in ('"', "\n", "\r", "%", "$", "`", "\\")):
-                raise RuntimeError("Unsupported launcher path")
+                raise RpcFailure("shortcut_launcher")
             binding = {"name": name, "target": target, "options": f"decky play {profile} {app}",
                        "artwork": {}, "initializing": True}
             if self._owned(account, binding) is not None:
-                raise RuntimeError("Existing shortcut marker without a saved binding")
+                raise RpcFailure("shortcut_ambiguous")
             ledger[key] = binding
             self._save(ledger)
             return {"action": "create", "target": target, "options": binding["options"]}
@@ -492,7 +520,7 @@ class Plugin:
         async with self.lock:
             ledger, _, binding = self._binding(account, profile, app)
             if binding is None or binding.get("confirmed") or binding.get("appid") not in (None, appid):
-                raise RuntimeError("Unexpected Steam AppID")
+                raise RpcFailure("shortcut_identity")
             binding["appid"] = appid
             self._save(ledger)
 

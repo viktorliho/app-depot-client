@@ -177,3 +177,36 @@ test('uninstall grid refresh only changes the existing AppID and leaves other ro
     () => '123', 'profile', app('a', 'App'), '123', grids);
   assert.equal(unavailable.length, 2);
 });
+
+test('artwork failure and recovery are reported independently of shortcut reconciliation', async () => {
+  const reports: [string, string[]][] = [];
+  const appid = 0x80000099;
+  let available = false;
+  const bridge: Bridge = {
+    async shortcut() { return { action: 'keep', appid }; },
+    async acknowledge() { throw new Error('unexpected creation'); },
+    async binding() { return appid; },
+    async artwork() {
+      if (!available) throw new Error('network unavailable');
+      return null;
+    },
+  };
+  const steam = {
+    async AddShortcut() { throw new Error('unexpected creation'); },
+    RegisterForAppDetails(_id: number, callback: (details: {
+      unAppID: number; strDisplayName: string; strShortcutExe: string; strShortcutLaunchOptions: string; strShortcutStartDir: string;
+    }) => void) {
+      callback({ unAppID: appid, strDisplayName: 'Fixture', strShortcutExe: 'play',
+        strShortcutLaunchOptions: 'original', strShortcutStartDir: 'fixture' });
+      return { unregister() {} };
+    },
+    async SetCustomArtworkForApp() {},
+  };
+  const report = (id: string, problems: string[]) => reports.push([id, problems]);
+  assert.deepEqual(await reconcile(bridge, steam, () => '123', 'profile', [app('a', 'Fixture')], wait, report), []);
+  assert.equal(reports[0][0], 'a');
+  assert.match(reports[0][1][0], /network unavailable/);
+  available = true;
+  assert.deepEqual(await reconcile(bridge, steam, () => '123', 'profile', [app('a', 'Fixture')], wait, report), []);
+  assert.deepEqual(reports[1], ['a', []]);
+});

@@ -1835,7 +1835,20 @@ mod tests {
         assert_eq!(preview.states, ["Ready"]);
         assert!(preview.runtime_bytes > bytes.len() as u64);
         assert!(lib.uninstall_local_app(&profile, "app", "stale").is_err());
-        let _slot = lib.lock_download_slot().unwrap();
+        // A parallel test's fork can inherit a descriptor until its exec.
+        let limit = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let slot = loop {
+            match lib.lock_download_slot() {
+                Ok(slot) => break slot,
+                Err(LibraryError::Invalid(message))
+                    if message == "another application download holds the library slot"
+                        && std::time::Instant::now() < limit =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(error) => panic!("{error}"),
+            }
+        };
         assert!(
             lib.local_uninstall_preview(&profile, "app")
                 .unwrap()
@@ -1846,7 +1859,8 @@ mod tests {
             lib.uninstall_local_app(&profile, "app", &preview.revision)
                 .is_err()
         );
-        drop(_slot);
+        slot.unlock().unwrap();
+        drop(slot);
         assert!(
             lib.uninstall_local_app(&profile, "app", &preview.revision)
                 .unwrap()

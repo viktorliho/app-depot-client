@@ -181,6 +181,8 @@ def verify_decky(args, root, origin, token, app, server, opener, server_origin):
     package_root = root / "plugin"
     (package_root / "bin").mkdir(parents=True)
     (package_root / "bin" / "app-depot").symlink_to(args.client.resolve())
+    package = (args.decky_plugin.parent / "package.json").read_bytes()
+    (package_root / "package.json").write_bytes(package)
     plugin_home = root / "steam-user"
     plugin_home.mkdir()
     os.environ["DECKY_USER_HOME"] = str(plugin_home)
@@ -194,7 +196,9 @@ def verify_decky(args, root, origin, token, app, server, opener, server_origin):
         backend = module.Plugin()
         await backend._main()
         try:
-            assert (await backend.status())["profiles"] == []
+            status = await backend.status()
+            assert status["profiles"] == []
+            assert status["version"] == json.loads(package)["version"] != status["coreVersion"]
             if args.decky_lan_host:
                 try:
                     await backend.test(origin, token)
