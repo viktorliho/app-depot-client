@@ -1,16 +1,19 @@
 //! Explicit, source-preserving migration of a closed local library to one root.
 //! The old library is never removed by this operation.
-use crate::library::{
-    Library, LibraryError, LibraryPaths, access_lock, ensure_directory, read_marker, write_marker,
-};
+#[cfg(target_os = "linux")]
+use crate::library::{Library, access_lock, ensure_directory, read_marker, write_marker};
+use crate::library::{LibraryError, LibraryPaths};
+#[cfg(target_os = "linux")]
 use rusqlite::{Connection, OpenFlags};
 use serde::Serialize;
+use std::path::{Path, PathBuf};
+#[cfg(target_os = "linux")]
 use std::{
     ffi::OsStr,
     fs::{self, File, OpenOptions},
     io::Read,
-    path::{Path, PathBuf},
 };
+#[cfg(target_os = "linux")]
 use uuid::Uuid;
 
 fn invalid(message: impl Into<String>) -> LibraryError {
@@ -25,6 +28,7 @@ pub struct MigrationEstimate {
     pub destination: PathBuf,
 }
 
+#[cfg(target_os = "linux")]
 fn sum_regular_bytes(root: &Path) -> Result<u64, LibraryError> {
     let mut total = 0u64;
     for entry in fs::read_dir(root)? {

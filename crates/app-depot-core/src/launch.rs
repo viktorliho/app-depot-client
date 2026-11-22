@@ -8,11 +8,9 @@ use crate::{
 use rusqlite::OptionalExtension;
 use serde::Serialize;
 use serde_json::Value;
-use std::{
-    fs::File,
-    path::{Path, PathBuf},
-    process::{Child, Command},
-};
+#[cfg(target_os = "linux")]
+use std::{fs::File, path::Path, process::Command};
+use std::{path::PathBuf, process::Child};
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -498,9 +496,9 @@ impl LaunchCandidate {
         }
         #[cfg(not(target_os = "linux"))]
         {
-            return Err(invalid(
+            Err(invalid(
                 "NativePortableV1 execution is available only on Linux",
-            ));
+            ))
         }
         #[cfg(target_os = "linux")]
         {
@@ -645,13 +643,30 @@ mod tests {
             .unwrap();
         assert_eq!(result.len(), 6);
         assert_eq!(result[0].status, "NoLaunch");
-        assert_eq!(result[1].status, "NotDownloaded");
-        assert_eq!(result[1].arguments, ["", "$(echo literal)"]);
+        let fixture_matches_host = host() == Some("linux/x86_64");
+        let expected_local_status = if fixture_matches_host {
+            "NotDownloaded"
+        } else {
+            "UnsupportedPlatform"
+        };
+        assert_eq!(result[1].status, expected_local_status);
+        if fixture_matches_host {
+            assert_eq!(result[1].arguments, ["", "$(echo literal)"]);
+        } else {
+            assert!(result[1].arguments.is_empty());
+        }
         assert_eq!(result[2].status, "UnsupportedPlatform");
         assert_eq!(result[3].status, "UnsupportedMethod");
-        assert_eq!(result[4].status, "Malformed");
+        assert_eq!(
+            result[4].status,
+            if fixture_matches_host {
+                "Malformed"
+            } else {
+                "UnsupportedPlatform"
+            }
+        );
         assert_eq!(result[5].association_id, "two");
-        assert_eq!(result[5].status, "NotDownloaded");
+        assert_eq!(result[5].status, expected_local_status);
         assert!(
             lib.cached_snapshot(&ServerProfileId(profile.into()), "release")
                 .unwrap()

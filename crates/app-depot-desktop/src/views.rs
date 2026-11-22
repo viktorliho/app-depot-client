@@ -646,7 +646,12 @@ impl Desktop {
                         ui.add_space(28.0);
                         ui.separator();
                         ui.add_space(12.0);
-                        ui.label(RichText::new("Connect a server   ·   Browse its catalog   ·   Download verified artifacts").size(12.0).weak());
+                        let summary = if worker::WINDOWS_CATALOG_ONLY {
+                            "Connect a server   ·   Browse its catalog"
+                        } else {
+                            "Connect a server   ·   Browse its catalog   ·   Download verified artifacts"
+                        };
+                        ui.label(RichText::new(summary).size(12.0).weak());
                     });
                 });
         });
@@ -908,7 +913,9 @@ impl Desktop {
             || self.snapshot.trees.iter().any(|t| t.association_id == id)
     }
     fn association_state(&self, id: &str) -> &'static str {
-        if self.is_verified(id) {
+        if worker::WINDOWS_CATALOG_ONLY {
+            "Downloads unavailable on Windows"
+        } else if self.is_verified(id) {
             "Downloaded and verified"
         } else if self.snapshot.jobs.iter().any(|j| {
             j.association_id == id
@@ -1105,7 +1112,8 @@ impl Desktop {
                                     self.screen=Screen::Downloads;
                                 }
                         } else {
-                            let message=if view.stale {"Saved for offline browsing"}
+                            let message=if worker::WINDOWS_CATALOG_ONLY {worker::WINDOWS_CATALOG_NOTICE}
+                                else if view.stale {"Saved for offline browsing"}
                                 else if view.releases.iter().flat_map(|r|&r.associations).any(|a|self.is_verified(&a.association.id)) {"Available in My library"}
                                 else {"Choose a release and artifact below"};
                             ui.label(RichText::new(message).color(palette.muted));
@@ -1209,6 +1217,10 @@ impl Desktop {
             "My library",
             "Your applications and saved downloads. Available offline.",
         );
+        if worker::WINDOWS_CATALOG_ONLY {
+            ui.label(worker::WINDOWS_CATALOG_NOTICE);
+            return;
+        }
         if self.active.is_none() {
             self.empty_panel(
                 ui,
@@ -1793,8 +1805,15 @@ impl Desktop {
         self.header(
             ui,
             "Downloads",
-            "One active transfer. New requests move to the front of the queue.",
+            if worker::WINDOWS_CATALOG_ONLY {
+                worker::WINDOWS_CATALOG_NOTICE
+            } else {
+                "One active transfer. New requests move to the front of the queue."
+            },
         );
+        if worker::WINDOWS_CATALOG_ONLY {
+            return;
+        }
         let mut jobs = self.snapshot.jobs.clone();
         jobs.sort_by_key(|job| (download_group(&job.state), job.queue_rank, job.created_at));
         if jobs.is_empty() {
@@ -2069,7 +2088,7 @@ impl Desktop {
                     .clicked()
                 {
                     self.settings_tab = tab;
-                    if tab == SettingsTab::Storage {
+                    if tab == SettingsTab::Storage && !worker::WINDOWS_CATALOG_ONLY {
                         self.send(Command::StorageUsage);
                     }
                 }
@@ -2121,6 +2140,12 @@ impl Desktop {
             if self.settings_tab==SettingsTab::Storage {
             section(ui,"Storage",|ui| {
                 ui.label(RichText::new("Your library").size(18.0).strong());
+                if worker::WINDOWS_CATALOG_ONLY {
+                    ui.label("Windows profiles and catalog data default to %LOCALAPPDATA%\\app-depot-client.");
+                    ui.label(format!("Current location: {}", self.snapshot.library_data.display()));
+                    ui.label("Storage management is unavailable in this Windows build.");
+                    return;
+                }
                 ui.label("New Linux libraries are stored in ~/.appdepot. Existing libraries remain where they are until you explicitly migrate them.");
                 ui.add_space(12.0);
                 ui.label(RichText::new(format!("Current location: {}",self.snapshot.library_data.display())).size(14.0).color(design::palette(ui).muted));

@@ -466,7 +466,13 @@ impl Library {
                 permissions.set_mode(0o600);
             }
             #[cfg(not(unix))]
-            permissions.set_readonly(false);
+            #[expect(
+                clippy::permissions_set_readonly_false,
+                reason = "non-Unix targets do not use Unix mode bits"
+            )]
+            {
+                permissions.set_readonly(false);
+            }
             existing.set_permissions(permissions)?;
             existing.sync_all()?;
         }
@@ -687,7 +693,7 @@ impl Library {
             }
         }
         #[cfg(not(unix))]
-        let _ = newly_linked;
+        let _ = (newly_linked, linked);
         self.mark_tree_file_verified(job_id, path)?;
         Ok(false)
     }
@@ -1228,7 +1234,8 @@ impl Library {
     }
 }
 
-#[cfg(test)]
+// These fixtures construct on-disk Tree objects using directory synchronization.
+#[cfg(all(test, not(windows)))]
 mod tests {
     use super::*;
     use crate::library::LibraryPaths;

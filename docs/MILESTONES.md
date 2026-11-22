@@ -100,3 +100,19 @@ Scope is an audit and architecture plan. Preserve the existing Server protocol, 
 Use a disposable Windows x64 VM or runner with a pinned Rust MSVC toolchain and Windows SDK, NTFS fixture volumes, separate non-admin test identities and an isolated Dev/Test Server. Keep Linux CI as the reference. Use native Windows tests for paths, credential isolation, process lifetime and interruption where cross-compilation cannot supply evidence.
 
 M4.0 acceptance is a source-referenced dependency and capability matrix, a prioritized adapter plan with tested or explicitly unverified assumptions, a reproducible Windows build/test environment proposal, and acceptance fixtures for portability, secure credentials, filesystem safety and packaging. Windows client implementation and release are separate milestones.
+
+## M4.0b — Native Windows catalog preview
+
+The Windows x64 Desktop uses the existing egui views and Rust core. The Windows eframe renderer uses Direct3D 12 through wgpu. The Linux Desktop continues to use Glow, and the AppImage updater is Linux-only.
+
+Build from a Visual Studio 2022 x64 developer prompt with the C++ Build Tools and Windows SDK installed:
+
+~~~bat
+rustup toolchain install 1.100.0 --profile minimal --component rustfmt --component clippy
+rustup target add --toolchain 1.100.0 x86_64-pc-windows-msvc
+cargo +1.100.0 build -p app-depot-desktop --bin app-depot-desktop --target x86_64-pc-windows-msvc --locked
+~~~
+
+The executable is at x86_64-pc-windows-msvc/debug/app-depot-desktop.exe under Cargo's target directory. Windows stores the profile database and desktop preferences under %LOCALAPPDATA%\app-depot-client by default. Set APP_DEPOT_LIBRARY_DATA_DIR to an absolute path in a private disposable directory before launching a test instance. Artwork is cached in memory. The profile stores only an opaque reference to any token saved in Windows Credential Manager.
+
+Windows supports profiles, catalog sync, artwork, release details, preferences and offline catalog browsing. Transfer scheduling and recovery, artifact download, installation, Play, repair, removal, storage management and AppImage updates are unavailable on Windows. Enabling these operations requires verified handle-relative traversal and reparse-point rejection, atomic publication and recovery on NTFS, and native process identity and cleanup rules. macOS requires its own verification of those guarantees and its existing Keychain backend.

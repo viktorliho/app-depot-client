@@ -537,6 +537,17 @@ fn main() -> eframe::Result {
         }
     };
     let options = eframe::NativeOptions {
+        #[cfg(windows)]
+        renderer: eframe::Renderer::Wgpu,
+        #[cfg(windows)]
+        wgpu_options: {
+            let mut setup = eframe::egui_wgpu::WgpuSetupCreateNew::without_display_handle();
+            setup.instance_descriptor.backends = wgpu::Backends::DX12;
+            eframe::WgpuConfiguration {
+                wgpu_setup: setup.into(),
+                ..Default::default()
+            }
+        },
         viewport: egui::ViewportBuilder::default()
             .with_title("App Depot")
             .with_app_id("io.github.viktorliho.AppDepot")
@@ -556,7 +567,9 @@ fn main() -> eframe::Result {
         "App Depot",
         options,
         Box::new(move |cc| {
-            let mut desktop = Desktop::new(&cc.egui_ctx, paths);
+            let desktop = Desktop::new(&cc.egui_ctx, paths);
+            #[cfg(target_os = "linux")]
+            let mut desktop = desktop;
             #[cfg(target_os = "linux")]
             if let Some(marker) = &update_ack
                 && let (Some(image), Some(parent)) = (env::var_os("APPIMAGE"), marker.parent())

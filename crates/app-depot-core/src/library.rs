@@ -85,7 +85,9 @@ impl LibraryPaths {
                 (None, None) => current,
             }
         };
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(windows)]
+        let base = dirs.data_local_dir().join("app-depot-client");
+        #[cfg(not(any(target_os = "linux", windows)))]
         let base = dirs.data_dir().join("app-depot-client");
         Ok(Self {
             metadata: base.clone(),
@@ -158,7 +160,7 @@ pub(crate) fn ensure_directory(path: &Path) -> Result<(), LibraryError> {
         || path
             .components()
             .any(|component| matches!(component, Component::ParentDir | Component::CurDir))
-        || path == Path::new("/")
+        || path.parent().is_none()
     {
         return Err(invalid(
             "library roots must be absolute, non-root paths without . or ..",
@@ -167,9 +169,12 @@ pub(crate) fn ensure_directory(path: &Path) -> Result<(), LibraryError> {
     let mut current = PathBuf::new();
     for component in path.components() {
         current.push(component.as_os_str());
+        if matches!(component, Component::Prefix(_)) {
+            continue;
+        }
         match fs::symlink_metadata(&current) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                return Err(invalid("symlink in library path"));
+            Ok(metadata) if is_redirect(&metadata) => {
+                return Err(invalid("symlink or reparse point in library path"));
             }
             Ok(metadata) if !metadata.is_dir() => {
                 return Err(invalid("non-directory in library path"));
@@ -187,6 +192,24 @@ pub(crate) fn ensure_directory(path: &Path) -> Result<(), LibraryError> {
         }
     }
     Ok(())
+}
+
+fn is_redirect(metadata: &fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+    #[cfg(not(windows))]
+    metadata.file_type().is_symlink()
+}
+
+#[cfg(windows)]
+fn open_lock_without_following_reparse_point(options: &mut fs::OpenOptions) {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
 }
 
 fn ensure_private_root(path: &Path) -> Result<(), LibraryError> {
@@ -214,8 +237,11 @@ pub(crate) fn access_lock(root: &Path, exclusive: bool) -> Result<fs::File, Libr
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
     }
+    #[cfg(windows)]
+    open_lock_without_following_reparse_point(&mut options);
     let file = options.open(root.join(".app-depot-access.lock"))?;
-    if !file.metadata()?.is_file() {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || is_redirect(&metadata) {
         return Err(invalid("unsafe library access lock"));
     }
     #[cfg(unix)]
@@ -245,8 +271,11 @@ fn schema_open_lock(root: &Path) -> Result<fs::File, LibraryError> {
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
     }
+    #[cfg(windows)]
+    open_lock_without_following_reparse_point(&mut options);
     let file = options.open(root.join(".app-depot-schema.lock"))?;
-    if !file.metadata()?.is_file() {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || is_redirect(&metadata) {
         return Err(invalid("unsafe schema lock"));
     }
     #[cfg(unix)]
@@ -263,7 +292,7 @@ fn schema_open_lock(root: &Path) -> Result<fs::File, LibraryError> {
 pub(crate) fn read_marker(path: &Path) -> Result<Option<String>, LibraryError> {
     let marker = path.join(MARKER);
     match fs::symlink_metadata(&marker) {
-        Ok(metadata) if !metadata.is_file() || metadata.file_type().is_symlink() => {
+        Ok(metadata) if !metadata.is_file() || is_redirect(&metadata) => {
             Err(invalid("unsafe library identity marker"))
         }
         Ok(metadata) if metadata.len() > 64 => Err(invalid("invalid library identity marker")),
@@ -328,14 +357,14 @@ impl Library {
         }
         let db = paths.metadata.join("library.sqlite");
         let existing_db = match fs::symlink_metadata(&db) {
-            Ok(meta) if !meta.is_file() || meta.file_type().is_symlink() => {
+            Ok(meta) if !meta.is_file() || is_redirect(&meta) => {
                 return Err(invalid("unsafe SQLite database path"));
             }
-            Ok(meta) => {
+            Ok(_meta) => {
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::PermissionsExt;
-                    if meta.permissions().mode() & 0o077 != 0 {
+                    if _meta.permissions().mode() & 0o077 != 0 {
                         return Err(invalid(
                             "SQLite database must not be accessible by group or others",
                         ));
@@ -944,6 +973,32 @@ mod tests {
             metadata: dir.path().join("metadata"),
             content: dir.path().join("content"),
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rejects_windows_junction_in_library_path() {
+        use std::os::windows::process::CommandExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        let junction = dir.path().join("junction");
+        fs::create_dir(&target).unwrap();
+        let command = format!(
+            r#"mklink /J "{}" "{}""#,
+            junction.display(),
+            target.display()
+        );
+        let output = std::process::Command::new("cmd.exe")
+            .args(["/d", "/c"])
+            .raw_arg(command)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let result = ensure_directory(&junction.join("library"));
+        fs::remove_dir(junction).unwrap();
+        assert!(matches!(result, Err(LibraryError::Invalid(_))));
+        assert!(!target.join("library").exists());
     }
     const DIGEST: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const CAPS: &str = r#"{"apiVersion":"1.0.0","ingestionModes":[],"zipMethods":[],"treeIdentity":"adtree:v1:sha256","fileIdentity":"adfile:sha256","uploadRanges":true,"downloadRanges":true,"limits":{"maxPageSize":1000,"maxConcurrentRanges":8,"maxUploadBytes":18446744073709551615},"features":[]}"#;

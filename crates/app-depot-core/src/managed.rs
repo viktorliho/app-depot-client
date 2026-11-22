@@ -1,21 +1,26 @@
 //! Managed writable copies of verified portable Artifacts. Paths use local UUIDs only.
 use crate::{
     ServerProfileId,
-    library::{Library, LibraryError, now},
+    library::{Library, LibraryError},
+};
+#[cfg(target_os = "linux")]
+use crate::{
+    library::now,
     models::InventoryEntry,
     transfer::{hash_file, open_regular, private_dir, sync_dir},
     tree::{identity, validate_destination},
     tree_download::{create_file_beneath, dir_beneath, open_dir_nofollow, rename_tree_noreplace},
 };
+#[cfg(target_os = "linux")]
 use fs2::FileExt;
 use rusqlite::{OptionalExtension, params};
 use serde::Serialize;
+#[cfg(target_os = "linux")]
 use sha2::{Digest, Sha256};
+#[cfg(target_os = "linux")]
+use std::{collections::BTreeSet, fs::File, io::Read, os::fd::AsRawFd};
 use std::{
-    collections::BTreeSet,
-    fs::{self, File},
-    io::Read,
-    os::fd::AsRawFd,
+    fs,
     path::{Path, PathBuf},
 };
 use uuid::Uuid;

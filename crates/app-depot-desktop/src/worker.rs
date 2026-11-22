@@ -144,8 +144,36 @@ pub enum Command {
     },
 }
 
+pub(crate) const WINDOWS_CATALOG_ONLY: bool = cfg!(windows);
+pub(crate) const WINDOWS_CATALOG_NOTICE: &str =
+    "Downloads, installation, Play, repair, and removal are unavailable in this Windows build.";
+
+impl Command {
+    fn manages_local_content(&self) -> bool {
+        matches!(
+            self,
+            Self::Download { .. }
+                | Self::Pause(_)
+                | Self::Resume(_)
+                | Self::Retry(_)
+                | Self::MoveToTop(_)
+                | Self::Cancel(_)
+                | Self::TreeFiles(_)
+                | Self::Reveal(_)
+                | Self::StorageUsage
+                | Self::RemoveInstallation { .. }
+                | Self::VerifyInstallation(_)
+                | Self::RepairInstallation(_)
+                | Self::RemoveArtifact { .. }
+                | Self::RemoveApp { .. }
+                | Self::RepairSource { .. }
+                | Self::Play { .. }
+        )
+    }
+}
+
 pub enum Event {
-    Snapshot(Snapshot),
+    Snapshot(Box<Snapshot>),
     StorageUsage(StorageUsage),
     Jobs {
         profile: ServerProfileId,
@@ -393,7 +421,9 @@ pub(crate) fn snapshot(
         library_content: lib.paths.content.clone(),
         ..Snapshot::default()
     };
-    result.jobs = lib.jobs(None).map_err(|e| e.to_string())?;
+    if !WINDOWS_CATALOG_ONLY {
+        result.jobs = lib.jobs(None).map_err(|e| e.to_string())?;
+    }
     for job in &result.jobs {
         if let Some(context) = lib
             .display_context_for_association(&job.profile_id, &job.association_id)
@@ -438,6 +468,9 @@ pub(crate) fn snapshot(
                 stale: row.stale,
             });
         }
+        if WINDOWS_CATALOG_ONLY {
+            return Ok(result);
+        }
         let (files, file_issues) = lib.inspect_files(Some(id)).map_err(|e| e.to_string())?;
         let (trees, tree_issues) = lib.inspect_trees(Some(id)).map_err(|e| e.to_string())?;
         result.files = files;
@@ -473,6 +506,9 @@ fn operation(
     art_tx: &Sender<ArtTask>,
     ctx: &egui::Context,
 ) -> Result<bool, String> {
+    if WINDOWS_CATALOG_ONLY && cmd.manages_local_content() {
+        return Err(WINDOWS_CATALOG_NOTICE.into());
+    }
     let jobs_only = matches!(
         &cmd,
         Command::Download { .. }
@@ -1216,10 +1252,11 @@ fn run(
     });
     let mut lib = match Library::open(paths.clone()) {
         Ok(mut lib) => {
-            if let Err(e) = lib
-                .reconcile_file_jobs()
-                .and_then(|_| lib.reconcile_tree_jobs())
-                .and_then(|_| lib.restore_preempted_jobs())
+            if !WINDOWS_CATALOG_ONLY
+                && let Err(e) = lib
+                    .reconcile_file_jobs()
+                    .and_then(|_| lib.reconcile_tree_jobs())
+                    .and_then(|_| lib.restore_preempted_jobs())
             {
                 send(&tx, &ctx, Event::Error(format!("Job recovery: {e}")));
             }
@@ -1241,7 +1278,7 @@ fn run(
     let mut active_download: Option<String> = None;
     let mut next_download_try = Instant::now();
     if let Ok(value) = snapshot(&lib, None) {
-        send(&tx, &ctx, Event::Snapshot(value));
+        send(&tx, &ctx, Event::Snapshot(Box::new(value)));
     }
     loop {
         while let Ok(done) = background_rx.try_recv() {
@@ -1304,7 +1341,7 @@ fn run(
                         );
                     }
                     if let Ok(value) = snapshot(&lib, selected.as_ref()) {
-                        send(&tx, &ctx, Event::Snapshot(value));
+                        send(&tx, &ctx, Event::Snapshot(Box::new(value)));
                     }
                     if pending_force {
                         schedule_sync(
@@ -1380,7 +1417,7 @@ fn run(
                                         },
                                     );
                                     if let Ok(value) = snapshot(&lib, selected.as_ref()) {
-                                        send(&tx, &ctx, Event::Snapshot(value));
+                                        send(&tx, &ctx, Event::Snapshot(Box::new(value)));
                                     }
                                     schedule_sync(
                                         &paths,
@@ -1451,7 +1488,8 @@ fn run(
         {
             let _ = lib.preempt_job(current);
         }
-        if active_download.is_none() && Instant::now() >= next_download_try {
+        if !WINDOWS_CATALOG_ONLY && active_download.is_none() && Instant::now() >= next_download_try
+        {
             if let Err(error) = lib.restore_preempted_jobs() {
                 send(&tx, &ctx, Event::Error(error.to_string()));
             }
@@ -1549,7 +1587,7 @@ fn run(
                     Ok(refresh) => {
                         if refresh {
                             match snapshot(&lib, selected.as_ref()) {
-                                Ok(value) => send(&tx, &ctx, Event::Snapshot(value)),
+                                Ok(value) => send(&tx, &ctx, Event::Snapshot(Box::new(value))),
                                 Err(e) => send(&tx, &ctx, Event::Error(e)),
                             }
                         }
@@ -1558,7 +1596,7 @@ fn run(
                     Err(e) => {
                         send(&tx, &ctx, Event::Error(e));
                         if let Ok(value) = snapshot(&lib, selected.as_ref()) {
-                            send(&tx, &ctx, Event::Snapshot(value));
+                            send(&tx, &ctx, Event::Snapshot(Box::new(value)));
                         }
                         false
                     }

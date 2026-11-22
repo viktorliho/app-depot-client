@@ -147,6 +147,31 @@ impl SecretStore for UnavailableSecrets {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(windows)]
+    #[test]
+    fn windows_credential_survives_process_restart() {
+        const REFERENCE: &str = "APP_DEPOT_CREDENTIAL_TEST_REFERENCE";
+        const TEST_VALUE: &str = "app-depot-synthetic-test-value";
+        let mut store = NativeSecrets;
+        if let Ok(reference) = std::env::var(REFERENCE) {
+            assert!(store.get(&reference).is_ok_and(|value| value == TEST_VALUE));
+            return;
+        }
+        let reference = store.put(TEST_VALUE).unwrap();
+        let read = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "secrets::tests::windows_credential_survives_process_restart",
+            ])
+            .env(REFERENCE, &reference)
+            .output();
+        store.delete(&reference).unwrap();
+        assert!(matches!(store.get(&reference), Err(SecretError::Missing)));
+        let read = read.unwrap();
+        assert!(read.status.success());
+        assert!(String::from_utf8_lossy(&read.stdout).contains("1 passed"));
+    }
+
     #[test]
     fn refs_are_distinct_and_debug_never_contains_token() {
         let mut store = MemorySecrets::default();

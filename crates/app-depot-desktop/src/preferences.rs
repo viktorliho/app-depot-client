@@ -81,6 +81,7 @@ pub fn save(root: &Path, value: &Preferences) -> Result<(), String> {
             .write_all(&serde_json::to_vec(value).map_err(|e| e.to_string())?)
             .map_err(|e| e.to_string())?;
         writer.sync_all().map_err(|e| e.to_string())?;
+        drop(writer);
         fs::rename(&tmp, &file).map_err(|e| e.to_string())?;
         Ok(())
     })();

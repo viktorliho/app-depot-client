@@ -1292,6 +1292,7 @@ mod tests {
         assert_eq!(seen, 42);
     }
     #[test]
+    #[cfg_attr(windows, ignore = "requires durable File staging and publication")]
     fn live_observations_count_only_network_bytes_and_not_completion() {
         let data = vec![7u8; 256 * 1024];
         let mut fixture = fixture(data.clone(), "normal");
@@ -1352,6 +1353,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "requires durable File staging and publication")]
     fn zero_and_normal_files_complete_with_offline_materialization() {
         for data in [vec![], b"download me".to_vec()] {
             let mut f = fixture(data.clone(), "normal");
@@ -1375,6 +1377,7 @@ mod tests {
         }
     }
     #[test]
+    #[cfg_attr(windows, ignore = "requires durable File staging and publication")]
     fn range_resume_and_full_200_restart() {
         for mode in ["normal", "fallback"] {
             let mut f = fixture(vec![7; CHUNK * 3], mode);
@@ -1399,6 +1402,7 @@ mod tests {
         }
     }
     #[test]
+    #[cfg_attr(windows, ignore = "requires durable File staging and publication")]
     fn invalid_range_and_changed_etag_are_rejected() {
         for mode in ["bad_range", "bad_etag"] {
             let mut f = fixture(vec![1; CHUNK * 2], mode);
@@ -1416,6 +1420,7 @@ mod tests {
         }
     }
     #[test]
+    #[cfg_attr(windows, ignore = "requires durable File staging and publication")]
     fn range_416_restarts_from_zero_and_verifies() {
         let mut f = fixture(vec![8; CHUNK * 2], "range416");
         let job = queue(&mut f);
@@ -1431,6 +1436,7 @@ mod tests {
         assert_eq!(f.hits.load(Ordering::Relaxed), 3);
     }
     #[test]
+    #[cfg_attr(windows, ignore = "requires durable File staging and publication")]
     fn temporary_http_failure_is_retried_but_cancellation_is_terminal() {
         let mut f = fixture(vec![10; CHUNK], "retry503");
         let job = queue(&mut f);
@@ -1454,6 +1460,7 @@ mod tests {
         );
     }
     #[test]
+    #[cfg_attr(windows, ignore = "requires durable File staging and publication")]
     fn corrupted_stage_restarts_without_trusting_checkpoint() {
         let mut f = fixture(vec![9; CHUNK * 2], "normal");
         let job = queue(&mut f);
@@ -1472,6 +1479,7 @@ mod tests {
         );
     }
     #[test]
+    #[cfg_attr(windows, ignore = "requires durable File staging and publication")]
     fn database_failure_during_completion_never_reports_completed() {
         let mut f = fixture(vec![6; CHUNK], "normal");
         let job = queue(&mut f);
@@ -1504,6 +1512,7 @@ mod tests {
         );
     }
     #[test]
+    #[cfg_attr(windows, ignore = "requires durable File staging and publication")]
     fn corruption_truncation_and_authorization_never_complete() {
         for mode in ["bad_hash", "truncated", "auth", "no_etag"] {
             let mut f = fixture(vec![2; CHUNK], mode);
@@ -1519,6 +1528,7 @@ mod tests {
         }
     }
     #[test]
+    #[cfg_attr(windows, ignore = "requires durable File staging and publication")]
     fn interrupted_job_reopens_and_resumes_from_checkpoint() {
         let mut f = fixture(vec![3; CHUNK * 3], "normal");
         let job = queue(&mut f);
@@ -1546,6 +1556,7 @@ mod tests {
         );
     }
     #[test]
+    #[cfg_attr(windows, ignore = "requires durable File staging and publication")]
     fn object_reuse_and_profile_context_remain_distinct() {
         let mut f = fixture(vec![4; CHUNK], "normal");
         let one = queue(&mut f);
@@ -1567,6 +1578,7 @@ mod tests {
         assert_ne!(files[0].path, files[1].path);
     }
     #[test]
+    #[cfg_attr(windows, ignore = "requires durable File staging and publication")]
     fn crash_during_commit_reconciles_and_lock_prevents_concurrent_run() {
         let mut f = fixture(vec![5; CHUNK], "normal");
         let job = queue(&mut f);
@@ -1633,6 +1645,7 @@ mod tests {
         assert_eq!(f.library.jobs(Some(&f.profile)).unwrap().len(), 1);
     }
     #[test]
+    #[cfg_attr(windows, ignore = "requires durable File staging and publication")]
     fn preemption_keeps_durable_checkpoint_and_resumes_without_discarding_bytes() {
         let mut f = fixture(vec![7; 5 * 1024 * 1024], "slow");
         let job = queue(&mut f);
