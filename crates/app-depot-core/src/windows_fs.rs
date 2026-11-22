@@ -530,6 +530,84 @@ pub(crate) fn verify_tree_install(
     })
 }
 
+/// Keep the installation ancestors, working directory and candidate image pinned.
+pub(crate) struct LaunchBinding {
+    _installation: Vec<File>,
+    _working_directory: Vec<File>,
+    _image_directories: Vec<File>,
+    _image: File,
+}
+
+pub(crate) fn bind_launch_target(
+    installation: &Path,
+    id: &str,
+    target: &str,
+    working_directory: &str,
+) -> io::Result<LaunchBinding> {
+    let installation = installation_chain(installation, id)?;
+    let root = installation.last().unwrap();
+    require_case_insensitive(root)?;
+    let (parents, leaf) = target.rsplit_once('/').unwrap_or(("", target));
+    let image_directories = launch_directories(root, parents)?;
+    let working_directory = launch_directories(root, working_directory)?;
+    let mut image = open_installed_file(image_directories.last().unwrap_or(root), leaf)?;
+    require_single_link(&image)?;
+    validate_amd64_image(&mut image)?;
+    Ok(LaunchBinding {
+        _installation: installation,
+        _working_directory: working_directory,
+        _image_directories: image_directories,
+        _image: image,
+    })
+}
+
+fn launch_directories(root: &File, relative: &str) -> io::Result<Vec<File>> {
+    let mut chain = Vec::new();
+    if !relative.is_empty() {
+        for part in relative.split('/') {
+            let current = chain.last().unwrap_or(root);
+            require_case_insensitive(current)?;
+            chain.push(directory_child(
+                current,
+                OsStr::new(part),
+                false,
+                DIRECTORY_ACCESS,
+            )?);
+        }
+        require_case_insensitive(chain.last().unwrap())?;
+    }
+    Ok(chain)
+}
+
+fn validate_amd64_image(file: &mut File) -> io::Result<()> {
+    let mut dos = [0u8; 64];
+    file.read_exact(&mut dos)?;
+    if &dos[..2] != b"MZ" {
+        return Err(invalid("launch target is not a Windows executable image"));
+    }
+    let offset = u64::from(u32::from_le_bytes(dos[60..64].try_into().unwrap()));
+    if offset < 64 || offset + 26 > file.metadata()?.len() {
+        return Err(invalid("invalid executable header offset"));
+    }
+    file.seek(SeekFrom::Start(offset))?;
+    let mut pe = [0u8; 26];
+    file.read_exact(&mut pe)?;
+    let machine = u16::from_le_bytes([pe[4], pe[5]]);
+    let characteristics = u16::from_le_bytes([pe[22], pe[23]]);
+    let optional_size = u16::from_le_bytes([pe[20], pe[21]]);
+    if &pe[..4] != b"PE\0\0"
+        || machine != 0x8664
+        || characteristics & 0x2002 != 0x0002
+        || optional_size < 2
+        || pe[24..26] != [0x0b, 0x02]
+    {
+        return Err(invalid(
+            "launch target is not a native Windows x64 executable",
+        ));
+    }
+    Ok(())
+}
+
 fn installation_chain(to: &Path, id: &str) -> io::Result<Vec<File>> {
     let chain = directory_chain(to, false)?;
     let directory = chain.last().unwrap();
@@ -909,5 +987,121 @@ mod tests {
             .read_to_end(&mut bytes)
             .unwrap();
         assert_eq!(bytes, b"verified bytes");
+    }
+    #[test]
+    fn launch_binding_pins_native_image_and_working_directory() {
+        let fixture = tempfile::tempdir().unwrap();
+        let id = "6aba9be7-1f56-45c3-bdb6-df916d9235a9";
+        let install = fixture.path().join(id);
+        let working = install.join("payload/bin");
+        std::fs::create_dir_all(&working).unwrap();
+        std::fs::write(install.join(".app-depot-installation-id"), id).unwrap();
+        let exe = working.join("fixture.exe");
+        std::fs::copy(std::env::current_exe().unwrap(), &exe).unwrap();
+        let binding =
+            bind_launch_target(&install, id, "payload/bin/fixture.exe", "payload/bin").unwrap();
+        assert!(std::fs::rename(&working, install.join("moved")).is_err());
+        assert!(std::fs::OpenOptions::new().write(true).open(&exe).is_err());
+        assert!(std::fs::rename(&exe, working.join("renamed.exe")).is_err());
+        drop(binding);
+        assert!(
+            bind_launch_target(&install, id, "payload/../payload/bin/fixture.exe", "").is_err()
+        );
+        assert!(
+            bind_launch_target(
+                &install,
+                id,
+                "payload/bin/fixture.exe",
+                "payload/../payload"
+            )
+            .is_err()
+        );
+        assert!(bind_launch_target(&install, id, "payload/bin/fixture.exe:alternate", "").is_err());
+        assert!(bind_launch_target(&install, id, "payload/bin/missing.exe", "").is_err());
+        let alias = working.join("alias.exe");
+        std::fs::hard_link(&exe, &alias).unwrap();
+        assert!(bind_launch_target(&install, id, "payload/bin/fixture.exe", "").is_err());
+        std::fs::remove_file(alias).unwrap();
+        let corrupt = working.join("corrupt.exe");
+        std::fs::write(&corrupt, [0; 128]).unwrap();
+        assert!(bind_launch_target(&install, id, "payload/bin/corrupt.exe", "").is_err());
+    }
+    #[test]
+    fn launch_binding_refuses_junction_in_image_or_working_directory() {
+        let fixture = tempfile::tempdir().unwrap();
+        let id = "35fd693c-20cf-4cb6-bf63-309ecfee41cb";
+        let install = fixture.path().join(id);
+        let payload = install.join("payload");
+        let outside = fixture.path().join("outside");
+        std::fs::create_dir_all(&payload).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(install.join(".app-depot-installation-id"), id).unwrap();
+        std::fs::copy(
+            std::env::current_exe().unwrap(),
+            outside.join("fixture.exe"),
+        )
+        .unwrap();
+        std::fs::copy(
+            std::env::current_exe().unwrap(),
+            payload.join("fixture.exe"),
+        )
+        .unwrap();
+
+        // mklink is used only to manufacture a junction inside this test's own directory.
+        let junction = payload.join("escape");
+        use std::os::windows::process::CommandExt;
+        let junction_name = junction.to_str().unwrap().trim_start_matches(r"\\?\");
+        let outside_name = outside.to_str().unwrap().trim_start_matches(r"\\?\");
+        let command = format!("mklink /J \"{junction_name}\" \"{outside_name}\"");
+        let output = std::process::Command::new("cmd.exe")
+            .args(["/d", "/c"])
+            .raw_arg(&command)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{command}: {output:?}");
+        assert!(bind_launch_target(&install, id, "payload/escape/fixture.exe", "payload").is_err());
+        assert!(bind_launch_target(&install, id, "payload/fixture.exe", "payload/escape").is_err());
+        std::fs::remove_dir(junction).unwrap();
+        assert!(outside.join("fixture.exe").is_file());
+    }
+
+    #[test]
+    fn pinned_fixture_can_start_with_native_process_creation() {
+        const WORK: &str = "APP_DEPOT_TEST_PINNED_LAUNCH_DIR";
+        if let Some(path) = std::env::var_os(WORK) {
+            assert_eq!(
+                std::env::current_dir().unwrap(),
+                std::path::PathBuf::from(path)
+            );
+            assert!(std::env::var_os("APP_DEPOT_TEST_PINNED_LAUNCH_SECRET").is_none());
+            std::fs::write("started", b"test child").unwrap();
+            std::process::exit(23);
+        }
+        let fixture = tempfile::tempdir().unwrap();
+        let id = "0a76b1dd-bf20-4ae9-8887-7c4dcb707f10";
+        let install = fixture.path().join(id);
+        let working = install.join("payload");
+        std::fs::create_dir_all(&working).unwrap();
+        std::fs::write(install.join(".app-depot-installation-id"), id).unwrap();
+        let exe = working.join("fixture with spaces.exe");
+        std::fs::copy(std::env::current_exe().unwrap(), &exe).unwrap();
+        let binding =
+            bind_launch_target(&install, id, "payload/fixture with spaces.exe", "payload").unwrap();
+        let status = std::process::Command::new(&exe)
+            .current_dir(&working)
+            .env(WORK, &working)
+            .env_remove("APP_DEPOT_TEST_PINNED_LAUNCH_SECRET")
+            .args([
+                "--exact",
+                "windows_fs::tests::pinned_fixture_can_start_with_native_process_creation",
+            ])
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(23));
+        assert_eq!(
+            std::fs::read(working.join("started")).unwrap(),
+            b"test child"
+        );
+        drop(binding);
     }
 }

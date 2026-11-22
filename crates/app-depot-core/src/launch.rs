@@ -78,6 +78,7 @@ fn host() -> Option<&'static str> {
     match (std::env::consts::OS, std::env::consts::ARCH) {
         ("linux", "x86_64") => Some("linux/x86_64"),
         ("linux", "aarch64") => Some("linux/aarch64"),
+        ("windows", "x86_64") => Some("windows/x86_64"),
         _ => None,
     }
 }
@@ -381,11 +382,52 @@ impl Library {
                         ),
                         Err(reason) => issue(&mut c, "LocalUnavailable", &reason),
                     }
-                    #[cfg(not(target_os = "linux"))]
+                    #[cfg(windows)]
+                    {
+                        let runtime = runtime.expect("resolved installation");
+                        let target = if file {
+                            "payload".into()
+                        } else {
+                            format!("payload/{target_path}")
+                        };
+                        let work = if file || work.is_empty() {
+                            if file {
+                                String::new()
+                            } else {
+                                "payload".into()
+                            }
+                        } else {
+                            format!("payload/{work}")
+                        };
+                        match crate::windows_fs::bind_launch_target(
+                            &runtime.path,
+                            &runtime.id,
+                            &target,
+                            &work,
+                        ) {
+                            Ok(_) => issue(
+                                &mut c,
+                                "UnsupportedPlatform",
+                                "Windows launch target validated. Native execution is unavailable.",
+                            ),
+                            Err(error) => issue(
+                                &mut c,
+                                "LocalUnavailable",
+                                &format!("Invalid Windows launch target: {error}"),
+                            ),
+                        }
+                    }
+                    #[cfg(not(any(target_os = "linux", windows)))]
                     issue(
                         &mut c,
                         "UnsupportedPlatform",
                         "Native portable execution is implemented only on Linux",
+                    );
+                } else if cfg!(windows) && c.reason.is_empty() && referenced == 1 {
+                    issue(
+                        &mut c,
+                        "UnsupportedPlatform",
+                        "Install the verified Artifact to validate its Windows launch target.",
                     );
                 } else if c.reason.is_empty() && referenced == 1 {
                     issue(
