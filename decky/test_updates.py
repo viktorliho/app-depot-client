@@ -146,6 +146,27 @@ class UpdateRpcTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(checked["ok"])
             self.assertEqual(set(checked["value"]), {"version", "notes", "url"})
 
+            reported = asyncio.Event()
+            finish = threading.Event()
+
+            def transfer(_candidate, progress, verifying):
+                progress(1024, 2048, 100)
+                loop.call_soon_threadsafe(reported.set)
+                if not finish.wait(3):
+                    raise TimeoutError
+                verifying()
+
+            with patch.object(updates, "verify_update", side_effect=transfer):
+                task = asyncio.create_task(plugin.request("verify_update"))
+                try:
+                    await asyncio.wait_for(reported.wait(), timeout=2)
+                    self.assertEqual((await plugin.request("update_progress"))["value"],
+                                     {"phase": "downloading", "received": 1024, "total": 2048})
+                finally:
+                    finish.set()
+                self.assertTrue((await task)["ok"])
+                self.assertIsNone((await plugin.request("update_progress"))["value"])
+
             with patch.object(updates, "verify_update", side_effect=[OSError("interrupted"), None]):
                 self.assertEqual(await plugin.request("verify_update"),
                                  {"ok": False, "code": "update_verification_failed"})

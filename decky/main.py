@@ -134,6 +134,7 @@ class Plugin:
         self.update_lock = asyncio.Lock()
         self.update_candidate = None
         self.release_pages = None
+        self.update_transfer = None
 
     async def _unload(self):
         self.closing = True
@@ -217,6 +218,7 @@ class Plugin:
             "configure": self.configure, "catalog": self.catalog, "artwork": self.artwork,
             "shortcut": self.shortcut, "acknowledge": self.acknowledge, "binding": self.binding,
             "check_update": self.check_update, "verify_update": self.verify_update,
+            "update_progress": self.update_progress,
             "installed": self.installed, "uninstall": self.uninstall,
             "grid_states": self.grid_states, "finish_grids": self.finish_grids,
         }
@@ -278,6 +280,9 @@ class Plugin:
                 return {key: self.update_candidate[key] for key in ("version", "notes", "url")}
             return None
 
+    async def update_progress(self):
+        return self.update_transfer
+
     async def verify_update(self):
         from decky_updates import verify_update
 
@@ -286,11 +291,23 @@ class Plugin:
         async with self.update_lock:
             if not self.update_candidate:
                 raise RpcFailure("update_check_failed")
+            def progress(received, total, speed):
+                self.update_transfer = {
+                    "phase": "retrying" if speed is None else "downloading",
+                    "received": received, "total": total,
+                }
+
+            def verifying():
+                self.update_transfer = {"phase": "verifying"}
+
+            progress(0, None, 0)
             try:
-                await asyncio.to_thread(verify_update, self.update_candidate)
+                await asyncio.to_thread(verify_update, self.update_candidate, progress, verifying)
             except Exception:
                 # Network URLs and archive paths remain inside this boundary.
                 raise RpcFailure("update_verification_failed") from None
+            finally:
+                self.update_transfer = None
 
     async def discover(self):
         return await self._rust("decky", "discover")

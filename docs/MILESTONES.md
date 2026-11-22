@@ -76,3 +76,8 @@ The candidate adds Gaming Mode release discovery and on-demand verification. Act
 ## M3.3 — Decky Local Application Uninstall
 
 Decky Installed provides a confirmed, fully local complete uninstall by App and Server profile. The transaction removes runnable copies, managed data and download references. Shared objects survive while another local owner remains. The Steam shortcut and its settings stay intact, and the owned grid artwork is refreshed separately. The next Play follows normal First Play. Secure Gaming Mode update activation remains deferred. [SteamOS scope and acceptance](STEAMOS_DECKY.md#m33-local-application-uninstall)
+
+
+## M3.4 — Signed update verification and activation fixture
+
+Gaming Mode reports progress while downloading and verifying official packages. A Debian-only fixture exercises the signed manifest, protected paths, kernel peer authentication, exclusive activation and recovery. SteamOS activation and enrollment are gated on a protected Loader executable and plugin path, generation-specific Loader health and an authorized production signing identity. The fixture is not deployed. [SteamOS activation gate](STEAMOS_DECKY.md#m34-steamos-activation-gate)

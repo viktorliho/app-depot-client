@@ -177,11 +177,25 @@ async function observeInstallations() {
 type Update = { version: string; notes: string; url: string };
 const checkUpdate = rpcMethod<[], Update | null>('check_update');
 const verifyUpdate = rpcMethod<[], null>('verify_update');
+type Transfer = { phase: 'verifying' } | {
+  phase: 'downloading' | 'retrying'; received: number; total: number | null;
+};
+const updateProgress = rpcMethod<[], Transfer | null>('update_progress');
 
 function Updates({ version }: { version?: string }) {
   const [update, setUpdate] = useState<Update | null>(null);
   const [message, setMessage] = useState('');
   const [busy, setBusy] = useState(false);
+  const [downloading, setDownloading] = useState(false);
+  const [transfer, setTransfer] = useState<Transfer | null>(null);
+  useEffect(() => {
+    if (!downloading) return;
+    let active = true;
+    const refresh = () => { void updateProgress().then(state => { if (active) setTransfer(state); }, () => {}); };
+    refresh();
+    const timer = setInterval(refresh, 500);
+    return () => { active = false; clearInterval(timer); };
+  }, [downloading]);
 
   const check = async () => {
     setBusy(true);
@@ -200,22 +214,30 @@ function Updates({ version }: { version?: string }) {
 
   const verify = async () => {
     setBusy(true);
-    setMessage('Downloading and verifying…');
+    setTransfer(null);
+    setDownloading(true);
+    setMessage('Downloading…');
     try {
       await verifyUpdate();
       setMessage('Official package verified. Use the release’s installer in Desktop Mode to upgrade.');
     } catch (error) {
       setMessage(error instanceof ConnectionFailure ? error.message : messages.update_verification_failed);
     } finally {
+      setDownloading(false);
       setBusy(false);
     }
   };
 
+  const volume = (bytes: number) => `${(bytes / 1048576).toFixed(2)} MiB`;
+  const feedback = downloading && transfer
+    ? transfer.phase === 'verifying' ? 'Validating the package…'
+      : `${transfer.phase === 'retrying' ? 'Connection interrupted. Retrying' : 'Downloading'} · ${volume(transfer.received)}${transfer.total === null ? '' : ` / ${volume(transfer.total)}`}`
+    : message;
   return <PanelSection title="Updates & About">
     <PanelSectionRow>{version ? `App Depot Decky ${version}` : 'Loading version…'}</PanelSectionRow>
     <PanelSectionRow>Gaming Mode can check and verify updates. To install an update, use its installer in Desktop Mode.</PanelSectionRow>
     <PanelSectionRow><ButtonItem disabled={busy} onClick={check}>Check for updates</ButtonItem></PanelSectionRow>
-    {message && <PanelSectionRow><div role="status">{message}</div></PanelSectionRow>}
+    {feedback && <PanelSectionRow><div role="status">{feedback}</div></PanelSectionRow>}
     {update && <>
       <PanelSectionRow>Available version · {update.version}</PanelSectionRow>
       {update.notes && <PanelSectionRow><div style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}>{update.notes}</div></PanelSectionRow>}

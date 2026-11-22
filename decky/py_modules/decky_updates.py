@@ -126,7 +126,12 @@ def find_update(current, fetch=None):
     }
 
 
-def verify_update(update):
-    payload = get_package(update["package"], update["sha256"], False, context=release_tls_context())
+def verify_update(update, progress=None, verifying=None):
+    options = {"context": release_tls_context()}
+    if progress is not None:
+        options["progress"] = progress
+    payload = get_package(update["package"], update["sha256"], False, **options)
+    if verifying is not None:
+        verifying()
     with TemporaryDirectory(prefix="app-depot-update-") as scratch:
         unpack(payload, Path(scratch), update["version"])
