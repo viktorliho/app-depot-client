@@ -6,8 +6,9 @@ use crate::{
     library::{Library, LibraryError, now},
     models::InventoryEntry,
     transfer::{
-        BlobOutcome, BlobSpec, DownloadJob, TransferObservation, TransferPhase, existing_dir,
-        hash_file, open_regular, private_dir, receive_blob, safe_regular, sync_dir,
+        BlobOutcome, BlobSpec, DownloadJob, TransferObservation, TransferPhase,
+        create_content_file, existing_dir, hash_file, link_content, open_regular, private_dir,
+        receive_blob, safe_regular, sync_dir,
     },
     tree::{identity, validate_destination},
 };
@@ -16,7 +17,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     thread,
@@ -88,7 +89,7 @@ pub(crate) fn tree_destination(
 
 #[cfg(unix)]
 pub(crate) fn open_dir_nofollow(path: &Path) -> Result<File, LibraryError> {
-    use std::os::unix::fs::OpenOptionsExt;
+    use std::{fs::OpenOptions, os::unix::fs::OpenOptionsExt};
     let file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
@@ -454,10 +455,7 @@ impl Library {
         let stage = child_stage(self, job_id, file_id)?;
         private_dir(stage.parent().unwrap())?;
         if !safe_regular(&stage)? {
-            OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&stage)?;
+            create_content_file(&stage)?;
         }
         // Promotion may have been interrupted after making staging immutable but before the
         // object link became durable. Reopen by descriptor and restore write access for resume.
@@ -673,7 +671,7 @@ impl Library {
         permissions.set_readonly(true);
         verified_stage.set_permissions(permissions)?;
         verified_stage.sync_all()?;
-        let newly_linked = match fs::hard_link(&stage, &object) {
+        let newly_linked = match link_content(&stage, &object, *size, sha256) {
             Ok(()) => {
                 sync_dir(object.parent().unwrap())?;
                 true
@@ -893,10 +891,7 @@ impl Library {
                 #[cfg(unix)]
                 let mut output = create_file_beneath(&root_handle, path)?;
                 #[cfg(not(unix))]
-                let mut output = OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(build.join(path))?;
+                let mut output = create_content_file(&build.join(path))?;
                 let mut hash = Sha256::new();
                 let mut length = 0u64;
                 let mut buffer = [0u8; 65536];

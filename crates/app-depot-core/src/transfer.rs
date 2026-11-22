@@ -96,6 +96,17 @@ pub(crate) fn strong_etag(value: &str) -> bool {
         && value.bytes().all(|byte| (33..=126).contains(&byte))
 }
 pub(crate) fn safe_regular(path: &Path) -> Result<bool, LibraryError> {
+    #[cfg(windows)]
+    {
+        match open_regular(path, false) {
+            Ok(_) => Ok(true),
+            Err(LibraryError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                Ok(false)
+            }
+            Err(error) => Err(error),
+        }
+    }
+    #[cfg(not(windows))]
     match fs::symlink_metadata(path) {
         Ok(meta) if meta.is_file() && !meta.file_type().is_symlink() => Ok(true),
         Ok(_) => Err(invalid(format!("unsafe existing file: {}", path.display()))),
@@ -103,6 +114,12 @@ pub(crate) fn safe_regular(path: &Path) -> Result<bool, LibraryError> {
         Err(error) => Err(error.into()),
     }
 }
+#[cfg(windows)]
+pub(crate) fn open_regular(path: &Path, write: bool) -> Result<File, LibraryError> {
+    Ok(crate::windows_fs::content_file(path, false, write)?)
+}
+
+#[cfg(not(windows))]
 pub(crate) fn open_regular(path: &Path, write: bool) -> Result<File, LibraryError> {
     let mut options = OpenOptions::new();
     options.read(true).write(write);
@@ -117,6 +134,42 @@ pub(crate) fn open_regular(path: &Path, write: bool) -> Result<File, LibraryErro
     }
     Ok(file)
 }
+
+pub(crate) fn create_content_file(path: &Path) -> Result<File, LibraryError> {
+    #[cfg(windows)]
+    {
+        Ok(crate::windows_fs::content_file(path, true, true)?)
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(OpenOptions::new().write(true).create_new(true).open(path)?)
+    }
+}
+
+pub(crate) fn link_content(
+    from: &Path,
+    to: &Path,
+    expected_size: u64,
+    digest: &str,
+) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        crate::windows_fs::link_verified(from, to, |file| {
+            if hash_open_file(file, expected_size).map_err(std::io::Error::other)? != digest {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "CAS source SHA-256 mismatch",
+                ));
+            }
+            Ok(())
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (expected_size, digest);
+        fs::hard_link(from, to)
+    }
+}
 #[cfg(unix)]
 fn same_inode(first: &Path, second: &Path) -> Result<bool, LibraryError> {
     use std::os::unix::fs::MetadataExt;
@@ -128,6 +181,13 @@ fn same_inode(first: &Path, second: &Path) -> Result<bool, LibraryError> {
 fn same_inode(_first: &Path, _second: &Path) -> Result<bool, LibraryError> {
     Ok(false)
 }
+#[cfg(windows)]
+pub(crate) fn private_dir(path: &Path) -> Result<(), LibraryError> {
+    crate::windows_fs::ensure_directory(path)?;
+    Ok(())
+}
+
+#[cfg(not(windows))]
 pub(crate) fn private_dir(path: &Path) -> Result<(), LibraryError> {
     if path.exists() {
         if fs::symlink_metadata(path)?.is_dir() {
@@ -155,6 +215,9 @@ pub(crate) fn existing_dir(path: &Path) -> Result<(), LibraryError> {
     Ok(())
 }
 pub(crate) fn sync_dir(path: &Path) -> Result<(), LibraryError> {
+    #[cfg(windows)]
+    crate::windows_fs::sync_directory(path)?;
+    #[cfg(not(windows))]
     File::open(path)?.sync_all()?;
     Ok(())
 }
@@ -162,7 +225,10 @@ pub(crate) fn hash_file(path: &Path, expected_size: u64) -> Result<String, Libra
     if !safe_regular(path)? {
         return Err(invalid("verified file is missing"));
     }
-    let mut file = open_regular(path, false)?;
+    hash_open_file(&open_regular(path, false)?, expected_size)
+}
+
+fn hash_open_file(mut file: &File, expected_size: u64) -> Result<String, LibraryError> {
     if file.metadata()?.len() != expected_size {
         return Err(invalid("verified file has wrong size"));
     }
@@ -410,11 +476,7 @@ impl Library {
         private_dir(dir)?;
         let path = dir.join("job.lock");
         if !safe_regular(&path)? {
-            OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)?
-                .sync_all()?;
+            create_content_file(&path)?.sync_all()?;
             sync_dir(dir)?;
         }
         let file = open_regular(&path, true)?;
@@ -656,7 +718,12 @@ impl Library {
                 return Err(invalid("staging identity mismatch during commit"));
             }
             open_regular(&stage, false)?.sync_all()?;
-            match fs::hard_link(&stage, &object) {
+            match link_content(
+                &stage,
+                &object,
+                job.expected_size,
+                digest(&job.artifact_id)?,
+            ) {
                 Ok(()) => {
                     sync_dir(object.parent().unwrap())?;
                     true
@@ -692,7 +759,12 @@ impl Library {
             }
             false
         } else {
-            match fs::hard_link(&object, &visible) {
+            match link_content(
+                &object,
+                &visible,
+                job.expected_size,
+                digest(&job.artifact_id)?,
+            ) {
                 Ok(()) => {
                     sync_dir(visible_parent)?;
                     true
@@ -1066,6 +1138,118 @@ impl Library {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_cas_process_interruption() {
+        const ROOT: &str = "APP_DEPOT_CAS_TEST_ROOT";
+        const PHASE: &str = "APP_DEPOT_CAS_TEST_PHASE";
+        const BYTES: &[u8] = b"process recovery fixture";
+        let digest = format!("{:x}", Sha256::digest(BYTES));
+        if let Some(root) = std::env::var_os(ROOT) {
+            let root = PathBuf::from(root);
+            let mut output = create_content_file(&root.join("stage")).unwrap();
+            output.write_all(BYTES).unwrap();
+            output.sync_all().unwrap();
+            drop(output);
+            if std::env::var(PHASE).as_deref() == Ok("after") {
+                link_content(
+                    &root.join("stage"),
+                    &root.join("object"),
+                    BYTES.len() as u64,
+                    &digest,
+                )
+                .unwrap();
+                sync_dir(&root).unwrap();
+            }
+            create_content_file(&root.join("ready")).unwrap();
+            loop {
+                std::thread::park();
+            }
+        }
+        for phase in ["before", "after"] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path();
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "transfer::tests::windows_cas_process_interruption",
+                ])
+                .env(ROOT, root)
+                .env(PHASE, phase)
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while !root.join("ready").exists() && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let terminated = child.kill();
+            child.wait().unwrap();
+            terminated.unwrap();
+            assert!(root.join("ready").exists());
+            let stage = root.join("stage");
+            let object = root.join("object");
+            assert_eq!(hash_file(&stage, BYTES.len() as u64).unwrap(), digest);
+            if phase == "before" {
+                assert!(!object.exists());
+                link_content(&stage, &object, BYTES.len() as u64, &digest).unwrap();
+            }
+            assert_eq!(hash_file(&object, BYTES.len() as u64).unwrap(), digest);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_cas_link_checks_bytes_and_never_replaces_destination() {
+        let temp = tempfile::tempdir().unwrap();
+        let stage = temp.path().join("staging");
+        let cas = temp.path().join("cas");
+        private_dir(&stage).unwrap();
+        private_dir(&cas).unwrap();
+        sync_dir(temp.path()).unwrap();
+        let source = stage.join("blob");
+        let target = cas.join("object");
+        let bytes = b"verified bytes";
+        let digest = format!("{:x}", Sha256::digest(bytes));
+        let mut file = create_content_file(&source).unwrap();
+        file.write_all(bytes).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        assert_eq!(
+            link_content(&source, &target, bytes.len() as u64, &"0".repeat(64))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        assert!(!target.exists());
+        let writer = open_regular(&source, true).unwrap();
+        assert!(link_content(&source, &target, bytes.len() as u64, &digest).is_err());
+        assert!(!target.exists());
+        drop(writer);
+        link_content(&source, &target, bytes.len() as u64, &digest).unwrap();
+        sync_dir(&cas).unwrap();
+        assert_eq!(hash_file(&target, bytes.len() as u64).unwrap(), digest);
+        let other = stage.join("other");
+        let other_bytes = b"unrelated bytes";
+        let other_digest = format!("{:x}", Sha256::digest(other_bytes));
+        create_content_file(&other)
+            .unwrap()
+            .write_all(other_bytes)
+            .unwrap();
+        assert_eq!(
+            link_content(
+                &other,
+                &cas.join("OBJECT"),
+                other_bytes.len() as u64,
+                &other_digest
+            )
+            .unwrap_err()
+            .kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(fs::read(&target).unwrap(), bytes);
+    }
 
     #[cfg(windows)]
     #[test]

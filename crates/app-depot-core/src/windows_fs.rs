@@ -15,9 +15,10 @@ use windows_sys::{
     Wdk::{
         Foundation::OBJECT_ATTRIBUTES,
         Storage::FileSystem::{
-            FILE_CREATE, FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE, FILE_OPEN,
-            FILE_OPEN_REPARSE_POINT, FILE_RENAME_INFORMATION, FILE_SYNCHRONOUS_IO_NONALERT,
-            FileRenameInformation, NtCreateFile, NtSetInformationFile,
+            FILE_CREATE, FILE_DIRECTORY_FILE, FILE_INFORMATION_CLASS, FILE_LINK_INFORMATION,
+            FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_REPARSE_POINT, FILE_RENAME_INFORMATION,
+            FILE_SYNCHRONOUS_IO_NONALERT, FileLinkInformation, FileRenameInformation, NtCreateFile,
+            NtSetInformationFile,
         },
     },
     Win32::{
@@ -124,6 +125,7 @@ fn open_child(
     access: u32,
     disposition: u32,
     options: u32,
+    share: u32,
 ) -> io::Result<File> {
     let mut name = name_utf16(name)?;
     let bytes = (name.len() * size_of::<u16>()) as u16;
@@ -151,7 +153,7 @@ fn open_child(
             &mut status_block,
             null(),
             FILE_ATTRIBUTE_NORMAL,
-            SHARE,
+            share,
             disposition,
             options | FILE_SYNCHRONOUS_IO_NONALERT,
             null(),
@@ -169,7 +171,7 @@ fn directory_child(parent: &File, name: &OsStr, create: bool, access: u32) -> io
     } else {
         (FILE_OPEN, FILE_OPEN_REPARSE_POINT)
     };
-    let handle = open_child(parent, name, access, disposition, options)?;
+    let handle = open_child(parent, name, access, disposition, options, SHARE)?;
     check_directory(&handle)?;
     Ok(handle)
 }
@@ -246,29 +248,53 @@ pub(crate) fn ensure_directory(path: &Path) -> io::Result<()> {
 
 /// Open an existing regular file for read, or exclusively create a new file for write.
 pub(crate) fn regular_file(path: &Path, create: bool) -> io::Result<File> {
+    open_regular(path, create, create, SHARE)
+}
+
+fn open_regular(path: &Path, create: bool, write: bool, share: u32) -> io::Result<File> {
     let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
         return Err(invalid("file path requires a parent and a name"));
     };
     let chain = directory_chain(parent, false)?;
     let parent = chain.last().unwrap();
-    let (access, disposition, options) = if create {
+    let (disposition, options) = if create {
         require_case_insensitive(parent)?;
-        (GENERIC_WRITE, FILE_CREATE, FILE_NON_DIRECTORY_FILE)
+        (FILE_CREATE, FILE_NON_DIRECTORY_FILE)
     } else {
-        (GENERIC_READ, FILE_OPEN, FILE_OPEN_REPARSE_POINT)
+        (FILE_OPEN, FILE_OPEN_REPARSE_POINT)
     };
+    let access = GENERIC_READ | if write { GENERIC_WRITE } else { 0 };
     let file = open_child(
         parent,
         name,
         access | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
         disposition,
         options,
+        share,
     )?;
     let metadata = file.metadata()?;
     if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
         return Err(invalid("Windows path is not a plain regular file"));
     }
     Ok(file)
+}
+
+pub(crate) fn content_file(path: &Path, create: bool, write: bool) -> io::Result<File> {
+    open_regular(path, create, write, SHARE)
+}
+
+pub(crate) fn sync_directory(path: &Path) -> io::Result<()> {
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return Err(invalid("directory sync requires a named directory"));
+    };
+    let chain = directory_chain(parent, false)?;
+    directory_child(
+        chain.last().unwrap(),
+        name,
+        false,
+        DIRECTORY_ACCESS | GENERIC_WRITE,
+    )?
+    .sync_all()
 }
 
 #[repr(C)]
@@ -288,6 +314,14 @@ const _: () = {
             == offset_of!(FILE_RENAME_INFORMATION, FileNameLength)
     );
     assert!(offset_of!(RenameInformation, name) == offset_of!(FILE_RENAME_INFORMATION, FileName));
+    assert!(
+        offset_of!(RenameInformation, root) == offset_of!(FILE_LINK_INFORMATION, RootDirectory)
+    );
+    assert!(
+        offset_of!(RenameInformation, name_bytes)
+            == offset_of!(FILE_LINK_INFORMATION, FileNameLength)
+    );
+    assert!(offset_of!(RenameInformation, name) == offset_of!(FILE_LINK_INFORMATION, FileName));
 };
 
 pub(crate) fn rename_directory_noreplace(from: &Path, to: &Path) -> io::Result<()> {
@@ -296,7 +330,6 @@ pub(crate) fn rename_directory_noreplace(from: &Path, to: &Path) -> io::Result<(
     else {
         return Err(invalid("rename requires source and destination names"));
     };
-    let name = name_utf16(to_name)?;
     let from_chain = directory_chain(from_parent, false)?;
     let to_chain = directory_chain(to_parent, false)?;
     let target = to_chain.last().unwrap();
@@ -307,13 +340,44 @@ pub(crate) fn rename_directory_noreplace(from: &Path, to: &Path) -> io::Result<(
         false,
         DIRECTORY_ACCESS | DELETE,
     )?;
+    set_name(
+        &source,
+        target,
+        &name_utf16(to_name)?,
+        FileRenameInformation,
+    )
+}
+
+pub(crate) fn link_verified(
+    from: &Path,
+    to: &Path,
+    verify: impl FnOnce(&File) -> io::Result<()>,
+) -> io::Result<()> {
+    let (Some(parent), Some(name)) = (to.parent(), to.file_name()) else {
+        return Err(invalid("link requires a destination name"));
+    };
+    let name = name_utf16(name)?;
+    let chain = directory_chain(parent, false)?;
+    let target = chain.last().unwrap();
+    require_case_insensitive(target)?;
+    let source = open_regular(from, false, false, FILE_SHARE_READ)?;
+    verify(&source)?;
+    set_name(&source, target, &name, FileLinkInformation)
+}
+
+fn set_name(
+    source: &File,
+    target: &File,
+    name: &[u16],
+    class: FILE_INFORMATION_CLASS,
+) -> io::Result<()> {
     let mut info = RenameInformation {
         flags: 0,
         root: target.as_raw_handle(),
-        name_bytes: (name.len() * size_of::<u16>()) as u32,
+        name_bytes: std::mem::size_of_val(name) as u32,
         name: [0; MAX_NAME],
     };
-    info.name[..name.len()].copy_from_slice(&name);
+    info.name[..name.len()].copy_from_slice(name);
     let mut status_block = IO_STATUS_BLOCK::default();
     // SAFETY: fixed C layout checked against the SDK binding. Both endpoint handles and the
     // complete name buffer remain valid for this synchronous operation. Flags forbid replacement.
@@ -323,7 +387,7 @@ pub(crate) fn rename_directory_noreplace(from: &Path, to: &Path) -> io::Result<(
             &mut status_block,
             (&raw const info).cast(),
             size_of::<RenameInformation>() as u32,
-            FileRenameInformation,
+            class,
         )
     };
     nt_result(status)
