@@ -2,7 +2,7 @@
 use std::{
     ffi::OsStr,
     fs::{File, OpenOptions},
-    io,
+    io::{self, Read, Seek, SeekFrom},
     mem::{offset_of, size_of},
     os::windows::{
         fs::{MetadataExt, OpenOptionsExt},
@@ -15,10 +15,11 @@ use windows_sys::{
     Wdk::{
         Foundation::OBJECT_ATTRIBUTES,
         Storage::FileSystem::{
-            FILE_CREATE, FILE_DIRECTORY_FILE, FILE_INFORMATION_CLASS, FILE_LINK_INFORMATION,
+            FILE_CREATE, FILE_DIRECTORY_FILE, FILE_DISPOSITION_DELETE,
+            FILE_DISPOSITION_INFORMATION_EX, FILE_DISPOSITION_POSIX_SEMANTICS,
             FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_REPARSE_POINT, FILE_RENAME_INFORMATION,
-            FILE_SYNCHRONOUS_IO_NONALERT, FileLinkInformation, FileRenameInformation, NtCreateFile,
-            NtSetInformationFile,
+            FILE_SYNCHRONOUS_IO_NONALERT, FileDispositionInformationEx, FileRenameInformation,
+            NtCreateFile, NtSetInformationFile,
         },
     },
     Win32::{
@@ -28,9 +29,10 @@ use windows_sys::{
         },
         Storage::FileSystem::{
             DELETE, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_CASE_SENSITIVE_INFO,
-            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
-            FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, FileCaseSensitiveInfo, GetDriveTypeW,
-            GetFileInformationByHandleEx, SYNCHRONIZE,
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_INFO,
+            FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE,
+            FileCaseSensitiveInfo, FileIdInfo, GetDriveTypeW, GetFileInformationByHandleEx,
+            SYNCHRONIZE,
         },
         System::IO::IO_STATUS_BLOCK,
     },
@@ -280,7 +282,34 @@ fn open_regular(path: &Path, create: bool, write: bool, share: u32) -> io::Resul
 }
 
 pub(crate) fn content_file(path: &Path, create: bool, write: bool) -> io::Result<File> {
-    open_regular(path, create, write, SHARE)
+    let file = open_regular(path, create, write, SHARE)?;
+    if write {
+        require_single_link(&file)?;
+    }
+    Ok(file)
+}
+
+fn require_single_link(file: &File) -> io::Result<()> {
+    use windows_sys::Win32::Storage::FileSystem::{FILE_STANDARD_INFO, FileStandardInfo};
+    let mut info = FILE_STANDARD_INFO::default();
+    // SAFETY: the handle is live and the buffer matches FileStandardInfo.
+    let ok = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle(),
+            FileStandardInfo,
+            (&raw mut info).cast(),
+            size_of::<FILE_STANDARD_INFO>() as u32,
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if info.NumberOfLinks != 1 {
+        return Err(invalid(
+            "refusing writable content handle for a linked or unlinked file",
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn sync_directory(path: &Path) -> io::Result<()> {
@@ -314,14 +343,6 @@ const _: () = {
             == offset_of!(FILE_RENAME_INFORMATION, FileNameLength)
     );
     assert!(offset_of!(RenameInformation, name) == offset_of!(FILE_RENAME_INFORMATION, FileName));
-    assert!(
-        offset_of!(RenameInformation, root) == offset_of!(FILE_LINK_INFORMATION, RootDirectory)
-    );
-    assert!(
-        offset_of!(RenameInformation, name_bytes)
-            == offset_of!(FILE_LINK_INFORMATION, FileNameLength)
-    );
-    assert!(offset_of!(RenameInformation, name) == offset_of!(FILE_LINK_INFORMATION, FileName));
 };
 
 pub(crate) fn rename_directory_noreplace(from: &Path, to: &Path) -> io::Result<()> {
@@ -340,37 +361,96 @@ pub(crate) fn rename_directory_noreplace(from: &Path, to: &Path) -> io::Result<(
         false,
         DIRECTORY_ACCESS | DELETE,
     )?;
-    set_name(
-        &source,
-        target,
-        &name_utf16(to_name)?,
-        FileRenameInformation,
-    )
+    rename_noreplace(&source, target, &name_utf16(to_name)?)
 }
 
-pub(crate) fn link_verified(
+pub(crate) fn publish_verified_copy(
     from: &Path,
     to: &Path,
+    expected_size: u64,
     verify: impl FnOnce(&File) -> io::Result<()>,
 ) -> io::Result<()> {
     let (Some(parent), Some(name)) = (to.parent(), to.file_name()) else {
-        return Err(invalid("link requires a destination name"));
+        return Err(invalid("publication requires a destination name"));
     };
     let name = name_utf16(name)?;
     let chain = directory_chain(parent, false)?;
     let target = chain.last().unwrap();
     require_case_insensitive(target)?;
     let source = open_regular(from, false, false, FILE_SHARE_READ)?;
-    verify(&source)?;
-    set_name(&source, target, &name, FileLinkInformation)
+    if volume(&source)? != volume(target)? {
+        return Err(invalid("publication requires a single volume"));
+    }
+    if source.metadata()?.len() != expected_size {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "publication source size mismatch",
+        ));
+    }
+    let temporary_name = format!(".app-depot-publish-{}", uuid::Uuid::new_v4());
+    let mut temporary = open_child(
+        target,
+        OsStr::new(&temporary_name),
+        GENERIC_READ | GENERIC_WRITE | DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+        FILE_CREATE,
+        FILE_NON_DIRECTORY_FILE,
+        0,
+    )?;
+    let result = (|| {
+        if io::copy(&mut source.take(expected_size), &mut temporary)? != expected_size {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "publication source shortened",
+            ));
+        }
+        temporary.seek(SeekFrom::Start(0))?;
+        verify(&temporary)?;
+        temporary.sync_all()?;
+        rename_noreplace(&temporary, target, &name)
+    })();
+    if result.is_err() {
+        delete_open_file(temporary)?;
+    }
+    result
 }
 
-fn set_name(
-    source: &File,
-    target: &File,
-    name: &[u16],
-    class: FILE_INFORMATION_CLASS,
-) -> io::Result<()> {
+fn volume(file: &File) -> io::Result<u64> {
+    let mut info = FILE_ID_INFO::default();
+    // SAFETY: FileIdInfo writes to a FILE_ID_INFO buffer and file stays open during the call.
+    let ok = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle(),
+            FileIdInfo,
+            (&raw mut info).cast(),
+            size_of::<FILE_ID_INFO>() as u32,
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(info.VolumeSerialNumber)
+}
+
+fn delete_open_file(file: File) -> io::Result<()> {
+    let mut status_block = IO_STATUS_BLOCK::default();
+    let info = FILE_DISPOSITION_INFORMATION_EX {
+        Flags: FILE_DISPOSITION_DELETE | FILE_DISPOSITION_POSIX_SEMANTICS,
+    };
+    // SAFETY: the exclusive creation handle grants DELETE on this exact file. This call
+    // keeps the handle and disposition buffer valid until synchronous completion.
+    let status = unsafe {
+        NtSetInformationFile(
+            file.as_raw_handle(),
+            &mut status_block,
+            (&raw const info).cast(),
+            size_of::<FILE_DISPOSITION_INFORMATION_EX>() as u32,
+            FileDispositionInformationEx,
+        )
+    };
+    nt_result(status)
+}
+
+fn rename_noreplace(source: &File, target: &File, name: &[u16]) -> io::Result<()> {
     let mut info = RenameInformation {
         flags: 0,
         root: target.as_raw_handle(),
@@ -387,7 +467,7 @@ fn set_name(
             &mut status_block,
             (&raw const info).cast(),
             size_of::<RenameInformation>() as u32,
-            class,
+            FileRenameInformation,
         )
     };
     nt_result(status)
@@ -397,6 +477,44 @@ fn set_name(
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn failed_publication_cleans_only_its_exclusive_temporary_file() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path();
+        let source = root.join("source");
+        let target = root.join("target");
+        let unrelated = root.join("unrelated");
+        fs::write(&source, b"data").unwrap();
+        fs::write(&unrelated, b"keep").unwrap();
+
+        let error = publish_verified_copy(&source, &target, 4, |_| {
+            let temporary = root
+                .read_dir()
+                .unwrap()
+                .flatten()
+                .find(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".app-depot-publish-")
+                })
+                .unwrap()
+                .path();
+            assert!(fs::rename(&temporary, root.join("substitute")).is_err());
+            assert!(fs::rename(&unrelated, &temporary).is_err());
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "fixture rejection",
+            ))
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(fs::read(&unrelated).unwrap(), b"keep");
+        assert_eq!(fs::read(&source).unwrap(), b"data");
+        assert!(!target.exists());
+        assert_eq!(root.read_dir().unwrap().count(), 2);
+    }
 
     #[test]
     fn rejects_win32_path_aliases_and_streams() {

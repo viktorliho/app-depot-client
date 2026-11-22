@@ -7,7 +7,7 @@ use crate::{
     models::InventoryEntry,
     transfer::{
         BlobOutcome, BlobSpec, DownloadJob, TransferObservation, TransferPhase,
-        create_content_file, existing_dir, hash_file, link_content, open_regular, private_dir,
+        create_content_file, existing_dir, hash_file, open_regular, private_dir, publish_content,
         receive_blob, safe_regular, sync_dir,
     },
     tree::{identity, validate_destination},
@@ -671,7 +671,7 @@ impl Library {
         permissions.set_readonly(true);
         verified_stage.set_permissions(permissions)?;
         verified_stage.sync_all()?;
-        let newly_linked = match link_content(&stage, &object, *size, sha256) {
+        let newly_linked = match publish_content(&stage, &object, *size, sha256) {
             Ok(()) => {
                 sync_dir(object.parent().unwrap())?;
                 true
@@ -858,8 +858,13 @@ impl Library {
                 root.sync_all()?;
                 fs::remove_dir(&build)?;
             }
-            #[cfg(not(unix))]
+            #[cfg(windows)]
+            return Err(invalid(
+                "cannot safely clean an interrupted Windows Tree staging directory",
+            ));
+            #[cfg(not(any(unix, windows)))]
             fs::remove_dir_all(&build)?;
+            #[cfg(not(windows))]
             sync_dir(&stage)?;
         }
         private_dir(&build)?;

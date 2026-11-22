@@ -146,7 +146,7 @@ pub(crate) fn create_content_file(path: &Path) -> Result<File, LibraryError> {
     }
 }
 
-pub(crate) fn link_content(
+pub(crate) fn publish_content(
     from: &Path,
     to: &Path,
     expected_size: u64,
@@ -154,7 +154,7 @@ pub(crate) fn link_content(
 ) -> std::io::Result<()> {
     #[cfg(windows)]
     {
-        crate::windows_fs::link_verified(from, to, |file| {
+        crate::windows_fs::publish_verified_copy(from, to, expected_size, |file| {
             if hash_open_file(file, expected_size).map_err(std::io::Error::other)? != digest {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
@@ -718,7 +718,7 @@ impl Library {
                 return Err(invalid("staging identity mismatch during commit"));
             }
             open_regular(&stage, false)?.sync_all()?;
-            match link_content(
+            match publish_content(
                 &stage,
                 &object,
                 job.expected_size,
@@ -759,7 +759,7 @@ impl Library {
             }
             false
         } else {
-            match link_content(
+            match publish_content(
                 &object,
                 &visible,
                 job.expected_size,
@@ -794,7 +794,8 @@ impl Library {
         let tx = self.conn.transaction()?;
         tx.execute("INSERT OR IGNORE INTO verified_content(profile_id,artifact_id,local_ref,verified_at,association_id) VALUES (?1,?2,?3,?4,?5)",params![job.profile_id.0,job.artifact_id,relative,now()?,job.association_id])?;
         if tx.execute("UPDATE download_jobs SET state='Completed',progress=?2,last_error=NULL,updated_at=?3 WHERE id=?1 AND state='Committing'",params![job.id,job.expected_size as i64,now()?])?!=1 {return Err(invalid("job left Committing state"));}
-        if safe_regular(&stage)? {
+        // On Windows a reopened name alone does not establish ownership of the staging file.
+        if !cfg!(windows) && safe_regular(&stage)? {
             fs::remove_file(&stage)?;
             sync_dir(stage.parent().unwrap())?;
         }
@@ -1152,8 +1153,22 @@ mod tests {
             output.write_all(BYTES).unwrap();
             output.sync_all().unwrap();
             drop(output);
-            if std::env::var(PHASE).as_deref() == Ok("after") {
-                link_content(
+            let phase = std::env::var(PHASE).unwrap();
+            if phase == "during" {
+                crate::windows_fs::publish_verified_copy(
+                    &root.join("stage"),
+                    &root.join("object"),
+                    BYTES.len() as u64,
+                    |_| {
+                        create_content_file(&root.join("ready")).map_err(std::io::Error::other)?;
+                        loop {
+                            std::thread::park();
+                        }
+                    },
+                )
+                .unwrap();
+            } else if phase == "after" {
+                publish_content(
                     &root.join("stage"),
                     &root.join("object"),
                     BYTES.len() as u64,
@@ -1167,7 +1182,7 @@ mod tests {
                 std::thread::park();
             }
         }
-        for phase in ["before", "after"] {
+        for phase in ["before", "during", "after"] {
             let temp = tempfile::tempdir().unwrap();
             let root = temp.path();
             let mut child = std::process::Command::new(std::env::current_exe().unwrap())
@@ -1191,17 +1206,31 @@ mod tests {
             let stage = root.join("stage");
             let object = root.join("object");
             assert_eq!(hash_file(&stage, BYTES.len() as u64).unwrap(), digest);
-            if phase == "before" {
+            let unpublished = || {
+                root.read_dir()
+                    .unwrap()
+                    .flatten()
+                    .filter(|entry| {
+                        entry
+                            .file_name()
+                            .to_string_lossy()
+                            .starts_with(".app-depot-publish-")
+                    })
+                    .count()
+            };
+            assert_eq!(unpublished(), usize::from(phase == "during"));
+            if phase != "after" {
                 assert!(!object.exists());
-                link_content(&stage, &object, BYTES.len() as u64, &digest).unwrap();
+                publish_content(&stage, &object, BYTES.len() as u64, &digest).unwrap();
             }
             assert_eq!(hash_file(&object, BYTES.len() as u64).unwrap(), digest);
+            assert_eq!(unpublished(), usize::from(phase == "during"));
         }
     }
 
     #[cfg(windows)]
     #[test]
-    fn windows_cas_link_checks_bytes_and_never_replaces_destination() {
+    fn windows_cas_publication_checks_bytes_and_never_replaces_destination() {
         let temp = tempfile::tempdir().unwrap();
         let stage = temp.path().join("staging");
         let cas = temp.path().join("cas");
@@ -1217,19 +1246,27 @@ mod tests {
         file.sync_all().unwrap();
         drop(file);
         assert_eq!(
-            link_content(&source, &target, bytes.len() as u64, &"0".repeat(64))
+            publish_content(&source, &target, bytes.len() as u64, &"0".repeat(64))
                 .unwrap_err()
                 .kind(),
             std::io::ErrorKind::InvalidData
         );
         assert!(!target.exists());
         let writer = open_regular(&source, true).unwrap();
-        assert!(link_content(&source, &target, bytes.len() as u64, &digest).is_err());
+        assert!(publish_content(&source, &target, bytes.len() as u64, &digest).is_err());
         assert!(!target.exists());
         drop(writer);
-        link_content(&source, &target, bytes.len() as u64, &digest).unwrap();
+        publish_content(&source, &target, bytes.len() as u64, &digest).unwrap();
         sync_dir(&cas).unwrap();
         assert_eq!(hash_file(&target, bytes.len() as u64).unwrap(), digest);
+        let mut resumed_writer = open_regular(&source, true).unwrap();
+        resumed_writer.write_all(b"changed").unwrap();
+        resumed_writer.sync_all().unwrap();
+        drop(resumed_writer);
+        assert_eq!(hash_file(&target, bytes.len() as u64).unwrap(), digest);
+        let injected_alias = stage.join("alias");
+        fs::hard_link(&target, &injected_alias).unwrap();
+        assert!(open_regular(&injected_alias, true).is_err());
         let other = stage.join("other");
         let other_bytes = b"unrelated bytes";
         let other_digest = format!("{:x}", Sha256::digest(other_bytes));
@@ -1238,7 +1275,7 @@ mod tests {
             .write_all(other_bytes)
             .unwrap();
         assert_eq!(
-            link_content(
+            publish_content(
                 &other,
                 &cas.join("OBJECT"),
                 other_bytes.len() as u64,
