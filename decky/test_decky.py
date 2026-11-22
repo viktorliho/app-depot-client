@@ -5,6 +5,8 @@ import io
 import json
 from pathlib import Path
 import stat
+import shlex
+import sys
 import tempfile
 import threading
 import unittest
@@ -416,9 +418,52 @@ class InstallerTests(unittest.TestCase):
                         target.replace(".com/", ".com:8443/"), target.replace(".com/", ".com@evil/")):
             self.assertIsNone(redirect.redirect_request(request, None, 302, "", {}, changed))
 
-    def test_bootstrap_contains_pinned_metadata_and_source(self):
-        source = "def desktop(*args):\n    print(args[1:])\n"
-        desktop = package.desktop_entry(source, "http://127.0.0.1:8765/v1.zip", "a" * 64, "v1", True)
-        self.assertIn("Exec=/usr/bin/python3 -I -c ", desktop)
-        self.assertIn("# def desktop(*args):", desktop)
-        self.assertIn("# SHA-256: " + "a" * 64, desktop)
+    def test_compact_bootstrap_verifies_script_before_execution(self):
+        script = b"print('installer fixture executed')"
+        digest = hashlib.sha256(script).hexdigest()
+        version = "0.1.0-beta.8"
+        name = f"AppDepot-Decky-Installer-v{version}.py"
+        url = f"{package.RELEASE_BASE}/decky-v{version}/{name}"
+        desktop = package.desktop_entry(url, digest, False)
+        line = next(line for line in desktop.splitlines() if line.startswith("Exec="))
+        self.assertLess(len(line.encode()), 1024)
+        self.assertLess(len(desktop.encode()), 1400)
+        executable, isolated, command_flag, command, pinned_url, pinned_digest = shlex.split(line[5:])
+        self.assertEqual((executable, isolated, command_flag), ("/usr/bin/python3", "-I", "-c"))
+        self.assertEqual((pinned_url, pinned_digest), (url, digest))
+
+        for invalid in (url.replace("https:", "http:"), url + "?mutable=1",
+                        url.replace("github.com", "github.com.example"),
+                        url.replace(f"decky-v{version}", "decky-v0.1.0-beta.7")):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                package.desktop_entry(invalid, digest, False)
+
+        output = io.StringIO()
+
+        def run(payload):
+            with patch.object(sys, "argv", ["-c", url, digest]), patch("sys.stdout", output), \
+                    patch("urllib.request.build_opener") as build_opener:
+                opener = build_opener.return_value
+                opener.open.side_effect = payload if isinstance(payload, Exception) else None
+                opener.open.return_value = io.BytesIO(payload if isinstance(payload, bytes) else b"")
+                try:
+                    exec(command, {})
+                finally:
+                    opener.open.assert_called_once_with(url, timeout=20)
+                redirect = build_opener.call_args.args[1].redirect_request
+                cdn = "https://release-assets.githubusercontent.com/github-production-release-asset/fixture?token=fixture"
+                target = redirect(Request(url), None, 302, "", {}, cdn)
+                self.assertEqual(target.full_url, cdn)
+                for invalid in (cdn.replace("https:", "http:"), cdn.replace(".com/", ".com.evil/"),
+                                cdn.replace(".com/", ".com:443/"), cdn + "#fragment", url):
+                    self.assertIsNone(redirect(Request(url), None, 302, "", {}, invalid))
+                self.assertIsNone(redirect(target, None, 302, "", {}, cdn))
+
+        for payload in (script + b" ", b"", b"x" * (package.SCRIPT_LIMIT + 1)):
+            with self.subTest(size=len(payload)), self.assertRaisesRegex(SystemExit, "SHA-256"):
+                run(payload)
+        with self.assertRaises(HTTPError):
+            run(HTTPError(url, 404, "Missing", {}, None))
+        self.assertNotIn("installer fixture executed", output.getvalue())
+        run(script)
+        self.assertIn("installer fixture executed", output.getvalue())

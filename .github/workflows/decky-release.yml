@@ -41,6 +41,7 @@ jobs:
           git merge-base --is-ancestor HEAD origin/main
           gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq '.id' > "$RUNNER_TEMP/desktop-release"
           printf 'ZIP=AppDepot-Decky-%s-x86_64.zip\n' "${RELEASE_TAG#decky-}" >> "$GITHUB_ENV"
+          printf 'SCRIPT=AppDepot-Decky-Installer-%s.py\n' "${RELEASE_TAG#decky-}" >> "$GITHUB_ENV"
       - name: Install pinned toolchains
         run: |
           set -euo pipefail
@@ -76,12 +77,15 @@ jobs:
             /usr/bin/python3 -B decky/package.py --binary target/release/app-depot --out "$output" --github-release-tag "$RELEASE_TAG"
             (cd "$output" && sha256sum -c SHA256SUMS)
           done
-          for file in "$ZIP" SHA256SUMS AppDepot-Decky-Installer.desktop; do
+          for file in "$ZIP" "$SCRIPT" SHA256SUMS AppDepot-Decky-Installer.desktop; do
             cmp "release-decky/$file" "$RUNNER_TEMP/rebuild/$file"
           done
           desktop-file-validate release-decky/AppDepot-Decky-Installer.desktop
-          grep -Fx "# Package: https://github.com/$GITHUB_REPOSITORY/releases/download/$RELEASE_TAG/$ZIP" release-decky/AppDepot-Decky-Installer.desktop
-          grep -Fx "# SHA-256: $(cut -d ' ' -f1 release-decky/SHA256SUMS)" release-decky/AppDepot-Decky-Installer.desktop
+          script_url="https://github.com/$GITHUB_REPOSITORY/releases/download/$RELEASE_TAG/$SCRIPT"
+          script_hash="$(sha256sum "release-decky/$SCRIPT" | cut -d ' ' -f1)"
+          package_hash="$(sha256sum "release-decky/$ZIP" | cut -d ' ' -f1)"
+          grep '^Exec=' release-decky/AppDepot-Decky-Installer.desktop | grep -F " $script_url $script_hash"
+          grep -Fx "desktop(installer_source, 'https://github.com/$GITHUB_REPOSITORY/releases/download/$RELEASE_TAG/$ZIP', '$package_hash', '${RELEASE_TAG#decky-v}', False)" "release-decky/$SCRIPT"
       - name: Create or verify draft and publish as prerelease
         run: |
           set -euo pipefail
@@ -95,7 +99,7 @@ jobs:
               --notes-file "docs/release-notes/$RELEASE_TAG.md"
           fi
           mkdir -p "$RUNNER_TEMP/draft-assets"
-          for file in "$ZIP" SHA256SUMS AppDepot-Decky-Installer.desktop; do
+          for file in "$ZIP" "$SCRIPT" SHA256SUMS AppDepot-Decky-Installer.desktop; do
             if gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name' | grep -Fx "$file"; then
               gh release download "$RELEASE_TAG" --pattern "$file" --dir "$RUNNER_TEMP/draft-assets"
               cmp "release-decky/$file" "$RUNNER_TEMP/draft-assets/$file"
@@ -105,13 +109,13 @@ jobs:
               cmp "release-decky/$file" "$RUNNER_TEMP/draft-assets/$file"
             fi
           done
-          test "$(gh release view "$RELEASE_TAG" --json assets --jq '.assets | length')" = 3
+          test "$(gh release view "$RELEASE_TAG" --json assets --jq '.assets | length')" = 4
           gh release edit "$RELEASE_TAG" --draft=false --prerelease --latest=false
       - name: Verify public delivery and unchanged Desktop release
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/public-assets"
-          for file in "$ZIP" SHA256SUMS AppDepot-Decky-Installer.desktop; do
+          for file in "$ZIP" "$SCRIPT" SHA256SUMS AppDepot-Decky-Installer.desktop; do
             curl --proto '=https' --proto-redir '=https' --fail --silent --show-error --location \
               --retry 4 --retry-all-errors --output "$RUNNER_TEMP/public-assets/$file" \
               "https://github.com/$GITHUB_REPOSITORY/releases/download/$RELEASE_TAG/$file"

@@ -1,4 +1,4 @@
-"""Bootstrap for the generated AppDepot-Decky-Installer.desktop file."""
+"""Installer implementation for the versioned App Depot Decky release script."""
 
 import ctypes
 import fcntl
@@ -360,9 +360,7 @@ def desktop(source, url, checksum, version, development):
         if root.stat().st_uid == os.geteuid():
             install(root, payload, checksum, version, lambda: activate(systemctl))
         else:
-            elevated = "exec(" + repr(source) + ");desktop(" + ",".join(map(repr, (
-                source, url, checksum, version, development,
-            ))) + ")"
+            elevated = "installer_source=" + repr(source) + ";exec(installer_source)"
             subprocess.run(
                 ["/usr/bin/sudo", "/usr/bin/python3", "-I", "-c", elevated,
                  "--activate", pwd.getpwuid(os.getuid()).pw_name],
