@@ -82,7 +82,8 @@ class ShortcutTests(unittest.IsolatedAsyncioTestCase):
         await self.plugin.acknowledge(ACCOUNT, PROFILE, APP, ID)
         self.assertEqual(await self.plugin.shortcut(ACCOUNT, PROFILE, APP, "Same"),
                          {"action": "inspect", "appid": ID})
-        live = dict(appid=ID, appname="Same", exe=plan["target"], launchoptions=plan["options"])
+        live = dict(appid=ID, appname="Same", exe=f'"{plan["target"]}"',
+                    startdir=f'"{Path(plan["target"]).parent}"', launchoptions=plan["options"])
         self.assertEqual(await self.plugin.shortcut(ACCOUNT, PROFILE, APP, "Same", live),
                          {"action": "keep", "appid": ID})
         self.assertEqual((await self.plugin.shortcut(ACCOUNT, PROFILE, APP, "Rename", live))["action"], "rename")
@@ -93,6 +94,39 @@ class ShortcutTests(unittest.IsolatedAsyncioTestCase):
         other = await self.plugin.shortcut(ACCOUNT, OTHER, APP, "Same")
         self.assertEqual(other["action"], "create")
         self.assertNotEqual(other["target"], plan["target"])
+
+    async def test_repair_beta2_disk_fingerprint_and_resume_without_recreating(self):
+        plan = await self.plugin.shortcut(ACCOUNT, PROFILE, APP, "Fixture App")
+        await self.plugin.acknowledge(ACCOUNT, PROFILE, APP, ID)
+        ledger = self.plugin._load()
+        binding = next(iter(ledger.values()))
+        del binding["initializing"]
+        self.plugin._save(ledger)
+        target = plan["target"]
+        cwd = str(Path(target).parent)
+        damaged = {"appid": ID, "appname": 'play"', "exe": f'""{target}""',
+                   "startdir": f'"{cwd}/', "launchoptions": ""}
+        with self.assertRaisesRegex(RuntimeError, "ownership"):
+            await self.plugin.shortcut(ACCOUNT, PROFILE, APP, "Fixture App", damaged)
+        disk = dict(damaged, appid=ID - (1 << 32))
+        self.write(self.foreign, disk)
+        before = self.path.read_bytes()
+        planned = await self.plugin.shortcut(ACCOUNT, PROFILE, APP, "Fixture App", damaged)
+        self.assertEqual(planned["action"], "setup")
+        self.assertEqual(planned["appid"], ID)
+        self.assertEqual(planned["fields"], {"appname": "Fixture App", "exe": f'"{target}"',
+                                             "startdir": f'"{cwd}"', "launchoptions": plan["options"]})
+        partial = {**damaged, "exe": f'"{target}"'}
+        resumed = await self.plugin.shortcut(ACCOUNT, PROFILE, APP, "Fixture App", partial)
+        self.assertNotIn("exe", resumed["fields"])
+        with self.assertRaisesRegex(RuntimeError, "changed during repair"):
+            await self.plugin.shortcut(ACCOUNT, PROFILE, APP, "Fixture App",
+                                       {**partial, "appname": "My custom name"})
+        completed = {**damaged, **planned["fields"]}
+        self.assertEqual(await self.plugin.shortcut(ACCOUNT, PROFILE, APP, "Fixture App", completed),
+                         {"action": "keep", "appid": ID})
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertEqual(await self.plugin.binding(ACCOUNT, PROFILE, APP), ID)
 
     async def test_collision_and_missing_marker(self):
         plan = await self.plugin.shortcut(ACCOUNT, PROFILE, APP, "Same")

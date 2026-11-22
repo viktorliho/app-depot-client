@@ -296,6 +296,48 @@ class Plugin:
             raise RuntimeError("Shortcut ownership could not be verified. Existing Steam entry preserved.")
         return actual
 
+    def _setup_shortcut(self, account, profile, app, binding, row):
+        """Return an in-place repair only for acknowledged, unconfirmed entries."""
+        appid = binding.get("appid")
+        if binding.get("confirmed") or not appid or row.get("appid") != appid:
+            return None
+        alias = self.data / "launchers" / profile / app / "play"
+        if (binding["target"] != str(alias) or not alias.is_symlink()
+                or alias.readlink() != self.plugin / "bin/app-depot"):
+            return None
+        expected = {
+            "exe": f'"{alias}"', "startdir": f'"{alias.parent}"',
+            "launchoptions": binding["options"], "appname": binding["name"],
+        }
+        before = binding.get("repair")
+        values = {field: row.get(field) for field in expected}
+        if before is None:
+            auto_start = f'"{alias.parent}/'
+            legacy = dict(exe=f'""{alias}""', startdir=auto_start, launchoptions="", appname='play"')
+            if values == legacy:
+                snapshots = read_shortcuts(self._config(account) / "shortcuts.vdf")
+                snapshot = next((record for record in snapshots if record["appid"] == appid), {})
+                if any(snapshot.get(field) != value for field, value in legacy.items()):
+                    return None
+            elif not (
+                binding.get("initializing") and values["exe"] in (str(alias), expected["exe"])
+                and values["launchoptions"] in ("", expected["launchoptions"])
+                and values["appname"] in ("play", expected["appname"])
+                and values["startdir"] in (auto_start, auto_start + '"', str(alias.parent) + "/", str(alias.parent), expected["startdir"])
+            ):
+                return None
+            before = values
+        if any(values[field] not in (before[field], desired) for field, desired in expected.items()):
+            raise RuntimeError("Steam shortcut settings changed during repair")
+        if values == expected:
+            binding.pop("repair", None)
+            binding.pop("initializing", None)
+            return {"action": "keep", "appid": appid}
+        binding["repair"] = before
+        return {"action": "setup", "appid": appid, "fields": {
+            field: value for field, value in expected.items() if values[field] != value
+        }}
+
     async def shortcut(self, account, profile, app, name, observation=None):
         if not isinstance(name, str) or not name.strip() or len(name) > 512 or "\0" in name:
             raise ValueError("Invalid shortcut display name")
@@ -304,6 +346,15 @@ class Plugin:
             if binding is not None:
                 if observation is None and binding.get("appid") is not None:
                     return {"action": "inspect", "appid": binding["appid"]}
+                if observation is not None:
+                    setup = self._setup_shortcut(account, profile, app, binding, observation)
+                    if setup is not None:
+                        if setup["action"] == "keep":
+                            binding["confirmed"] = True
+                        self._save(ledger)
+                        return setup
+                    if binding.get("repair") or binding.get("initializing"):
+                        raise RuntimeError("Steam shortcut ownership or initial metadata could not be verified")
                 actual = self._owned(account, binding, observation)
                 if actual is None:
                     return {"action": "pending"}
@@ -336,7 +387,7 @@ class Plugin:
             if any(character in target for character in ('"', "\n", "\r", "%", "$", "`", "\\")):
                 raise RuntimeError("Unsupported launcher path")
             binding = {"name": name, "target": target, "options": f"decky play {profile} {app}",
-                       "artwork": {}}
+                       "artwork": {}, "initializing": True}
             if self._owned(account, binding) is not None:
                 raise RuntimeError("Existing shortcut marker without a saved binding")
             ledger[key] = binding

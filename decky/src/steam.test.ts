@@ -39,11 +39,11 @@ test('create acknowledges the actual ID, rechecks, renames and leaves foreign en
       return number++ | 0;
     },
     RegisterForAppDetails(id: number, callback: (details: {
-      unAppID: number; strDisplayName: string; strShortcutExe: string; strShortcutLaunchOptions: string;
+      unAppID: number; strDisplayName: string; strShortcutExe: string; strShortcutLaunchOptions: string; strShortcutStartDir: string;
     }) => void) {
       const entry = [...bound.values()].find(value => value.id === id);
       assert.ok(entry);
-      callback({ unAppID: id, strDisplayName: entry.name, strShortcutExe: 'fixture', strShortcutLaunchOptions: 'fixture' });
+      callback({ unAppID: id, strDisplayName: entry.name, strShortcutExe: 'fixture', strShortcutLaunchOptions: 'fixture', strShortcutStartDir: 'fixture' });
       return { unregister() {} };
     },
     async SetShortcutName(id: number, name: string) {
@@ -80,4 +80,66 @@ test('pending readback and account changes never trigger a second creation', asy
   const changed = await reconcile(bridge, steam, () => String(account++), 'profile', [app('b', 'Other')], wait);
   assert.match(changed[0], /account changed/);
   assert.equal(added, 0);
+});
+
+test('sets fields explicitly after Steam derives the name from the executable', async () => {
+  const id = 0x80000042;
+  const target = '/fixture/launchers/profile/app/play';
+  const cwd = '/fixture/launchers/profile/app';
+  const options = 'decky play profile app';
+  let created = 0;
+  let acknowledged = false;
+  let initialized = false;
+  let applied = 0;
+  const live = {
+    unAppID: id, strDisplayName: 'play', strShortcutExe: `"${target}"`,
+    strShortcutStartDir: `${cwd}/`, strShortcutLaunchOptions: '',
+  };
+  const bridge: Bridge = {
+    async shortcut(_account, _profile, _app, _name, observation) {
+      if (!acknowledged) return { action: 'create', target, options };
+      if (!observation) return { action: 'inspect', appid: id };
+      assert.equal(observation.appid, id);
+      if (observation.launchoptions !== options) return {
+        action: 'setup', appid: id,
+        fields: { appname: 'Fixture App', startdir: `"${cwd}"`, launchoptions: options },
+      };
+      assert.deepEqual(observation, {
+        appid: id, appname: 'Fixture App', exe: `"${target}"`, startdir: `"${cwd}"`, launchoptions: options,
+      });
+      initialized = true;
+      return { action: 'keep', appid: id };
+    },
+    async acknowledge(_a, _p, _app, actual) {
+      assert.equal(actual, id);
+      acknowledged = true;
+    },
+    async binding() { return initialized ? id : null; },
+    async artwork(_a, _p, _app, role) {
+      assert.ok(initialized);
+      return role === 'steam.grid.vertical' ? { appid: id, png: 'fixture' } : null;
+    },
+  };
+  const steam = {
+    async AddShortcut(...args: string[]) {
+      assert.deepEqual(args, ['Fixture App', target, cwd, options]);
+      created++;
+      return id | 0;
+    },
+    RegisterForAppDetails(actual: number, callback: (details: typeof live) => void) {
+      assert.equal(actual, id);
+      callback({ ...live });
+      return { unregister() {} };
+    },
+    async SetShortcutName(actual: number, name: string) { assert.equal(actual, id); live.strDisplayName = name; },
+    async SetShortcutStartDir(actual: number, dir: string) { assert.equal(actual, id); live.strShortcutStartDir = dir; },
+    async SetShortcutLaunchOptions(actual: number, args: string) { assert.equal(actual, id); live.strShortcutLaunchOptions = args; },
+    async SetCustomArtworkForApp(...args: unknown[]) {
+      assert.deepEqual(args, [id, 'fixture', 'png', 0]);
+      applied++;
+    },
+  };
+  assert.deepEqual(await reconcile(bridge, steam, () => '123', 'profile', [app('app','Fixture App')], wait), []);
+  assert.equal(created, 1);
+  assert.equal(applied, 1);
 });

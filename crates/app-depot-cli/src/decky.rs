@@ -14,6 +14,56 @@ use std::{
     time::{Duration, Instant},
 };
 
+pub(super) fn launch_invocation() -> bool {
+    let args = env::args_os().collect::<Vec<_>>();
+    args.windows(2)
+        .any(|pair| pair[0] == "decky" && pair[1] == "play")
+        || (args.len() == 1 && PathBuf::from(&args[0]).ends_with("play"))
+}
+
+// A bounded diagnostic record. No command line, paths, Server details or child output.
+pub(super) fn record_launch(stage: &str, code: Option<u8>) {
+    use std::io::Write;
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    let Some(base) = env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")))
+    else {
+        return;
+    };
+    let directory = base.join("app-depot-decky");
+    let _ = (|| -> io::Result<()> {
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&directory)?;
+        if !fs::symlink_metadata(&directory)?.is_dir() {
+            return Ok(());
+        }
+        let temporary = directory.join(format!(".launch-{}.tmp", std::process::id()));
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary)?;
+        let result = (|| -> io::Result<()> {
+            serde_json::to_writer(
+                &mut file,
+                &json!({
+                    "stage":stage,"exitCode":code,"pid":std::process::id(),
+                }),
+            )?;
+            file.flush()?;
+            fs::rename(&temporary, directory.join("last-launch.json"))
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(temporary);
+        }
+        result
+    })();
+}
+
 fn profile_client(library: &Library, id: &ServerProfileId) -> Result<ApiClient, CliError> {
     let profile = library.profile(id)?;
     if profile.archived {

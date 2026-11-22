@@ -1314,8 +1314,20 @@ fn run() -> Result<(), CliError> {
 }
 
 fn main() -> ExitCode {
+    #[cfg(all(feature = "decky", target_os = "linux"))]
+    let trace_launch = decky::launch_invocation();
+    #[cfg(all(feature = "decky", target_os = "linux"))]
+    if trace_launch {
+        decky::record_launch("started", None);
+    }
     match run() {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(()) => {
+            #[cfg(all(feature = "decky", target_os = "linux"))]
+            if trace_launch {
+                decky::record_launch("exited", Some(0));
+            }
+            ExitCode::SUCCESS
+        }
         Err(error) => {
             #[cfg(all(feature = "decky", target_os = "linux"))]
             if env::var_os("APP_DEPOT_DECKY_RPC").is_some() {
@@ -1323,7 +1335,7 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
             eprintln!("{error}");
-            ExitCode::from(match &error {
+            let code = match &error {
                 CliError::Api(error) | CliError::Library(LibraryError::Api(error)) => {
                     api_exit(error)
                 }
@@ -1340,7 +1352,12 @@ fn main() -> ExitCode {
                         .and_then(|code| u8::try_from(code).ok())
                         .unwrap_or(1)
                 }
-            })
+            };
+            #[cfg(all(feature = "decky", target_os = "linux"))]
+            if trace_launch {
+                decky::record_launch("exited", Some(code));
+            }
+            ExitCode::from(code)
         }
     }
 }

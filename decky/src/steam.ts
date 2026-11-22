@@ -8,6 +8,7 @@ export type CatalogApp = {
 
 export type Plan =
   | { action: 'create'; target: string; options: string }
+  | { action: 'setup'; appid: number; fields: Partial<Record<SetupField, string>> }
   | { action: 'rename'; appid: number; name: string }
   | { action: 'keep'; appid: number }
   | { action: 'inspect'; appid: number }
@@ -15,12 +16,16 @@ export type Plan =
 
 export const roles = ['steam.grid.vertical', 'steam.grid.horizontal', 'steam.hero', 'logo', 'icon'] as const;
 type Role = typeof roles[number];
-export type Observation = { appid: number; appname: string; exe: string; launchoptions: string };
-type Details = { unAppID: number; strDisplayName: string; strShortcutExe: string; strShortcutLaunchOptions: string };
+type SetupField = 'exe' | 'startdir' | 'launchoptions' | 'appname';
+export type Observation = { appid: number; appname: string; exe: string; launchoptions: string; startdir: string };
+type Details = { unAppID: number; strDisplayName: string; strShortcutExe: string; strShortcutLaunchOptions: string; strShortcutStartDir: string };
 type Art = { appid: number; png?: string; path?: string };
 type SteamMethods = {
   RegisterForAppDetails?(id: number, callback: (details: Details) => void): { unregister(): void };
   AddShortcut?(name: string, target: string, cwd: string, options: string): Promise<number>;
+  SetShortcutExe?(id: number, exe: string): Promise<unknown>;
+  SetShortcutStartDir?(id: number, cwd: string): Promise<unknown>;
+  SetShortcutLaunchOptions?(id: number, options: string): Promise<unknown>;
   SetShortcutName?(id: number, name: string): Promise<unknown>;
   SetCustomArtworkForApp?(id: number, png: string, format: string, role: number): Promise<unknown>;
   SetShortcutIcon?(id: number, path: string): Promise<unknown>;
@@ -56,7 +61,7 @@ function details(steam: SteamMethods, appid: number): Promise<Observation> {
         clearTimeout(timer);
         queueMicrotask(() => request?.unregister());
         resolve({
-          appid, appname: value.strDisplayName, exe: value.strShortcutExe, launchoptions: value.strShortcutLaunchOptions,
+          appid, appname: value.strDisplayName, exe: value.strShortcutExe, launchoptions: value.strShortcutLaunchOptions, startdir: value.strShortcutStartDir,
         });
       });
     } catch (error) {
@@ -87,7 +92,7 @@ export async function reconcile(
       if (step.action === 'create') {
         guard();
         const id = await steam.AddShortcut(
-          row.name, `"${step.target}"`, `"${step.target.substring(0, step.target.lastIndexOf('/'))}"`, step.options,
+          row.name, step.target, step.target.substring(0, step.target.lastIndexOf('/')), step.options,
         );
         if (!Number.isInteger(id) || !((id >>> 0) & 0x80000000)) throw new Error('Steam returned an invalid shortcut ID');
         await bridge.acknowledge(account, profile, row.id, id >>> 0);
@@ -98,6 +103,28 @@ export async function reconcile(
         const observed = await details(steam, step.appid);
         guard();
         step = await plan(observed);
+      }
+      if (step.action === 'setup') {
+        const setters = {
+          exe: steam.SetShortcutExe, startdir: steam.SetShortcutStartDir,
+          appname: steam.SetShortcutName, launchoptions: steam.SetShortcutLaunchOptions,
+        };
+        const fields = ['exe', 'startdir', 'appname', 'launchoptions'] as const;
+        const id = step.appid;
+        if (fields.some(field => step.action === 'setup' && step.fields[field] !== undefined && !setters[field])) {
+          throw new Error('Steam shortcut setup methods are unavailable');
+        }
+        for (const field of fields) {
+          const value = step.fields[field];
+          if (value === undefined) continue;
+          guard();
+          const result = await setters[field]?.call(steam, id, value);
+          if (result === false) throw new Error(`Steam rejected shortcut field ${field}`);
+        }
+        await wait();
+        guard();
+        step = await plan(await details(steam, id));
+        if (step.action !== 'keep' || step.appid !== id) throw new Error('Steam shortcut setup awaits readback');
       }
       if (step.action === 'pending') throw new Error('Shortcut creation is awaiting Steam readback. Refresh after Steam saves its library.');
       if (step.action === 'rename') {

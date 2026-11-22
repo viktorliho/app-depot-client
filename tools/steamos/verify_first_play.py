@@ -222,11 +222,15 @@ def verify_decky(args, root, origin, token, app, server, opener, server_origin):
             await backend._unload()
 
     profile = asyncio.run(configure_backend())
-    env = dict(os.environ, HOME=str(plugin_home))
+    state = root / "launcher-state"
+    env = dict(os.environ, HOME=str(plugin_home), XDG_STATE_HOME=str(state))
     env.pop("APP_DEPOT_TOKEN", None)
     command = [args.client, "decky", "play", profile, app]
     play = subprocess.run(command, check=True, timeout=45, env=env, capture_output=True, text=True)
     assert "m30 fixture executed" in play.stdout
+    trace = json.loads((state / "app-depot-decky/last-launch.json").read_text())
+    assert set(trace) == {"pid", "exitCode", "stage"}
+    assert trace["stage"] == "exited" and trace["exitCode"] == 0
 
     async def check_after_reload():
         backend = module.Plugin()
@@ -271,7 +275,8 @@ def verify_decky(args, root, origin, token, app, server, opener, server_origin):
             await guest._unload()
 
     guest_profile = asyncio.run(configure_guest())
-    guest_env = dict(os.environ, HOME=str(guest_home), APP_DEPOT_TOKEN="invalid-fixture-token")
+    guest_env = dict(os.environ, HOME=str(guest_home), XDG_STATE_HOME=str(root / "guest-state"),
+                     APP_DEPOT_TOKEN="invalid-fixture-token")
     guest_command = [args.client, "decky", "play", guest_profile, app]
     first = subprocess.run(guest_command, check=True, timeout=45, env=guest_env, capture_output=True, text=True)
     assert "m30 fixture executed" in first.stdout
