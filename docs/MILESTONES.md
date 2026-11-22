@@ -81,3 +81,8 @@ Decky Installed provides a confirmed, fully local complete uninstall by App and 
 ## M3.4 — Signed update verification and activation fixture
 
 Gaming Mode reports progress while downloading and verifying official packages. A Debian-only fixture exercises the signed manifest, protected paths, kernel peer authentication, exclusive activation and recovery. SteamOS activation and enrollment are gated on a protected Loader executable and plugin path, generation-specific Loader health and an authorized production signing identity. The fixture is not deployed. [SteamOS activation gate](STEAMOS_DECKY.md#m34-steamos-activation-gate)
+
+
+## M3.4.1 — Decky-managed activation feasibility
+
+Investigated installed NonSteamLaunchers and pinned Loader stable and prerelease methods. App Depot retains Gaming Mode download verification and the Desktop installer. The next native activation prototype depends on a protected Loader layout and package verification before replacement. M3.4's separate helper is retained as research. [Decision and test evidence](STEAMOS_DECKY.md#m341-decky-managed-update-feasibility)
