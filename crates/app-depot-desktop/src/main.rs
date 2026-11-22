@@ -387,6 +387,7 @@ impl Desktop {
                         self.local_operations.remove(&id);
                     }
                 }
+                #[cfg(not(windows))]
                 Event::Integrity(report) => {
                     self.integrity_reports
                         .insert(report.installation_id.clone(), report);

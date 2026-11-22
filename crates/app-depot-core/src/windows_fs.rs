@@ -2,7 +2,7 @@
 use std::{
     ffi::OsStr,
     fs::{File, OpenOptions},
-    io::{self, Read, Seek, SeekFrom},
+    io::{self, Read, Seek, SeekFrom, Write},
     mem::{offset_of, size_of},
     os::windows::{
         fs::{MetadataExt, OpenOptionsExt},
@@ -16,10 +16,11 @@ use windows_sys::{
         Foundation::OBJECT_ATTRIBUTES,
         Storage::FileSystem::{
             FILE_CREATE, FILE_DIRECTORY_FILE, FILE_DISPOSITION_DELETE,
-            FILE_DISPOSITION_INFORMATION_EX, FILE_DISPOSITION_POSIX_SEMANTICS,
-            FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_REPARSE_POINT, FILE_RENAME_INFORMATION,
-            FILE_SYNCHRONOUS_IO_NONALERT, FileDispositionInformationEx, FileRenameInformation,
-            NtCreateFile, NtSetInformationFile,
+            FILE_DISPOSITION_IGNORE_READONLY_ATTRIBUTE, FILE_DISPOSITION_INFORMATION_EX,
+            FILE_DISPOSITION_POSIX_SEMANTICS, FILE_NON_DIRECTORY_FILE, FILE_OPEN,
+            FILE_OPEN_REPARSE_POINT, FILE_RENAME_INFORMATION, FILE_SYNCHRONOUS_IO_NONALERT,
+            FileDispositionInformationEx, FileRenameInformation, NtCreateFile,
+            NtSetInformationFile,
         },
     },
     Win32::{
@@ -376,6 +377,17 @@ pub(crate) fn publish_verified_copy(
     let name = name_utf16(name)?;
     let chain = directory_chain(parent, false)?;
     let target = chain.last().unwrap();
+    publish_copy_at(from, target, &name, expected_size, true, verify)
+}
+
+fn publish_copy_at(
+    from: &Path,
+    target: &File,
+    name: &[u16],
+    expected_size: u64,
+    readonly: bool,
+    verify: impl FnOnce(&File) -> io::Result<()>,
+) -> io::Result<()> {
     require_case_insensitive(target)?;
     let source = open_regular(from, false, false, FILE_SHARE_READ)?;
     if volume(&source)? != volume(target)? {
@@ -405,13 +417,104 @@ pub(crate) fn publish_verified_copy(
         }
         temporary.seek(SeekFrom::Start(0))?;
         verify(&temporary)?;
+        if readonly {
+            let mut permissions = temporary.metadata()?.permissions();
+            permissions.set_readonly(true);
+            temporary.set_permissions(permissions)?;
+        }
         temporary.sync_all()?;
-        rename_noreplace(&temporary, target, &name)
+        rename_noreplace(&temporary, target, name)
     })();
     if result.is_err() {
         delete_open_file(temporary)?;
     }
     result
+}
+
+/// Publish an installation containing a single independent payload and its ownership marker.
+pub(crate) fn publish_file_install(
+    from: &Path,
+    to: &Path,
+    id: &str,
+    size: u64,
+    verify: impl FnOnce(&File) -> io::Result<()>,
+) -> io::Result<()> {
+    if to.file_name() != Some(OsStr::new(id)) {
+        return Err(invalid("invalid installation identity"));
+    }
+    let chain = directory_chain(
+        to.parent()
+            .ok_or_else(|| invalid("installation has no parent"))?,
+        false,
+    )?;
+    let parent = chain.last().unwrap();
+    require_case_insensitive(parent)?;
+    let temporary_name = format!(".app-depot-install-{}", uuid::Uuid::new_v4());
+    let stage = directory_child(
+        parent,
+        OsStr::new(&temporary_name),
+        true,
+        DIRECTORY_ACCESS | DELETE | GENERIC_WRITE,
+    )?;
+    publish_copy_at(
+        from,
+        &stage,
+        &name_utf16(OsStr::new("payload"))?,
+        size,
+        false,
+        verify,
+    )?;
+    let mut marker = open_child(
+        &stage,
+        OsStr::new(".app-depot-installation-id"),
+        GENERIC_WRITE | SYNCHRONIZE,
+        FILE_CREATE,
+        FILE_NON_DIRECTORY_FILE,
+        0,
+    )?;
+    marker.write_all(id.as_bytes())?;
+    marker.sync_all()?;
+    drop(marker);
+    stage.sync_all()?;
+    rename_noreplace(&stage, parent, &name_utf16(OsStr::new(id))?)?;
+    sync_directory(to.parent().unwrap())
+}
+
+pub(crate) fn inspect_installed_payload(to: &Path, id: &str) -> io::Result<File> {
+    let chain = directory_chain(to, false)?;
+    let directory = chain.last().unwrap();
+    let open = |name| {
+        let file = open_child(
+            directory,
+            OsStr::new(name),
+            GENERIC_READ | SYNCHRONIZE,
+            FILE_OPEN,
+            FILE_OPEN_REPARSE_POINT,
+            FILE_SHARE_READ,
+        )?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(invalid("unsafe file in installation"));
+        }
+        Ok(file)
+    };
+    let mut marker = String::new();
+    let present = |name| {
+        open(name).map_err(|error| {
+            if error.kind() == io::ErrorKind::NotFound {
+                invalid("existing installation lacks marker or payload")
+            } else {
+                error
+            }
+        })
+    };
+    present(".app-depot-installation-id")?
+        .take(37)
+        .read_to_string(&mut marker)?;
+    if marker != id {
+        return Err(invalid("installation ownership marker mismatch"));
+    }
+    present("payload")
 }
 
 fn volume(file: &File) -> io::Result<u64> {
@@ -434,7 +537,9 @@ fn volume(file: &File) -> io::Result<u64> {
 fn delete_open_file(file: File) -> io::Result<()> {
     let mut status_block = IO_STATUS_BLOCK::default();
     let info = FILE_DISPOSITION_INFORMATION_EX {
-        Flags: FILE_DISPOSITION_DELETE | FILE_DISPOSITION_POSIX_SEMANTICS,
+        Flags: FILE_DISPOSITION_DELETE
+            | FILE_DISPOSITION_POSIX_SEMANTICS
+            | FILE_DISPOSITION_IGNORE_READONLY_ATTRIBUTE,
     };
     // SAFETY: the exclusive creation handle grants DELETE on this exact file. This call
     // keeps the handle and disposition buffer valid until synchronous completion.

@@ -646,7 +646,7 @@ impl Desktop {
                         ui.add_space(28.0);
                         ui.separator();
                         ui.add_space(12.0);
-                        let summary = if worker::WINDOWS_CATALOG_ONLY {
+                        let summary = if worker::WINDOWS_FILE_ONLY {
                             "Connect a server   ·   Browse its catalog"
                         } else {
                             "Connect a server   ·   Browse its catalog   ·   Download verified artifacts"
@@ -913,9 +913,7 @@ impl Desktop {
             || self.snapshot.trees.iter().any(|t| t.association_id == id)
     }
     fn association_state(&self, id: &str) -> &'static str {
-        if worker::WINDOWS_CATALOG_ONLY {
-            "Downloads unavailable on Windows"
-        } else if self.is_verified(id) {
+        if self.is_verified(id) {
             "Downloaded and verified"
         } else if self.snapshot.jobs.iter().any(|j| {
             j.association_id == id
@@ -1102,6 +1100,7 @@ impl Desktop {
                         } else if let Some(release)=view.releases.first().filter(|_|view.releases.len()==1)
                             && let Some(item)=release.associations.first().filter(|_|release.associations.len()==1)
                             && let Some(artifact)=&item.artifact
+                            && (!worker::WINDOWS_FILE_ONLY || artifact.kind=="File")
                             && !view.stale
                             && self.association_state(&item.association.id)=="Available to download"
                             && self.profile().is_some_and(|p|!p.archived)
@@ -1112,13 +1111,13 @@ impl Desktop {
                                     self.screen=Screen::Downloads;
                                 }
                         } else {
-                            let message=if worker::WINDOWS_CATALOG_ONLY {worker::WINDOWS_CATALOG_NOTICE}
+                            let message=if worker::WINDOWS_FILE_ONLY {worker::WINDOWS_FILE_NOTICE}
                                 else if view.stale {"Saved for offline browsing"}
                                 else if view.releases.iter().flat_map(|r|&r.associations).any(|a|self.is_verified(&a.association.id)) {"Available in My library"}
                                 else {"Choose a release and artifact below"};
                             ui.label(RichText::new(message).color(palette.muted));
                         }
-                        if view.releases.iter().flat_map(|r|&r.associations).any(|a|self.is_verified(&a.association.id)) {
+                        if !worker::WINDOWS_FILE_ONLY && view.releases.iter().flat_map(|r|&r.associations).any(|a|self.is_verified(&a.association.id)) {
                             ui.add_space(8.0);
                             ui.menu_button("Manage local content", |ui| {
                                 if ui.button("Open My library").clicked() {
@@ -1185,14 +1184,19 @@ impl Desktop {
                                         ui.label(RichText::new(format!("{kind} · {size}")).size(14.0).color(palette.muted));
                                         if let Some(purpose)=convention.as_ref().and_then(|c|c.purpose.as_deref()) { ui.label(RichText::new(purpose).small().weak()); }
                                         if let Some(description)=convention.as_ref().and_then(|c|c.description.as_deref()) { ui.label(RichText::new(description).small().weak()); }
-                                        ui.label(RichText::new(self.association_state(&item.association.id)).size(14.0).color(if self.is_verified(&item.association.id){palette.good}else{palette.muted}));
+                                        let state=if worker::WINDOWS_FILE_ONLY && kind!="File" {"Unavailable on Windows"} else {self.association_state(&item.association.id)};
+                                        ui.label(RichText::new(state).size(14.0).color(if self.is_verified(&item.association.id){palette.good}else{palette.muted}));
                                     });
-                                    let enabled=!view.stale && item.artifact.as_ref().is_some_and(|a|matches!(a.kind.as_str(),"File"|"Tree")) && self.profile().is_some_and(|p|!p.archived) && self.association_state(&item.association.id)=="Available to download";
+                                    let enabled=!view.stale && (!worker::WINDOWS_FILE_ONLY || kind=="File") && item.artifact.as_ref().is_some_and(|a|matches!(a.kind.as_str(),"File"|"Tree")) && self.profile().is_some_and(|p|!p.archived) && self.association_state(&item.association.id)=="Available to download";
                                     let action=if enabled {design::primary("Download",palette)} else {egui::Button::new(if self.is_verified(&item.association.id){"Saved locally"}else{"Unavailable"})};
                                     if ui.add_enabled(enabled,action).clicked() && let (Some(profile),Some(artifact))=(self.active.clone(),&item.artifact) {
                                         self.send(Command::Download {profile,release:release.release.id.clone(),association:item.association.id.clone(),kind:artifact.kind.clone()}); self.screen=Screen::Downloads;
                                     }
                                 });
+                                #[cfg(windows)]
+                                if kind == "File" {
+                                    self.windows_file_actions(ui, &item.association.id, &item.association.artifact_id);
+                                }
                                 self.play_controls(ui,&item.association.id);
                                 egui::CollapsingHeader::new("Technical details").id_salt(&item.association.id).show(ui,|ui| {
                                     copy_line(ui,"Association ID",&item.association.id);
@@ -1211,14 +1215,51 @@ impl Desktop {
             }
         });
     }
+    #[cfg(windows)]
+    fn windows_file_actions(&self, ui: &mut egui::Ui, association: &str, artifact: &str) {
+        if let Some(item) = self.snapshot.installations.iter().find(|item| {
+            self.active.as_ref() == Some(&item.profile_id)
+                && item.association_id == association
+                && item.artifact_id == artifact
+                && item.state == "Ready"
+        }) {
+            ui.horizontal(|ui| {
+                ui.label("Installed");
+                if ui
+                    .add_enabled(
+                        !self.local_operations.contains_key(&item.id),
+                        egui::Button::new("Verify"),
+                    )
+                    .clicked()
+                {
+                    self.send(Command::VerifyInstallation(item.id.clone()));
+                }
+            });
+        } else if let Some(job) = self.snapshot.jobs.iter().find(|job| {
+            self.active.as_ref() == Some(&job.profile_id)
+                && job.association_id == association
+                && job.artifact_id == artifact
+                && job.state == "Completed"
+        }) {
+            if let Some(phase) = self.local_operations.get(&job.id) {
+                ui.label(phase);
+            } else if ui.button("Install").clicked() {
+                self.send(Command::InstallFile(job.id.clone()));
+            }
+        }
+    }
+
     fn library(&mut self, ui: &mut egui::Ui) {
         self.header(
             ui,
             "My library",
             "Your applications and saved downloads. Available offline.",
         );
-        if worker::WINDOWS_CATALOG_ONLY {
-            ui.label(worker::WINDOWS_CATALOG_NOTICE);
+        if worker::WINDOWS_FILE_ONLY {
+            ui.label(worker::WINDOWS_FILE_NOTICE);
+            ui.label(
+                "Install or verify a downloaded File Artifact from its release details in Browse.",
+            );
             return;
         }
         if self.active.is_none() {
@@ -1805,15 +1846,12 @@ impl Desktop {
         self.header(
             ui,
             "Downloads",
-            if worker::WINDOWS_CATALOG_ONLY {
-                worker::WINDOWS_CATALOG_NOTICE
+            if worker::WINDOWS_FILE_ONLY {
+                worker::WINDOWS_FILE_NOTICE
             } else {
                 "One active transfer. New requests move to the front of the queue."
             },
         );
-        if worker::WINDOWS_CATALOG_ONLY {
-            return;
-        }
         let mut jobs = self.snapshot.jobs.clone();
         jobs.sort_by_key(|job| (download_group(&job.state), job.queue_rank, job.created_at));
         if jobs.is_empty() {
@@ -1901,14 +1939,14 @@ impl Desktop {
                                 egui::CollapsingHeader::new(format!("{} · {release} · {kind} · {}{when}", truncate(&title, 48), format_bytes(stored)))
                                     .id_salt(("history", &job.id))
                                     .show(ui, |ui| {
-                                        if let Some(path)=&local_path && ui.button("Open folder").clicked(){self.send(Command::Reveal(path.clone()));}
+                                        if !worker::WINDOWS_FILE_ONLY && let Some(path)=&local_path && ui.button("Open folder").clicked(){self.send(Command::Reveal(path.clone()));}
                                         copy_line(ui, "Job ID", &job.id);
                                         copy_line(ui, "Artifact ID", &job.artifact_id);
                                         copy_line(ui, "Association ID", &job.association_id);
                                     });
                             });
                         row.response.container_context_menu(|ui| {
-                            if let Some(path)=&local_path && ui.button("Open folder").clicked(){self.send(Command::Reveal(path.clone()));ui.close();}
+                            if !worker::WINDOWS_FILE_ONLY && let Some(path)=&local_path && ui.button("Open folder").clicked(){self.send(Command::Reveal(path.clone()));ui.close();}
                             ui.menu_button("Technical details",|ui|{
                                 copy_line(ui,"Job ID",&job.id);
                                 copy_line(ui,"Artifact ID",&job.artifact_id);
@@ -2088,7 +2126,7 @@ impl Desktop {
                     .clicked()
                 {
                     self.settings_tab = tab;
-                    if tab == SettingsTab::Storage && !worker::WINDOWS_CATALOG_ONLY {
+                    if tab == SettingsTab::Storage && !worker::WINDOWS_FILE_ONLY {
                         self.send(Command::StorageUsage);
                     }
                 }
@@ -2140,7 +2178,7 @@ impl Desktop {
             if self.settings_tab==SettingsTab::Storage {
             section(ui,"Storage",|ui| {
                 ui.label(RichText::new("Your library").size(18.0).strong());
-                if worker::WINDOWS_CATALOG_ONLY {
+                if worker::WINDOWS_FILE_ONLY {
                     ui.label("Windows profiles and catalog data default to %LOCALAPPDATA%\\app-depot-client.");
                     ui.label(format!("Current location: {}", self.snapshot.library_data.display()));
                     ui.label("Storage management is unavailable in this Windows build.");

@@ -228,7 +228,7 @@ pub(crate) fn hash_file(path: &Path, expected_size: u64) -> Result<String, Libra
     hash_open_file(&open_regular(path, false)?, expected_size)
 }
 
-fn hash_open_file(mut file: &File, expected_size: u64) -> Result<String, LibraryError> {
+pub(crate) fn hash_open_file(mut file: &File, expected_size: u64) -> Result<String, LibraryError> {
     if file.metadata()?.len() != expected_size {
         return Err(invalid("verified file has wrong size"));
     }
@@ -402,8 +402,8 @@ impl Library {
 
     pub fn next_queued_job(&self) -> Result<Option<DownloadJob>, LibraryError> {
         let id: Option<String> = self.conn.query_row(
-            "SELECT j.id FROM download_jobs j JOIN profiles p ON p.id=j.profile_id WHERE j.state='Queued' AND p.archived=0 ORDER BY j.queue_rank DESC,j.created_at,j.id LIMIT 1",
-            [], |r| r.get(0),
+            "SELECT j.id FROM download_jobs j JOIN profiles p ON p.id=j.profile_id WHERE j.state='Queued' AND p.archived=0 AND (NOT ?1 OR j.artifact_id LIKE 'adfile:sha256:%') ORDER BY j.queue_rank DESC,j.created_at,j.id LIMIT 1",
+            [cfg!(windows)], |r| r.get(0),
         ).optional()?;
         id.map(|id| self.job(&id)).transpose()
     }
@@ -432,7 +432,7 @@ impl Library {
             }
             Err(error) => return Err(error),
         };
-        self.conn.execute("UPDATE download_jobs SET state='Queued',auto_resume=0 WHERE state='Paused' AND auto_resume=1",[])?;
+        self.conn.execute("UPDATE download_jobs SET state='Queued',auto_resume=0 WHERE state='Paused' AND auto_resume=1 AND (NOT ?1 OR artifact_id LIKE 'adfile:sha256:%')",[cfg!(windows)])?;
         Ok(())
     }
 
@@ -443,16 +443,31 @@ impl Library {
 
     pub(crate) fn lock_download_slot(&self) -> Result<File, LibraryError> {
         let path = self.paths.metadata.join(".app-depot-download.lock");
-        let mut options = OpenOptions::new();
-        options.read(true).write(true).create(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options
-                .mode(0o600)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
-        }
-        let file = options.open(path)?;
+        #[cfg(windows)]
+        let file = {
+            match create_content_file(&path) {
+                Ok(file) => file,
+                Err(LibraryError::Io(error))
+                    if error.kind() == std::io::ErrorKind::AlreadyExists =>
+                {
+                    open_regular(&path, true)?
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        #[cfg(not(windows))]
+        let file = {
+            let mut options = OpenOptions::new();
+            options.read(true).write(true).create(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options
+                    .mode(0o600)
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+            }
+            options.open(path)?
+        };
         if !file.metadata()?.is_file() {
             return Err(invalid("unsafe download slot lock"));
         }
@@ -484,7 +499,7 @@ impl Library {
             .map_err(|_| invalid("download job is active in another process"))?;
         Ok(file)
     }
-    fn stage(&self, id: &str) -> Result<PathBuf, LibraryError> {
+    pub(crate) fn stage(&self, id: &str) -> Result<PathBuf, LibraryError> {
         Uuid::parse_str(id).map_err(|_| invalid("invalid job ID"))?;
         Ok(self
             .paths
@@ -502,7 +517,7 @@ impl Library {
             .join(&hash[..2])
             .join(hash))
     }
-    fn materialized(&self, job: &DownloadJob) -> Result<PathBuf, LibraryError> {
+    pub(crate) fn materialized(&self, job: &DownloadJob) -> Result<PathBuf, LibraryError> {
         Uuid::parse_str(&job.profile_id.0).map_err(|_| invalid("invalid profile ID"))?;
         Uuid::parse_str(&job.association_id).map_err(|_| invalid("invalid association ID"))?;
         Ok(self
@@ -708,6 +723,8 @@ impl Library {
         let object = self.object(&job.artifact_id)?;
         let stage = self.stage(&job.id)?;
         private_dir(object.parent().unwrap())?;
+        #[cfg(all(test, windows))]
+        pause_file_commit_test(&stage, "before-cas");
         let created_object = if safe_regular(&object)? {
             if hash_file(&object, job.expected_size)? != digest(&job.artifact_id)? {
                 return Err(invalid("existing object conflicts with Artifact identity"));
@@ -717,6 +734,7 @@ impl Library {
             if hash_file(&stage, job.expected_size)? != digest(&job.artifact_id)? {
                 return Err(invalid("staging identity mismatch during commit"));
             }
+            #[cfg(not(windows))]
             open_regular(&stage, false)?.sync_all()?;
             match publish_content(
                 &stage,
@@ -743,10 +761,17 @@ impl Library {
         {
             return Err(invalid("promoted object identity mismatch"));
         }
-        let mut permissions = fs::metadata(&object)?.permissions();
-        permissions.set_readonly(true);
-        fs::set_permissions(&object, permissions)?;
-        open_regular(&object, false)?.sync_all()?;
+        #[cfg(windows)]
+        sync_dir(object.parent().unwrap())?;
+        #[cfg(all(test, windows))]
+        pause_file_commit_test(&stage, "after-cas");
+        #[cfg(not(windows))]
+        {
+            let mut permissions = fs::metadata(&object)?.permissions();
+            permissions.set_readonly(true);
+            fs::set_permissions(&object, permissions)?;
+            open_regular(&object, false)?.sync_all()?;
+        }
         let visible = self.materialized(job)?;
         let visible_parent = visible.parent().unwrap();
         private_dir(visible_parent.parent().unwrap())?;
@@ -786,6 +811,8 @@ impl Library {
         {
             return Err(invalid("materialized file identity mismatch"));
         }
+        #[cfg(windows)]
+        sync_dir(visible_parent)?;
         let relative = visible
             .strip_prefix(&self.paths.content)
             .map_err(|_| invalid("invalid materialization path"))?
@@ -793,6 +820,8 @@ impl Library {
             .into_owned();
         let tx = self.conn.transaction()?;
         tx.execute("INSERT OR IGNORE INTO verified_content(profile_id,artifact_id,local_ref,verified_at,association_id) VALUES (?1,?2,?3,?4,?5)",params![job.profile_id.0,job.artifact_id,relative,now()?,job.association_id])?;
+        #[cfg(all(test, windows))]
+        pause_file_commit_test(&stage, "after-registration");
         if tx.execute("UPDATE download_jobs SET state='Completed',progress=?2,last_error=NULL,updated_at=?3 WHERE id=?1 AND state='Committing'",params![job.id,job.expected_size as i64,now()?])?!=1 {return Err(invalid("job left Committing state"));}
         // On Windows a reopened name alone does not establish ownership of the staging file.
         if !cfg!(windows) && safe_regular(&stage)? {
@@ -800,6 +829,8 @@ impl Library {
             sync_dir(stage.parent().unwrap())?;
         }
         tx.commit()?;
+        #[cfg(all(test, windows))]
+        pause_file_commit_test(&stage, "after-completion");
         Ok(())
     }
     fn transfer_once(
@@ -839,6 +870,7 @@ impl Library {
                 files_done: 1,
                 files_total: 1,
             });
+            drop(file);
             return self.commit_file(&job);
         }
         observer(TransferObservation {
@@ -885,6 +917,7 @@ impl Library {
                 });
             },
         )?;
+        drop(file);
         if matches!(result, BlobOutcome::Stopped) {
             if self.job(id)?.state == "Downloading" {
                 self.state(id, "Paused", None)?;
@@ -932,9 +965,6 @@ impl Library {
         pause_after: Option<u64>,
         observer: &mut dyn FnMut(TransferObservation),
     ) -> Result<DownloadJob, LibraryError> {
-        if cfg!(windows) {
-            return Err(invalid("durable File transfers are unavailable on Windows"));
-        }
         let _slot = self.lock_download_slot()?;
         let mut network_bytes = 0;
         let _lock = self.lock_job(id)?;
@@ -1021,9 +1051,6 @@ impl Library {
         }
     }
     pub fn reconcile_file_jobs(&mut self) -> Result<(), LibraryError> {
-        if cfg!(windows) {
-            return Ok(());
-        }
         let ids:Vec<String>=self.conn.prepare("SELECT id FROM download_jobs WHERE artifact_id LIKE 'adfile:sha256:%' AND state IN ('Downloading','Verifying','Committing')")?.query_map([],|r|r.get(0))?.collect::<Result<_,_>>()?;
         for id in ids {
             let _lock = match self.lock_job(&id) {
@@ -1136,9 +1163,193 @@ impl Library {
     }
 }
 
+#[cfg(all(test, windows))]
+pub(crate) fn pause_file_commit_test(stage: &Path, boundary: &str) {
+    if std::env::var("APP_DEPOT_FILE_CRASH_BOUNDARY").as_deref() == Ok(boundary) {
+        create_content_file(&stage.with_file_name("file-test-ready")).unwrap();
+        loop {
+            thread::park();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_file_reconciles_after_process_exit_at_commit_boundaries() {
+        use crate::library::LibraryPaths;
+        const ROOT: &str = "APP_DEPOT_FILE_CRASH_ROOT";
+        const JOB: &str = "APP_DEPOT_FILE_CRASH_JOB";
+        const BYTES: &[u8] = b"File Artifact HTTP and SQLite recovery fixture";
+        let paths = |root: &Path| LibraryPaths {
+            metadata: root.join("data"),
+            content: root.join("content"),
+        };
+        if let Some(root) = std::env::var_os(ROOT) {
+            let mut lib = Library::open(paths(Path::new(&root))).unwrap();
+            let id = std::env::var(JOB).unwrap();
+            let job = lib.job(&id).unwrap();
+            let profile = lib.profile(&job.profile_id).unwrap();
+            let client = ApiClient::new(&profile.origin, None, false).unwrap();
+            lib.run_file_job(&client, &id, None).unwrap();
+            lib.install_windows_file(&id).unwrap();
+            panic!("worker did not reach selected commit boundary");
+        }
+
+        for boundary in [
+            "before-cas",
+            "after-cas",
+            "after-registration",
+            "after-completion",
+            "after-preparing",
+            "after-install-publication",
+            "after-activation",
+        ] {
+            let mut fixture = fixture(BYTES.to_vec(), "normal");
+            let job = queue(&mut fixture);
+            let unrelated = fixture.library.paths.content.join("unrelated");
+            fs::write(&unrelated, b"keep").unwrap();
+            let stage = fixture.library.stage(&job.id).unwrap();
+            let object = fixture.library.object(&job.artifact_id).unwrap();
+            let ready = stage.with_file_name("file-test-ready");
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "transfer::tests::windows_file_reconciles_after_process_exit_at_commit_boundaries"])
+                .env(ROOT, fixture._root.path())
+                .env(JOB, &job.id)
+                .env("APP_DEPOT_FILE_CRASH_BOUNDARY", boundary)
+                .stdout(std::process::Stdio::null())
+                .spawn().unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while !ready.exists() && std::time::Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(10));
+            }
+            let terminated = child.kill();
+            child.wait().unwrap();
+            assert!(ready.exists(), "{boundary}: worker did not pause");
+            terminated.unwrap();
+
+            let mut reopened = Library::open(paths(fixture._root.path())).unwrap();
+            let has_installation = matches!(
+                boundary,
+                "after-preparing" | "after-install-publication" | "after-activation"
+            );
+            let committed = boundary == "after-completion" || has_installation;
+            assert_eq!(
+                reopened.job(&job.id).unwrap().state,
+                if committed { "Completed" } else { "Committing" },
+                "{boundary}"
+            );
+            assert_eq!(
+                reopened
+                    .verified_files(Some(&fixture.profile))
+                    .unwrap()
+                    .len(),
+                usize::from(committed),
+                "{boundary}"
+            );
+            assert_eq!(object.exists(), boundary != "before-cas", "{boundary}");
+            let installed = reopened.installations(Some(&fixture.profile)).unwrap();
+            assert_eq!(installed.len(), usize::from(has_installation), "{boundary}");
+            if let Some(item) = installed.first() {
+                assert_eq!(item.path.exists(), boundary != "after-preparing");
+                assert_eq!(
+                    item.state,
+                    if boundary == "after-activation" {
+                        "Ready"
+                    } else {
+                        "Preparing"
+                    }
+                );
+                if boundary == "after-preparing" {
+                    fs::create_dir(&item.path).unwrap();
+                    fs::write(item.path.join("unrelated"), b"preserve").unwrap();
+                    reopened.reconcile_windows_file_installations().unwrap();
+                    assert!(reopened.install_windows_file(&job.id).is_err());
+                    assert_eq!(reopened.installation(&item.id).unwrap().state, "Preparing");
+                    assert_eq!(fs::read(item.path.join("unrelated")).unwrap(), b"preserve");
+                    fs::rename(&item.path, item.path.with_file_name("preserved")).unwrap();
+                }
+            }
+            for _ in 0..2 {
+                reopened.reconcile_file_jobs().unwrap();
+                assert_eq!(reopened.job(&job.id).unwrap().state, "Completed");
+                let files = reopened.verified_files(Some(&fixture.profile)).unwrap();
+                assert_eq!(files.len(), 1);
+                assert_eq!(fs::read(&files[0].path).unwrap(), BYTES);
+                assert_eq!(
+                    hash_file(&object, BYTES.len() as u64).unwrap(),
+                    digest(&job.artifact_id).unwrap()
+                );
+                assert_eq!(fs::read(&unrelated).unwrap(), b"keep");
+            }
+            reopened.reconcile_windows_file_installations().unwrap();
+            if boundary == "after-install-publication" {
+                assert_eq!(
+                    reopened.installation(&installed[0].id).unwrap().state,
+                    "Ready"
+                );
+            }
+            let installed = reopened.install_windows_file(&job.id).unwrap();
+            assert_eq!(installed.state, "Ready");
+            drop(reopened);
+            let mut reopened = Library::open(paths(fixture._root.path())).unwrap();
+            reopened.reconcile_windows_file_installations().unwrap();
+            reopened
+                .verify_windows_file_installation(&installed.id)
+                .unwrap();
+            assert_eq!(
+                reopened.install_windows_file(&job.id).unwrap().id,
+                installed.id
+            );
+            assert_eq!(fixture.hits.load(Ordering::Relaxed), 1);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_file_activation_retries_after_sqlite_rollback_and_detects_modification() {
+        let mut fixture = fixture(b"file activation fixture".to_vec(), "normal");
+        let job = queue(&mut fixture);
+        fixture
+            .library
+            .run_file_job(&fixture.client, &job.id, None)
+            .unwrap();
+        fixture.library.conn.execute_batch(
+            "CREATE TRIGGER fail_activation BEFORE UPDATE ON installations WHEN NEW.state='Ready' BEGIN SELECT RAISE(ABORT,'fixture activation rollback'); END;"
+        ).unwrap();
+        assert!(fixture.library.install_windows_file(&job.id).is_err());
+        let item = fixture.library.installations(None).unwrap().pop().unwrap();
+        assert_eq!(item.state, "Preparing");
+        assert!(
+            fixture
+                .library
+                .verify_windows_file_installation(&item.id)
+                .is_err()
+        );
+        assert!(item.path.join("payload").is_file());
+        let paths = fixture.library.paths.clone();
+        let mut reopened = Library::open(paths).unwrap();
+        reopened
+            .conn
+            .execute_batch("DROP TRIGGER fail_activation")
+            .unwrap();
+        reopened.reconcile_windows_file_installations().unwrap();
+        reopened.reconcile_windows_file_installations().unwrap();
+        reopened.verify_windows_file_installation(&item.id).unwrap();
+        fs::write(item.path.join("payload"), b"local modification").unwrap();
+        assert!(reopened.verify_windows_file_installation(&item.id).is_err());
+        assert_eq!(
+            hash_file(
+                &reopened.object(&job.artifact_id).unwrap(),
+                job.expected_size
+            )
+            .unwrap(),
+            digest(&job.artifact_id).unwrap()
+        );
+    }
 
     #[cfg(windows)]
     #[test]
@@ -1290,7 +1501,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn windows_transfer_and_recovery_do_not_touch_artifact_storage() {
+    fn windows_tree_transfer_and_recovery_do_not_touch_artifact_storage() {
         let fixture = tempfile::tempdir().unwrap();
         let root = fixture.path().join("library");
         let mut library = Library::open(crate::library::LibraryPaths {
@@ -1299,11 +1510,8 @@ mod tests {
         })
         .unwrap();
         let client = ApiClient::new("http://127.0.0.1:1", None, false).unwrap();
-        let file_error = library.run_file_job(&client, "unused", None).unwrap_err();
         let tree_error = library.run_tree_job(&client, "unused", None).unwrap_err();
-        assert!(file_error.to_string().contains("durable File transfers"));
         assert!(tree_error.to_string().contains("durable Tree transfers"));
-        library.reconcile_file_jobs().unwrap();
         library.reconcile_tree_jobs().unwrap();
         assert!(library.jobs(None).unwrap().is_empty());
         for directory in ["staging", "objects", "artifacts"] {
@@ -1332,8 +1540,11 @@ mod tests {
     impl Drop for Fixture {
         fn drop(&mut self) {
             self.stop.store(true, Ordering::Relaxed);
-            if let Some(thread) = self.thread.take() {
-                thread.join().unwrap();
+            if let Some(thread) = self.thread.take()
+                && let Err(error) = thread.join()
+                && !thread::panicking()
+            {
+                std::panic::resume_unwind(error);
             }
         }
     }
@@ -1358,6 +1569,8 @@ mod tests {
                     }
                     Err(e) => panic!("{e}"),
                 };
+                // Winsock can inherit the listener's nonblocking mode on accept.
+                stream.set_nonblocking(false).unwrap();
                 stream
                     .set_read_timeout(Some(Duration::from_secs(2)))
                     .unwrap();
@@ -1542,7 +1755,6 @@ mod tests {
         assert_eq!(seen, 42);
     }
     #[test]
-    #[cfg_attr(windows, ignore = "requires durable File staging and publication")]
     fn live_observations_count_only_network_bytes_and_not_completion() {
         let data = vec![7u8; 256 * 1024];
         let mut fixture = fixture(data.clone(), "normal");
@@ -1603,7 +1815,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(windows, ignore = "requires durable File staging and publication")]
     fn zero_and_normal_files_complete_with_offline_materialization() {
         for data in [vec![], b"download me".to_vec()] {
             let mut f = fixture(data.clone(), "normal");
@@ -1627,7 +1838,6 @@ mod tests {
         }
     }
     #[test]
-    #[cfg_attr(windows, ignore = "requires durable File staging and publication")]
     fn range_resume_and_full_200_restart() {
         for mode in ["normal", "fallback"] {
             let mut f = fixture(vec![7; CHUNK * 3], mode);
@@ -1652,7 +1862,6 @@ mod tests {
         }
     }
     #[test]
-    #[cfg_attr(windows, ignore = "requires durable File staging and publication")]
     fn invalid_range_and_changed_etag_are_rejected() {
         for mode in ["bad_range", "bad_etag"] {
             let mut f = fixture(vec![1; CHUNK * 2], mode);
@@ -1670,7 +1879,6 @@ mod tests {
         }
     }
     #[test]
-    #[cfg_attr(windows, ignore = "requires durable File staging and publication")]
     fn range_416_restarts_from_zero_and_verifies() {
         let mut f = fixture(vec![8; CHUNK * 2], "range416");
         let job = queue(&mut f);
@@ -1686,7 +1894,6 @@ mod tests {
         assert_eq!(f.hits.load(Ordering::Relaxed), 3);
     }
     #[test]
-    #[cfg_attr(windows, ignore = "requires durable File staging and publication")]
     fn temporary_http_failure_is_retried_but_cancellation_is_terminal() {
         let mut f = fixture(vec![10; CHUNK], "retry503");
         let job = queue(&mut f);
@@ -1710,7 +1917,6 @@ mod tests {
         );
     }
     #[test]
-    #[cfg_attr(windows, ignore = "requires durable File staging and publication")]
     fn corrupted_stage_restarts_without_trusting_checkpoint() {
         let mut f = fixture(vec![9; CHUNK * 2], "normal");
         let job = queue(&mut f);
@@ -1719,6 +1925,7 @@ mod tests {
         let mut file = OpenOptions::new().write(true).open(path).unwrap();
         file.write_all(b"bad").unwrap();
         file.sync_all().unwrap();
+        drop(file);
         f.library.retry_job(&job.id).unwrap();
         assert_eq!(
             f.library
@@ -1729,7 +1936,6 @@ mod tests {
         );
     }
     #[test]
-    #[cfg_attr(windows, ignore = "requires durable File staging and publication")]
     fn database_failure_during_completion_never_reports_completed() {
         let mut f = fixture(vec![6; CHUNK], "normal");
         let job = queue(&mut f);
@@ -1762,7 +1968,6 @@ mod tests {
         );
     }
     #[test]
-    #[cfg_attr(windows, ignore = "requires durable File staging and publication")]
     fn corruption_truncation_and_authorization_never_complete() {
         for mode in ["bad_hash", "truncated", "auth", "no_etag"] {
             let mut f = fixture(vec![2; CHUNK], mode);
@@ -1778,7 +1983,6 @@ mod tests {
         }
     }
     #[test]
-    #[cfg_attr(windows, ignore = "requires durable File staging and publication")]
     fn interrupted_job_reopens_and_resumes_from_checkpoint() {
         let mut f = fixture(vec![3; CHUNK * 3], "normal");
         let job = queue(&mut f);
@@ -1806,7 +2010,6 @@ mod tests {
         );
     }
     #[test]
-    #[cfg_attr(windows, ignore = "requires durable File staging and publication")]
     fn object_reuse_and_profile_context_remain_distinct() {
         let mut f = fixture(vec![4; CHUNK], "normal");
         let one = queue(&mut f);
@@ -1828,7 +2031,6 @@ mod tests {
         assert_ne!(files[0].path, files[1].path);
     }
     #[test]
-    #[cfg_attr(windows, ignore = "requires durable File staging and publication")]
     fn crash_during_commit_reconciles_and_lock_prevents_concurrent_run() {
         let mut f = fixture(vec![5; CHUNK], "normal");
         let job = queue(&mut f);
@@ -1895,7 +2097,6 @@ mod tests {
         assert_eq!(f.library.jobs(Some(&f.profile)).unwrap().len(), 1);
     }
     #[test]
-    #[cfg_attr(windows, ignore = "requires durable File staging and publication")]
     fn preemption_keeps_durable_checkpoint_and_resumes_without_discarding_bytes() {
         let mut f = fixture(vec![7; 5 * 1024 * 1024], "slow");
         let job = queue(&mut f);
