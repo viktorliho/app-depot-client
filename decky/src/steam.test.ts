@@ -33,8 +33,9 @@ test('create acknowledges the actual ID, rechecks, renames and leaves foreign en
     async artwork() { return null; },
   };
   const steam = {
-    async AddShortcut(_name: string, target: string, _cwd: string, options: string) {
+    async AddShortcut(_name: string, target: string, options: string, commandLine: string) {
       assert.ok(target.includes(options));
+      assert.equal(commandLine, `"${target}" ${options}`);
       adds++;
       return number++ | 0;
     },
@@ -122,7 +123,7 @@ test('sets fields explicitly after Steam derives the name from the executable', 
   };
   const steam = {
     async AddShortcut(...args: string[]) {
-      assert.deepEqual(args, ['Fixture App', target, cwd, options]);
+      assert.deepEqual(args, ['Fixture App', target, options, `"${target}" ${options}`]);
       created++;
       return id | 0;
     },

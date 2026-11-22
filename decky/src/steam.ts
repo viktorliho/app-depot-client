@@ -22,7 +22,7 @@ type Details = { unAppID: number; strDisplayName: string; strShortcutExe: string
 type Art = { appid: number; png?: string; path?: string };
 type SteamMethods = {
   RegisterForAppDetails?(id: number, callback: (details: Details) => void): { unregister(): void };
-  AddShortcut?(name: string, target: string, cwd: string, options: string): Promise<number>;
+  AddShortcut?(name: string, target: string, args: string, commandLine: string): Promise<number>;
   SetShortcutExe?(id: number, exe: string): Promise<unknown>;
   SetShortcutStartDir?(id: number, cwd: string): Promise<unknown>;
   SetShortcutLaunchOptions?(id: number, options: string): Promise<unknown>;
@@ -92,7 +92,7 @@ export async function reconcile(
       if (step.action === 'create') {
         guard();
         const id = await steam.AddShortcut(
-          row.name, step.target, step.target.substring(0, step.target.lastIndexOf('/')), step.options,
+          row.name, step.target, step.options, `"${step.target}" ${step.options}`,
         );
         if (!Number.isInteger(id) || !((id >>> 0) & 0x80000000)) throw new Error('Steam returned an invalid shortcut ID');
         await bridge.acknowledge(account, profile, row.id, id >>> 0);

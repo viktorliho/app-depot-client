@@ -85,6 +85,8 @@ jobs:
       - name: Create or verify draft and publish as prerelease
         run: |
           set -euo pipefail
+          remote_source="$(git ls-remote origin "refs/tags/$RELEASE_TAG^{}" | cut -f1)"
+          test "$remote_source" = "$(git rev-parse HEAD)"
           if gh release view "$RELEASE_TAG" --json isDraft,isPrerelease > "$RUNNER_TEMP/decky-release"; then
             jq -e '.isDraft and .isPrerelease' "$RUNNER_TEMP/decky-release" >/dev/null
           else
