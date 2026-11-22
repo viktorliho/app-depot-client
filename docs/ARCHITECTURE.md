@@ -90,9 +90,9 @@ The release build embeds a numeric workspace version, Git revision and official 
 | Platform | Client strategy |
 | --- | --- |
 | Linux Desktop | Maintain the existing AppImage and egui catalog, library and application management. |
-| SteamOS | First new platform. Steam Library is the catalog and Play surface, with a small Decky control surface and a Rust wrapper. |
-| Windows Desktop | Second new platform. Reuse the Rust core and broadly the same desktop UI, with platform adapters. |
-| macOS Desktop | Third new platform. Reuse the Rust core and broadly the same desktop UI, with platform adapters. |
+| SteamOS Decky | Functional MVP in maintenance mode. Steam Library remains the catalog and Play surface, with a small Decky control surface and a Rust wrapper. |
+| Windows Desktop | Next major platform. Reuse the Rust core and the existing egui desktop frontend and visual design with Windows adapters. |
+| macOS Desktop | Subsequent platform. Reuse the Rust core and broadly the same desktop UI, with platform adapters. |
 
 All clients use the authoritative App Depot Server protocol and declarations. The core remains independent of Steam and Decky.
 
@@ -160,7 +160,7 @@ The installable Decky release candidate and hardware acceptance procedure are do
 
 ### Decky update boundary
 
-Release discovery and temporary package verification are Decky platform operations. The unprivileged backend does not replace root-owned plugin files. Safe Gaming Mode activation requires a privileged boundary that retains the existing version until the new plugin acknowledges health and rolls back on interruption. The Desktop installer remains the activation path. M3.4.1 selects Decky-managed installation as the future integration and keeps the separate helper as research. M3.4 validates signed activation inputs and transaction recovery in a root-owned Debian fixture. The current SteamOS Loader resolves both its executable and plugin paths through user-owned ancestors, so privileged Gaming Mode activation stays disabled. Steam shortcut installation state remains independent of App Depot runtime readiness. All SteamOS installation-tab integrations are deferred. See [SteamOS Decky](STEAMOS_DECKY.md#updates--about).
+M3.5 sets the supported Decky lifecycle: install or upgrade manually through the official, version-pinned Desktop Mode installer. The unprivileged plugin shows its package version, the release page and diagnostics. Steam shortcut installation state remains independent of App Depot runtime readiness. All SteamOS installation-tab integrations are deferred. M3.4 and M3.4.1 preserve feasibility and trust-boundary research. [SteamOS Decky](STEAMOS_DECKY.md#manual-installation-and-updates)
 
 Decky Installed invokes shared local lifecycle operations and keeps Steam identity separate from local content ownership. Complete uninstall includes application-owned local data and requires explicit confirmation. Runtime removal, release of verified-content references and shared-object collection remain distinct. See [SteamOS uninstall scope](STEAMOS_DECKY.md#m33-local-application-uninstall).
 

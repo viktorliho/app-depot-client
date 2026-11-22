@@ -55,7 +55,7 @@ M3.0 includes a headless First Play CLI with explicit cached selection, shared t
 
 ## M3.1a — SteamOS Decky release candidate
 
-The installable local candidate adds Decky onboarding, catalog reconciliation, artwork, a shared-core native launcher and a pinned single-file installer. Build, verification and deployment boundaries are in [SteamOS Decky](STEAMOS_DECKY.md). Live Steam and SteamOS acceptance is an owner hardware task.
+The installable local candidate adds Decky onboarding, catalog reconciliation, artwork, a shared-core native launcher and a pinned single-file installer. Build, verification and deployment boundaries are in [SteamOS Decky](STEAMOS_DECKY.md). The owner later validated the MVP flows listed in [SteamOS MVP status](STEAMOS_DECKY.md#steamos-mvp-status).
 
 ## M3.1b — SteamOS integration
 
@@ -71,18 +71,32 @@ Installation, runtime preparation and any additional launch methods require sepa
 
 ## M3.2 — Decky release verification and native installation-state feasibility
 
-The candidate adds Gaming Mode release discovery and on-demand verification. Activation still uses the pinned Desktop installer because the observed Loader replacement path cannot preserve the previous plugin across verification and activation failures. Beta.4 remains unpublished pending separate release authorization. A subsequent in-Gaming-Mode activation test requires a safe activation path. All SteamOS installation-tab work is deferred, including native state changes, default tab replacement, TabMaster integration and App Depot-specific tabs. The existing non-Steam shortcuts and grayscale-to-color artwork behavior remain in use. The three researched approaches are recorded as unselected alternatives. See [SteamOS Decky](STEAMOS_DECKY.md#updates--about) for the trust model, Steam evidence and hardware procedure.
+M3.2 evaluated Gaming Mode release discovery and on-demand verification. M3.5 retires those controls and adopts the official manual Desktop installer. All SteamOS installation-tab work remains deferred, including native state changes, default tab replacement, TabMaster integration and App Depot-specific tabs. The existing non-Steam shortcuts and grayscale-to-color artwork behavior remain in use. [Deferred tab alternatives](STEAMOS_DECKY.md#deferred-alternatives-from-the-tabmaster-investigation)
 
 ## M3.3 — Decky Local Application Uninstall
 
 Decky Installed provides a confirmed, fully local complete uninstall by App and Server profile. The transaction removes runnable copies, managed data and download references. Shared objects survive while another local owner remains. The Steam shortcut and its settings stay intact, and the owned grid artwork is refreshed separately. The next Play follows normal First Play. Secure Gaming Mode update activation remains deferred. [SteamOS scope and acceptance](STEAMOS_DECKY.md#m33-local-application-uninstall)
 
 
-## M3.4 — Signed update verification and activation fixture
+## M3.4 — Deferred Gaming Mode self-update
 
-Gaming Mode reports progress while downloading and verifying official packages. A Debian-only fixture exercises the signed manifest, protected paths, kernel peer authentication, exclusive activation and recovery. SteamOS activation and enrollment are gated on a protected Loader executable and plugin path, generation-specific Loader health and an authorized production signing identity. The fixture is not deployed. [SteamOS activation gate](STEAMOS_DECKY.md#m34-steamos-activation-gate)
+The project investigated NonSteamLaunchers-style script updates, Loader-managed installation, a restricted privileged helper and versioned user-space runtimes. Debian fixtures verified signed manifests, protected staging, exchange, failure recovery and rollback. The installed Loader and its tested upstream revisions exposed unprotected paths and lacked pre-replacement validation and reliable reload rollback. These findings and fixtures remain as research. [M3.4](https://github.com/viktorliho/app-depot-client/commit/385065c2e8f9353600d778e4dba27b8c27dd171d) · [M3.4.1](https://github.com/viktorliho/app-depot-client/commit/6987094eeecdbe84db4192fa9a3545a345ecfd1b) · [SteamOS research](STEAMOS_DECKY.md#deferred-gaming-mode-update-research)
 
+## M3.5 — Decky maintenance and Windows handoff
 
-## M3.4.1 — Decky-managed activation feasibility
+The SteamOS Decky MVP enters maintenance. Settings & About shows the Decky version, official Releases link and diagnostics. The supported lifecycle uses the official version-pinned Desktop Mode installer. Steam remains the library and Play surface. Decky Installed handles Uninstall. The owner-tested native lifecycle and remaining hardware limits are recorded in the SteamOS guide. Linux Desktop remains the existing AppImage implementation, Windows Desktop is the next major platform, and macOS follows. [Manual updates](STEAMOS_DECKY.md#manual-installation-and-updates) · [SteamOS MVP status](STEAMOS_DECKY.md#steamos-mvp-status)
 
-Investigated installed NonSteamLaunchers and pinned Loader stable and prerelease methods. App Depot retains Gaming Mode download verification and the Desktop installer. The next native activation prototype depends on a protected Loader layout and package verification before replacement. M3.4's separate helper is retained as research. [Decision and test evidence](STEAMOS_DECKY.md#m341-decky-managed-update-feasibility)
+## M4.0 — Windows Desktop Architecture & Cross-Platform Core Audit
+
+Scope is an audit and architecture plan. Preserve the existing Server protocol, Rust core, egui frontend and visual design. Target feature consistency with Linux Desktop through platform adapters, with unsupported operations gated until their safety properties are demonstrated.
+
+| Surface | Starting point and Windows audit question |
+| --- | --- |
+| Filesystem and library | `library.rs`, `transfer.rs`, `tree_download.rs`, `migration.rs` and `managed.rs` use Unix permissions or Linux-specific no-follow handles, mount checks, atomic Tree promotion, reflinks and removal. Determine Windows handle-relative access, reparse-point rejection, directory promotion and durability on NTFS. Define behavior for case folding, reserved names, ADS, long paths, ACLs, concurrent access and sharing violations. Review `fs2`, `libc`, bundled SQLite and `directories` per target. |
+| Process and runtime | `launch.rs` and `managed.rs` use Linux execution handles, `/proc` and Linux process tracking. Specify constrained executable and working-directory resolution, literal argument and environment handling, active process tracking and safe runtime cleanup. Scope audit to supported native executable declarations. Unsupported launch methods remain inert. |
+| Credentials and data | `keyring` selects Secret Service, Windows native and Apple native features. Validate Windows Credential Manager lifecycle and account isolation. Decide per-user library, cache and preference locations, ACL creation, offline operation and recovery. Preserve opaque references and avoid plaintext fallback. |
+| Shared desktop and distribution | `crates/app-depot-desktop` currently enables eframe/egui with X11 and Wayland features and hosts the AppImage updater. Audit Windows renderer/window behavior, platform preference persistence and isolation of AppImage scripts, helper and stable release channel. Evaluate signed Windows x64 packaging and upgrade/rollback requirements before choosing a format. |
+
+Use a disposable Windows x64 VM or runner with a pinned Rust MSVC toolchain and Windows SDK, NTFS fixture volumes, separate non-admin test identities and an isolated Dev/Test Server. Keep Linux CI as the reference. Use native Windows tests for paths, credential isolation, process lifetime and interruption where cross-compilation cannot supply evidence.
+
+M4.0 acceptance is a source-referenced dependency and capability matrix, a prioritized adapter plan with tested or explicitly unverified assumptions, a reproducible Windows build/test environment proposal, and acceptance fixtures for portability, secure credentials, filesystem safety and packaging. Windows client implementation and release are separate milestones.

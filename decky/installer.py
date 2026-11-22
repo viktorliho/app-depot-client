@@ -35,8 +35,7 @@ RELEASE_PATH = re.compile(
     r"/viktorliho/app-depot-client/releases/download/decky-v([0-9]+\.[0-9]+\.[0-9]+-beta\.[0-9]+)/"
     r"AppDepot-Decky-v\1-x86_64\.zip"
 )
-EXPECTED = {"plugin.json", "package.json", "main.py", "dist/index.js", "bin/app-depot", "LICENSE",
-            "py_modules/decky_updates.py", "py_modules/app_depot_installer.py"}
+EXPECTED = {"plugin.json", "package.json", "main.py", "dist/index.js", "bin/app-depot", "LICENSE"}
 
 
 class ReleaseRedirect(HTTPRedirectHandler):
@@ -105,7 +104,7 @@ def content_length(response):
     return int(value)
 
 
-def get_package(url, checksum, development, *, context=None, progress=None):
+def get_package(url, checksum, development, *, progress=None):
     location = urlparse(url)
     official = (location.scheme == "https" and location.netloc == "github.com"
                 and RELEASE_PATH.fullmatch(location.path) and not location.query)
@@ -114,7 +113,7 @@ def get_package(url, checksum, development, *, context=None, progress=None):
             or location.fragment or not location.path.endswith(".zip") or not (official or local)):
         raise ValueError("Invalid pinned package location")
     opener = build_opener(ProxyHandler({}), DownloadHTTPHandler(),
-                          DownloadHTTPSHandler(context=context), ReleaseRedirect(url))
+                          DownloadHTTPSHandler(), ReleaseRedirect(url))
     payload = bytearray()
     validator = None
     total = None

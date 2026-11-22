@@ -48,6 +48,26 @@ class ConnectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await plugin.request("_rust"), {"ok": False, "code": "internal"})
 
 
+    async def test_about_reports_plugin_version_and_has_no_update_rpc(self):
+        plugin = main.Plugin()
+        with tempfile.TemporaryDirectory() as root:
+            plugin.plugin = Path(root)
+            (plugin.plugin / "package.json").write_text(json.dumps({
+                "name": "app-depot-decky", "version": "0.1.0-beta.6",
+            }))
+
+            async def rust(*args):
+                self.assertEqual(args, ("decky", "status"))
+                return {"version": "0.1.3"}
+
+            plugin._rust = rust
+            self.assertEqual(await plugin.request("status"), {
+                "ok": True, "value": {"version": "0.1.0-beta.6", "coreVersion": "0.1.3"},
+            })
+            for operation in ("check_update", "verify_update", "update_progress"):
+                self.assertEqual(await plugin.request(operation), {"ok": False, "code": "internal"})
+
+
 class ShortcutTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.temporary = tempfile.TemporaryDirectory()

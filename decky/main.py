@@ -7,12 +7,10 @@ import json
 import logging
 import os
 import re
-import ssl
 from pathlib import Path
 import stat
 import struct
 import tempfile
-from urllib.error import HTTPError, URLError
 from uuid import UUID
 
 
@@ -131,10 +129,6 @@ class Plugin:
         self.lock = asyncio.Lock()
         self.children = set()
         self.closing = False
-        self.update_lock = asyncio.Lock()
-        self.update_candidate = None
-        self.release_pages = None
-        self.update_transfer = None
 
     async def _unload(self):
         self.closing = True
@@ -217,8 +211,6 @@ class Plugin:
             "status": self.status, "discover": self.discover, "test": self.test,
             "configure": self.configure, "catalog": self.catalog, "artwork": self.artwork,
             "shortcut": self.shortcut, "acknowledge": self.acknowledge, "binding": self.binding,
-            "check_update": self.check_update, "verify_update": self.verify_update,
-            "update_progress": self.update_progress,
             "installed": self.installed, "uninstall": self.uninstall,
             "grid_states": self.grid_states, "finish_grids": self.finish_grids,
         }
@@ -227,7 +219,7 @@ class Plugin:
         try:
             return {"ok": True, "value": await operations[method](*args)}
         except RpcFailure as error:
-            if method in {"check_update", "verify_update", "shortcut", "artwork", "uninstall"}:
+            if method in {"shortcut", "artwork", "uninstall"}:
                 logging.getLogger(__name__).info("App Depot RPC %s: %s", method, error.code)
             return {"ok": False, "code": error.code}
         except asyncio.TimeoutError:
@@ -249,65 +241,6 @@ class Plugin:
         ):
             raise RpcFailure("package_metadata_invalid")
         return version
-
-    async def check_update(self):
-        from decky_updates import ReleasePages, find_update
-
-        if self.update_lock.locked():
-            raise RpcFailure("update_busy")
-        async with self.update_lock:
-            self.update_candidate = None
-            if self.release_pages is None:
-                self.release_pages = ReleasePages()
-            try:
-                self.update_candidate = await asyncio.to_thread(find_update, self.package_version(), self.release_pages)
-            except HTTPError as error:
-                if error.code == 429 or (error.code == 403 and (
-                    error.headers.get("X-RateLimit-Remaining") == "0" or error.headers.get("Retry-After")
-                )):
-                    raise RpcFailure("update_rate_limited") from None
-                raise RpcFailure("update_http_failed") from None
-            except URLError as error:
-                code = "update_tls_failed" if isinstance(error.reason, ssl.SSLError) else "update_network_failed"
-                raise RpcFailure(code) from None
-            except ssl.SSLError:
-                raise RpcFailure("update_tls_failed") from None
-            except OSError:
-                raise RpcFailure("update_network_failed") from None
-            except (ValueError, TypeError):
-                raise RpcFailure("update_metadata_invalid") from None
-            if self.update_candidate:
-                return {key: self.update_candidate[key] for key in ("version", "notes", "url")}
-            return None
-
-    async def update_progress(self):
-        return self.update_transfer
-
-    async def verify_update(self):
-        from decky_updates import verify_update
-
-        if self.update_lock.locked():
-            raise RpcFailure("update_busy")
-        async with self.update_lock:
-            if not self.update_candidate:
-                raise RpcFailure("update_check_failed")
-            def progress(received, total, speed):
-                self.update_transfer = {
-                    "phase": "retrying" if speed is None else "downloading",
-                    "received": received, "total": total,
-                }
-
-            def verifying():
-                self.update_transfer = {"phase": "verifying"}
-
-            progress(0, None, 0)
-            try:
-                await asyncio.to_thread(verify_update, self.update_candidate, progress, verifying)
-            except Exception:
-                # Network URLs and archive paths remain inside this boundary.
-                raise RpcFailure("update_verification_failed") from None
-            finally:
-                self.update_transfer = None
 
     async def discover(self):
         return await self._rust("decky", "discover")

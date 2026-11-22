@@ -36,8 +36,6 @@ def build(binary, out, base_url, development, github_release_tag=None):
         "plugin.json": source / "plugin.json",
         "package.json": source / "package.json",
         "main.py": source / "main.py",
-        "py_modules/decky_updates.py": source / "py_modules/decky_updates.py",
-        "py_modules/app_depot_installer.py": source / "installer.py",
         "dist/index.js": source / "dist/index.js",
         "bin/app-depot": binary,
         "LICENSE": source.parent / "LICENSE",

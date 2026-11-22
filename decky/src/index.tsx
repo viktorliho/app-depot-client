@@ -9,9 +9,10 @@ type Profile = { id: string; origin: string; name: string; authenticated: boolea
 type Status = { profiles: Profile[]; library: string; usage: { writableInstallationsLogicalBytes: number }; version: string; coreVersion: string };
 type Steam = Parameters<typeof reconcile>[1];
 const environment = window as unknown as {
-  SteamClient?: { Apps?: Steam };
+  SteamClient?: { Apps?: Steam; System?: { OpenInSystemBrowser?(url: string): void } };
   App?: { m_CurrentUser?: { strSteamID?: string } };
 };
+const deckyReleases = 'https://github.com/viktorliho/app-depot-client/releases';
 const account = () => steamId(environment.App?.m_CurrentUser?.strSteamID ?? '');
 const steam = () => environment.SteamClient?.Apps ?? {};
 const bridgeReady = () => Boolean(steam().AddShortcut && steam().RegisterForAppDetails);
@@ -37,12 +38,6 @@ const messages: Record<string, string> = {
   uninstall_busy: 'Close the game and pause or cancel active downloads before uninstalling.',
   uninstall_incomplete: 'Uninstall could not finish safely. Reopen Installed to retry recovery.',
   uninstall_stale: 'Local content changed. Refresh Installed and confirm the current selection.',
-  update_busy: 'An update check or verification is already running.',
-  update_rate_limited: 'GitHub is limiting release checks. Try again later.',
-  update_tls_failed: 'The GitHub TLS certificate could not be verified.',
-  update_network_failed: 'Could not reach GitHub. Check your network connection and retry.',
-  update_metadata_invalid: 'GitHub returned invalid Decky release information.',
-  update_http_failed: 'GitHub rejected the release check. Try again later.',
   package_metadata_invalid: 'The installed Decky package metadata is invalid. Reinstall from Desktop Mode.',
   shortcut_ownership: 'Steam shortcut ownership could not be verified. The entry was preserved.',
   shortcut_ambiguous: 'Steam returned conflicting shortcut identities. The entries were preserved.',
@@ -51,8 +46,6 @@ const messages: Record<string, string> = {
   shortcut_identity: 'Steam returned an unexpected shortcut ID.',
   shortcut_storage: 'Steam account storage is unavailable.',
   shortcut_launcher: 'The shortcut launcher path could not be verified.',
-  update_check_failed: 'Could not check official Decky releases. Try again.',
-  update_verification_failed: 'The update could not be downloaded or verified. Retry or check again.',
   internal: 'App Depot could not complete this operation. Check the plugin diagnostics.',
 };
 
@@ -172,79 +165,6 @@ async function observeInstallations() {
     reportBackground('artwork', diagnostic(error));
   }).finally(() => { work = undefined; });
   return work;
-}
-
-type Update = { version: string; notes: string; url: string };
-const checkUpdate = rpcMethod<[], Update | null>('check_update');
-const verifyUpdate = rpcMethod<[], null>('verify_update');
-type Transfer = { phase: 'verifying' } | {
-  phase: 'downloading' | 'retrying'; received: number; total: number | null;
-};
-const updateProgress = rpcMethod<[], Transfer | null>('update_progress');
-
-function Updates({ version }: { version?: string }) {
-  const [update, setUpdate] = useState<Update | null>(null);
-  const [message, setMessage] = useState('');
-  const [busy, setBusy] = useState(false);
-  const [downloading, setDownloading] = useState(false);
-  const [transfer, setTransfer] = useState<Transfer | null>(null);
-  useEffect(() => {
-    if (!downloading) return;
-    let active = true;
-    const refresh = () => { void updateProgress().then(state => { if (active) setTransfer(state); }, () => {}); };
-    refresh();
-    const timer = setInterval(refresh, 500);
-    return () => { active = false; clearInterval(timer); };
-  }, [downloading]);
-
-  const check = async () => {
-    setBusy(true);
-    setUpdate(null);
-    setMessage('Checking for updates…');
-    try {
-      const result = await checkUpdate();
-      setUpdate(result);
-      setMessage(result ? 'Update available' : 'Up to date');
-    } catch (error) {
-      setMessage(error instanceof ConnectionFailure ? error.message : messages.update_check_failed);
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const verify = async () => {
-    setBusy(true);
-    setTransfer(null);
-    setDownloading(true);
-    setMessage('Downloading…');
-    try {
-      await verifyUpdate();
-      setMessage('Official package verified. Use the release’s installer in Desktop Mode to upgrade.');
-    } catch (error) {
-      setMessage(error instanceof ConnectionFailure ? error.message : messages.update_verification_failed);
-    } finally {
-      setDownloading(false);
-      setBusy(false);
-    }
-  };
-
-  const volume = (bytes: number) => `${(bytes / 1048576).toFixed(2)} MiB`;
-  const feedback = downloading && transfer
-    ? transfer.phase === 'verifying' ? 'Validating the package…'
-      : `${transfer.phase === 'retrying' ? 'Connection interrupted. Retrying' : 'Downloading'} · ${volume(transfer.received)}${transfer.total === null ? '' : ` / ${volume(transfer.total)}`}`
-    : message;
-  return <PanelSection title="Updates & About">
-    <PanelSectionRow>{version ? `App Depot Decky ${version}` : 'Loading version…'}</PanelSectionRow>
-    <PanelSectionRow>Gaming Mode can check and verify updates. To install an update, use its installer in Desktop Mode.</PanelSectionRow>
-    <PanelSectionRow><ButtonItem disabled={busy} onClick={check}>Check for updates</ButtonItem></PanelSectionRow>
-    {feedback && <PanelSectionRow><div role="status">{feedback}</div></PanelSectionRow>}
-    {update && <>
-      <PanelSectionRow>Available version · {update.version}</PanelSectionRow>
-      {update.notes && <PanelSectionRow><div style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}>{update.notes}</div></PanelSectionRow>}
-      <PanelSectionRow><ButtonItem disabled={busy} onClick={verify}>Download and verify</ButtonItem></PanelSectionRow>
-      <PanelSectionRow><div style={{ overflowWrap: 'anywhere' }}>Desktop installer · {update.url}</div></PanelSectionRow>
-    </>}
-  </PanelSection>;
 }
 
 function AppDepot() {
@@ -428,21 +348,26 @@ function AppDepot() {
       {!rows.length && !removal && <PanelSectionRow>{inventoryIssue ? 'Installed list unavailable' : 'No local installations'}</PanelSectionRow>}
       {removeResult && <PanelSectionRow><div role="status">{removeResult}</div></PanelSectionRow>}
     </PanelSection>
-    <PanelSection title="Settings">
-      <PanelSectionRow>{status?.library}</PanelSectionRow>
-      <PanelSectionRow>Runtime storage · {((status?.usage.writableInstallationsLogicalBytes ?? 0) / 1048576).toFixed(0)} MiB</PanelSectionRow>
+    <PanelSection title="Settings & About">
       <PanelSectionRow>{status ? `App Depot Decky ${status.version}` : 'Loading version…'}</PanelSectionRow>
+      <PanelSectionRow>In Desktop Mode, run the official .desktop installer from a Decky release.</PanelSectionRow>
+      <PanelSectionRow>{environment.SteamClient?.System?.OpenInSystemBrowser
+        ? <ButtonItem onClick={() => environment.SteamClient?.System?.OpenInSystemBrowser?.(deckyReleases)}>
+            Official GitHub Releases
+          </ButtonItem>
+        : <a href={deckyReleases} target="_blank" rel="noopener noreferrer">Official GitHub Releases</a>}
+      </PanelSectionRow>
       {diagnostics.sync && <PanelSectionRow>Steam synchronization needs attention.</PanelSectionRow>}
       {diagnostics.artwork && <PanelSectionRow>Artwork refresh deferred. App Depot will retry.</PanelSectionRow>}
       <PanelSectionRow><ToggleField label="Diagnostics" checked={showDiagnostics} onChange={setShowDiagnostics} /></PanelSectionRow>
       {showDiagnostics && <PanelSectionRow><div style={{ overflowWrap: 'anywhere' }}>
+        {status && <div>{status.library} · Runtime storage {(status.usage.writableInstallationsLogicalBytes / 1048576).toFixed(0)} MiB</div>}
         <div>Core {status?.coreVersion ?? 'unavailable'} · {bridgeReady() ? 'Steam bridge available' : 'Steam bridge unavailable'}</div>
         <div>Sync · {diagnostics.sync || lastOperations}</div>
         {diagnostics.artwork && <div>Artwork · {diagnostics.artwork}</div>}
         {inventoryIssue && <div>Installed list · {inventoryIssue}</div>}
       </div></PanelSectionRow>}
     </PanelSection>
-    <Updates version={status?.version} />
   </>;
 }
 
