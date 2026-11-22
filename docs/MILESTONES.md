@@ -68,3 +68,11 @@ The installable local candidate adds Decky onboarding, catalog reconciliation, a
 ## Later milestones
 
 Installation, runtime preparation and any additional launch methods require separately authorized, optional shared contracts and client implementations. No arbitrary script runner or automatic dependency installer is implied. Windows/macOS packaging and native launch adapters follow verified platform-specific behavior.
+
+## M3.2 — Decky release verification and native installation-state feasibility
+
+The candidate adds Gaming Mode release discovery and on-demand verification. Activation still uses the pinned Desktop installer because the observed Loader replacement path cannot preserve the previous plugin across verification and activation failures. Beta.4 remains unpublished pending separate release authorization. A subsequent in-Gaming-Mode activation test requires a safe activation path. All SteamOS installation-tab work is deferred, including native state changes, default tab replacement, TabMaster integration and App Depot-specific tabs. The existing non-Steam shortcuts and grayscale-to-color artwork behavior remain in use. The three researched approaches are recorded as unselected alternatives. See [SteamOS Decky](STEAMOS_DECKY.md#updates--about) for the trust model, Steam evidence and hardware procedure.
+
+## M3.3 — Decky Local Application Uninstall
+
+After M3.2 stabilization, this is the next implementation milestone. Secure Gaming Mode activation remains a later effort. Add **Installed → Select application → Uninstall** with a logical storage estimate and explicit confirmation. Reuse offline Rust removal and recovery. Distinguish writable runtime removal, release of App-owned download references and shared-object garbage collection. Preserve saves and modifications within the lifecycle contract, other Apps' references, the Steam shortcut, AppID, Steam Input and ownership. Guard active runtimes and partial transfers. The remove-download path restores grayscale artwork and allows normal First Play to reacquire content. Validate with a disposable App, including interrupted removal and an offline uninstall. [SteamOS scope and acceptance](STEAMOS_DECKY.md#m33-implementation-sequence)

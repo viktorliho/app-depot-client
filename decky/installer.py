@@ -23,7 +23,8 @@ from zipfile import ZipFile
 PACKAGE = "AppDepot"
 SERVICE = "plugin_loader.service"
 MAX_PACKAGE = 128 * 1024 * 1024
-EXPECTED = {"plugin.json", "package.json", "main.py", "dist/index.js", "bin/app-depot", "LICENSE"}
+EXPECTED = {"plugin.json", "package.json", "main.py", "dist/index.js", "bin/app-depot", "LICENSE",
+            "py_modules/decky_updates.py", "py_modules/app_depot_installer.py"}
 
 
 class ReleaseRedirect(HTTPRedirectHandler):

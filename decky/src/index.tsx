@@ -33,6 +33,10 @@ const messages: Record<string, string> = {
   secret_service_unavailable: 'Secret Service is unavailable or the saved credential is missing. Unlock the user keyring and try again.',
   saved_credentials: 'This Server already has a saved token. Synchronize its existing profile to keep that configuration.',
   discovery_unavailable: 'LAN discovery is unavailable. Enter the Server address manually.',
+  update_busy: 'An update check or verification is already running.',
+  update_rate_limited: 'GitHub is limiting release checks. Try again later.',
+  update_check_failed: 'Could not check official Decky releases. Try again.',
+  update_verification_failed: 'The update could not be downloaded or verified. Retry or check again.',
   internal: 'App Depot could not complete this operation. Check the plugin diagnostics.',
 };
 
@@ -97,6 +101,57 @@ async function observeInstallations() {
     }
   })().finally(() => { work = undefined; });
   return work;
+}
+
+type Update = { version: string; notes: string; url: string };
+const checkUpdate = rpcMethod<[], Update | null>('check_update');
+const verifyUpdate = rpcMethod<[], null>('verify_update');
+
+function Updates({ version }: { version?: string }) {
+  const [update, setUpdate] = useState<Update | null>(null);
+  const [message, setMessage] = useState('');
+  const [busy, setBusy] = useState(false);
+
+  const check = async () => {
+    setBusy(true);
+    setUpdate(null);
+    setMessage('Checking for updates…');
+    try {
+      const result = await checkUpdate();
+      setUpdate(result);
+      setMessage(result ? 'Update available' : 'Up to date');
+    } catch (error) {
+      setMessage(error instanceof ConnectionFailure ? error.message : messages.update_check_failed);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const verify = async () => {
+    setBusy(true);
+    setMessage('Downloading and verifying…');
+    try {
+      await verifyUpdate();
+      setMessage('Official package verified. Use the release’s installer in Desktop Mode to upgrade.');
+    } catch (error) {
+      setMessage(error instanceof ConnectionFailure ? error.message : messages.update_verification_failed);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return <PanelSection title="Updates & About">
+    <PanelSectionRow>Installed version · {version ?? 'Loading…'}</PanelSectionRow>
+    <PanelSectionRow>Gaming Mode can check and verify updates. To install an update, use its installer in Desktop Mode.</PanelSectionRow>
+    <PanelSectionRow><ButtonItem disabled={busy} onClick={check}>Check for updates</ButtonItem></PanelSectionRow>
+    {message && <PanelSectionRow><div role="status">{message}</div></PanelSectionRow>}
+    {update && <>
+      <PanelSectionRow>Available version · {update.version}</PanelSectionRow>
+      {update.notes && <PanelSectionRow><div style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}>{update.notes}</div></PanelSectionRow>}
+      <PanelSectionRow><ButtonItem disabled={busy} onClick={verify}>Download and verify</ButtonItem></PanelSectionRow>
+      <PanelSectionRow><div style={{ overflowWrap: 'anywhere' }}>Desktop installer · {update.url}</div></PanelSectionRow>
+    </>}
+  </PanelSection>;
 }
 
 function AppDepot() {
@@ -233,6 +288,7 @@ function AppDepot() {
       <PanelSectionRow>App Depot {status?.version} · {bridgeReady() ? 'Steam bridge available' : 'Steam bridge unavailable'}</PanelSectionRow>
       <PanelSectionRow><div style={{ whiteSpace: 'pre-wrap' }}>{lastOperations}</div></PanelSectionRow>
     </PanelSection>
+    <Updates version={status?.version} />
   </>;
 }
 
