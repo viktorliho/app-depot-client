@@ -643,7 +643,7 @@ impl Updater {
                     #[cfg(windows)]
                     let no_update = "No newer complete stable Desktop release found";
                     self.status = release.as_ref().map_or(no_update.into(), |r| {
-                        format!("Update available Ã¢â‚¬â€ {}", r.tag)
+                        format!("Update available ({})", r.tag)
                     });
                     self.release = release;
                     self.busy = false;

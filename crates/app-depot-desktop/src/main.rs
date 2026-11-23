@@ -265,6 +265,10 @@ impl Desktop {
             match event {
                 Event::Snapshot(s) => {
                     let selected = s.selected.clone();
+                    #[cfg(windows)]
+                    {
+                        self.snapshot.update_occupancy_clear = s.update_occupancy_clear;
+                    }
                     self.snapshot.profiles = s.profiles;
                     self.snapshot.library_data = s.library_data;
                     self.snapshot.library_content = s.library_content;
