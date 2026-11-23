@@ -8,7 +8,7 @@ $ErrorActionPreference = 'Stop'
 
 $root = Split-Path -Parent $PSScriptRoot
 $out = [IO.Directory]::CreateDirectory($OutputDirectory).FullName
-$version = [regex]::Match((Get-Content "$root\Cargo.toml" -Raw), '(?m)^version = "([0-9]+\.[0-9]+\.[0-9]+)"$').Groups[1].Value
+$version = [regex]::Match((Get-Content "$root\Cargo.toml" -Raw), '(?m)^version = "([0-9]+\.[0-9]+\.[0-9]+)"\r?$').Groups[1].Value
 if (!$version) { throw 'Workspace version missing' }
 $displayVersion = "$version-windows-rc.$Candidate"
 $numericVersion = "$version.$Candidate"
