@@ -350,6 +350,7 @@ fn process_state(pid: Option<i64>, time: Option<&str>) -> ProcessState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND};
 
     #[test]
     fn suspended_extensionless_child_has_stable_identity_before_running() {
@@ -385,5 +386,144 @@ mod tests {
             process_state(None, Some("windows:pending")),
             ProcessState::Unknown
         );
+    }
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
+        JobObjectBasicAccountingInformation, OpenJobObjectW, QueryInformationJobObject,
+    };
+    use windows_sys::Win32::System::SystemServices::JOB_OBJECT_QUERY;
+
+    fn job_name(id: uuid::Uuid) -> Vec<u16> {
+        format!("Global\\AppDepot.Process.{id}")
+            .encode_utf16()
+            .chain([0])
+            .collect()
+    }
+
+    fn new_job(id: uuid::Uuid, child: &Suspended) -> io::Result<OwnedHandle> {
+        let name = job_name(id);
+        // SAFETY: name is nul-terminated. Default security attributes do not inherit the handle.
+        let raw = unsafe { CreateJobObjectW(null(), name.as_ptr()) };
+        let status = io::Error::last_os_error();
+        if raw.is_null() {
+            return Err(status);
+        }
+        // SAFETY: CreateJobObjectW returned a fresh owned handle, even on an existing-name error.
+        let job = unsafe { OwnedHandle::from_raw_handle(raw) };
+        if status.raw_os_error() == Some(ERROR_ALREADY_EXISTS as i32) {
+            return Err(status);
+        }
+        let process = child.child.as_ref().unwrap().handle.as_raw_handle();
+        // SAFETY: both handles remain live and refer to the job and our suspended child.
+        if unsafe { AssignProcessToJobObject(job.as_raw_handle(), process) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(job)
+    }
+
+    fn job_active(id: uuid::Uuid) -> io::Result<Option<bool>> {
+        let name = job_name(id);
+        // SAFETY: name is nul-terminated and the result is either null or an owned handle.
+        let raw = unsafe { OpenJobObjectW(JOB_OBJECT_QUERY, 0, name.as_ptr()) };
+        if raw.is_null() {
+            let error = io::Error::last_os_error();
+            return if error.raw_os_error() == Some(ERROR_FILE_NOT_FOUND as i32) {
+                Ok(None)
+            } else {
+                Err(error)
+            };
+        }
+        // SAFETY: OpenJobObjectW returned a valid owned handle.
+        let job = unsafe { OwnedHandle::from_raw_handle(raw) };
+        let mut counts = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+        // SAFETY: the live job and output buffer match the information class.
+        if unsafe {
+            QueryInformationJobObject(
+                job.as_raw_handle(),
+                JobObjectBasicAccountingInformation,
+                (&raw mut counts).cast(),
+                size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+                std::ptr::null_mut(),
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Some(counts.ActiveProcesses != 0))
+    }
+
+    #[test]
+    fn named_job_reports_detached_descendant_after_primary_and_handle_exit() {
+        let cwd = std::env::current_dir().unwrap();
+        if cwd.join("job-fixture").is_file() {
+            if std::env::var_os("M41B2_JOB_DESCENDANT").is_some() {
+                // SAFETY: the pseudo-handle refers to the current fixture process.
+                let current = unsafe { windows_sys::Win32::System::Threading::GetCurrentProcess() };
+                let started = creation_time(current).unwrap();
+                std::fs::write(
+                    "descendant-ready.part",
+                    format!("{}:{started}", std::process::id()),
+                )
+                .unwrap();
+                std::fs::rename("descendant-ready.part", "descendant-ready").unwrap();
+                for _ in 0..400 {
+                    if cwd.join("descendant-release").is_file() {
+                        std::process::exit(0);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                std::process::exit(1);
+            }
+            use std::os::windows::process::CommandExt;
+            let child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "windows_process::tests::named_job_reports_detached_descendant_after_primary_and_handle_exit"])
+                .env("M41B2_JOB_DESCENDANT", "1")
+                .current_dir(&cwd)
+                .creation_flags(windows_sys::Win32::System::Threading::DETACHED_PROCESS)
+                .spawn().unwrap();
+            assert_ne!(child.id(), std::process::id());
+            std::process::exit(0);
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let image = temp.path().join("occupancy.exe");
+        std::fs::copy(std::env::current_exe().unwrap(), &image).unwrap();
+        std::fs::write(temp.path().join("job-fixture"), b"").unwrap();
+        let arguments = ["--exact".into(), "windows_process::tests::named_job_reports_detached_descendant_after_primary_and_handle_exit".into()];
+        let suspended = create_suspended(&image, temp.path(), &arguments).unwrap();
+        let id = uuid::Uuid::new_v4();
+        let job = new_job(id, &suspended).unwrap();
+        let (pid, start) = suspended.identity().unwrap();
+        let mut primary = suspended.resume().unwrap();
+        assert!(primary.wait().unwrap().success());
+        assert!(!is_running(pid, start).unwrap());
+        for _ in 0..160 {
+            if temp.path().join("descendant-ready").exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(temp.path().join("descendant-ready").exists());
+        let child = std::fs::read_to_string(temp.path().join("descendant-ready")).unwrap();
+        let (child_pid, child_start) = child.split_once(':').unwrap();
+        let child_pid = child_pid.parse().unwrap();
+        let child_start = child_start.parse().unwrap();
+        let result_held = job_active(id).unwrap();
+        drop(job);
+        let result_after_close = job_active(id).unwrap();
+        let alive_after_close = is_running(child_pid, child_start).unwrap();
+        eprintln!(
+            "detached fixture reported ready, job query with handle = {result_held:?}, after last handle close = {result_after_close:?}"
+        );
+        std::fs::write(temp.path().join("descendant-release"), b"").unwrap();
+        for _ in 0..160 {
+            if !is_running(child_pid, child_start).unwrap() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(!is_running(child_pid, child_start).unwrap());
+        assert!(alive_after_close);
+        assert_eq!(result_held, Some(true));
+        assert_ne!(result_after_close, Some(false));
     }
 }
