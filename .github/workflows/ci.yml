@@ -3,6 +3,12 @@ on:
   push:
     branches: [main, 'feature/**']
   pull_request:
+  workflow_dispatch:
+    inputs:
+      windows_10_smoke:
+        description: Run installer smoke test on the disposable Windows 10 workstation runner
+        type: boolean
+        default: false
 permissions:
   contents: read
 jobs:
@@ -35,6 +41,9 @@ jobs:
     runs-on: windows-2025
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Check Windows setup version and architecture
+        shell: pwsh
+        run: ./scripts/test-windows-setup-config.ps1
       - name: Pin Rust MSVC toolchain
         run: rustup toolchain install 1.100.0-x86_64-pc-windows-msvc --profile minimal --component rustfmt,clippy
       - run: cargo +1.100.0 fmt --check
@@ -60,3 +69,19 @@ jobs:
             ${{ runner.temp }}/app-depot-windows-rc/AppDepot-Desktop-Windows-x64-Setup.exe
             ${{ runner.temp }}/app-depot-windows-rc/app-depot-desktop.exe
             ${{ runner.temp }}/app-depot-windows-rc/SHA256SUMS
+
+  windows-10-installer:
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.windows_10_smoke
+    needs: windows
+    runs-on: [self-hosted, Windows, X64, app-depot-windows-10]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: AppDepot-Desktop-Windows-x64-RC
+          path: ${{ runner.temp }}/app-depot-windows-rc
+      - name: Verify Windows 10 per-user installer
+        shell: powershell
+        run: ./scripts/test-windows-installer.ps1 -PackageDirectory "$env:RUNNER_TEMP/app-depot-windows-rc" -RequireWindows10

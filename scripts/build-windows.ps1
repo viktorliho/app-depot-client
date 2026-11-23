@@ -1,7 +1,7 @@
 param(
     [Parameter(Mandatory)][string]$OutputDirectory,
     [string]$InnoCompiler = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
-    [ValidatePattern('^[1-9][0-9]{0,3}$')][string]$Candidate = '1',
+    [ValidatePattern('^[1-9][0-9]{0,3}$')][string]$Candidate = '2',
     [switch]$BinaryOnly
 )
 $ErrorActionPreference = 'Stop'

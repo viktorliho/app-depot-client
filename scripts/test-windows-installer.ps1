@@ -1,5 +1,18 @@
-param([Parameter(Mandatory)][string]$PackageDirectory)
+param(
+    [Parameter(Mandatory)][string]$PackageDirectory,
+    [switch]$RequireWindows10
+)
 $ErrorActionPreference = 'Stop'
+
+if ($RequireWindows10) {
+    $os = Get-CimInstance Win32_OperatingSystem
+    $build = [int]$os.BuildNumber
+    if ($os.ProductType -ne 1 -or $build -lt 19041 -or $build -ge 22000 -or
+        $env:PROCESSOR_ARCHITECTURE -ne 'AMD64') {
+        throw "Expected a Windows 10 x64 workstation, build 19041 or newer. Found $($os.Caption), build $build."
+    }
+    "Windows 10 installation smoke test on build $build"
+}
 
 $package = (Resolve-Path -LiteralPath $PackageDirectory).Path
 $binary = Join-Path $package 'app-depot-desktop.exe'
@@ -17,7 +30,9 @@ function Invoke-SmokeProcess([string]$File, [string]$Arguments) {
     if ($process.ExitCode -ne 0) { throw "$File exited with $($process.ExitCode)" }
 }
 
-$fixture = [IO.Directory]::CreateTempSubdirectory('app-depot-installer-').FullName
+$fixture = [IO.Directory]::CreateDirectory(
+    (Join-Path ([IO.Path]::GetTempPath()) "app-depot-installer-$([guid]::NewGuid())")
+).FullName
 $install = Join-Path $fixture 'program'
 $library = Join-Path $fixture 'library'
 [IO.Directory]::CreateDirectory($library) | Out-Null

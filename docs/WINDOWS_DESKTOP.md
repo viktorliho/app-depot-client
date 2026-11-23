@@ -1,6 +1,8 @@
-# App Depot Desktop for Windows 11 x64
+# App Depot Desktop for Windows x64
 
 ## Install and connect
+
+Setup accepts Windows 10 version 2004 (build 19041) or later and Windows 11 on x64. The owner confirmed that the previous standalone executable starts and connects to TrueNAS on a physical Windows 10 PC. Acceptance of the updated installer on Windows 10 is pending. File/Tree operations, Play and recovery on Windows 10 still require separate validation on an isolated test system.
 
 Download `AppDepot-Desktop-Windows-x64-Setup.exe` and `SHA256SUMS` from the same approved release. Compare the setup hash with its entry in the manifest using `Get-FileHash -Algorithm SHA256 .\AppDepot-Desktop-Windows-x64-Setup.exe`. This verifies file integrity. The unsigned candidate can show an unknown publisher or SmartScreen warning. Use only the expected release source and follow your Windows security policy.
 
@@ -14,21 +16,28 @@ Exit Desktop before updating or removing Desktop from Windows Settings. An activ
 
 - Windows File and Tree downloads, offline Verify, native Play and managed process supervision use the shared client. Managed Uninstall keeps the completed download and separate saves, so Install can reuse verified content.
 - Uninstall refuses running or uncertain managed processes, modified or unknown content, sharing conflicts, reparse points, unexpected hard links and named NTFS streams. The recovery journal retains incomplete operations. The private managed library is assumed to be under the user's control, without a hostile same-user process modifying it concurrently. External or escaped processes are outside universal detection.
-- Windows Repair, physical CAS garbage collection, automatic Desktop updates and Windows 10 are deferred for this release. Windows Server 2022 previously reported sharing violation 32 during File/Tree tests. See [the milestone diagnostics](MILESTONES.md#m41b2b--windows-removal-preflight).
+- Windows Repair, physical CAS garbage collection and automatic Desktop updates are deferred for this release.
+- Windows Server 2022 (build 20348) previously reported sharing violation 32 during File/Tree publication. Those paths request delete access for handle-relative, no-replace rename. Another handle without delete sharing can block that operation on Windows 10 too. The original CI logs lack the first failing API call, so reproduction on Windows 10 is still unknown. Preserve the sharing constraints and use the existing first-error traces and focused File/Tree tests on a disposable Windows 10 NTFS VM if the issue reproduces. [Milestone diagnostics](MILESTONES.md#m41b2b--windows-removal-preflight) · [Microsoft file sharing documentation](https://learn.microsoft.com/windows/win32/api/fileapi/nf-fileapi-createfilew)
 
 ## Build and package the candidate
 
 From an x64 Visual Studio 2022 developer prompt with Windows SDK, Rust 1.100.0 and Inno Setup 6.7:
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy RemoteSigned -File scripts\build-windows.ps1 -OutputDirectory C:\build\app-depot-windows -Candidate 1
+powershell -NoProfile -ExecutionPolicy RemoteSigned -File scripts\build-windows.ps1 -OutputDirectory C:\build\app-depot-windows -Candidate 2
 ```
 
 Pass `-InnoCompiler` if ISCC is elsewhere. The script compiles the optimized locked MSVC target with a static CRT, embeds the bundled icon and Windows version resource, checks PE architecture, subsystem and runtime imports, and checksums the installer and Desktop executable. The supervisor uses a mode of that same executable. For an executable-only build, use `-BinaryOnly`.
 
-Client CI builds the same installer and exercises per-user setup, reinstall/update, registration, binary integrity and standard uninstallation on a disposable Windows Server 2025 runner. Download the **AppDepot-Desktop-Windows-x64-RC** workflow artifact for evaluation. This environment does not substitute for native Windows 11 GUI acceptance.
+Client CI checks the version floor and x64 configuration in the actual Inno Setup file. It then builds the installer and exercises per-user setup, reinstall/update, registration, binary integrity and standard uninstallation on a disposable Windows Server 2025 runner. Download the **AppDepot-Desktop-Windows-x64-RC** workflow artifact for evaluation.
 
-The first public Windows candidate should use a distinct prerelease tag such as `windows-v0.1.3-rc.1` on the exact verified main commit, marked prerelease and explicitly excluded from Latest. Attach only setup and the corresponding checksum manifest, plus the standalone executable if desired. Publish after owner approval and Windows 11 acceptance. The Linux AppImage release workflow uses `v*` tags and the existing stable release remains separate.
+When a dedicated disposable Windows 10 x64 workstation runner is available, give it the `app-depot-windows-10` label and manually dispatch **Client CI** on `main` with `windows_10_smoke` enabled. That job consumes the exact setup artifact produced by the workflow, verifies the OS and exercises the same install, reinstall and uninstall smoke checks. It needs no build tools on the test machine. Keep personal PCs off the runner pool.
+
+The first public Windows candidate should use a distinct prerelease tag such as `windows-v0.1.3-rc.2` on the exact verified main commit, marked prerelease and explicitly excluded from Latest. Attach only setup and the corresponding checksum manifest, plus the standalone executable if desired. Publish after owner approval and acceptance. The Linux AppImage release workflow uses `v*` tags and the existing stable release remains separate.
+
+## Short Windows 10 hardware acceptance
+
+On the personal PC, check the setup hash, install normally, launch from Start, connect to TrueNAS as Guest and confirm the catalog renders. Close and reopen Desktop to confirm the profile persists. Optionally remove Desktop through Windows Settings. Preserve library data and other applications. This checks basic compatibility. Use the Windows 11 development VM or disposable CI systems for File/Tree, Play, managed Uninstall, recovery and stress tests.
 
 ## Clean Windows 11 acceptance
 
