@@ -147,15 +147,15 @@ pub enum Command {
 }
 
 pub(crate) const WINDOWS_INSTALL_ONLY: bool = cfg!(windows);
-pub(crate) const WINDOWS_INSTALL_NOTICE: &str = "Windows supports File and Tree installation and native Play. Repair and removal are unavailable.";
+pub(crate) const WINDOWS_INSTALL_NOTICE: &str = "Windows supports File and Tree installation, native Play and removal of verified working copies. Repair is unavailable.";
 
 impl Command {
     fn blocked_on_windows(&self) -> bool {
         match self {
             Self::Download { kind, .. } => !matches!(kind.as_str(), "File" | "Tree"),
+            Self::RemoveInstallation { complete, .. } => *complete,
             Self::Reveal(_)
             | Self::StorageUsage
-            | Self::RemoveInstallation { .. }
             | Self::RepairInstallation(_)
             | Self::RemoveArtifact { .. }
             | Self::RemoveApp { .. }

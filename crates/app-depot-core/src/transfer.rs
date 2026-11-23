@@ -1319,8 +1319,12 @@ mod tests {
         };
         if let Some(root) = std::env::var_os(ROOT) {
             let mut lib = Library::open(paths(Path::new(&root))).unwrap();
-            lib.quarantine_windows_installation(&std::env::var(ID).unwrap())
-                .unwrap();
+            let id = std::env::var(ID).unwrap();
+            if std::env::var_os("APP_DEPOT_CLEANUP_CRASH").is_some() {
+                lib.remove_installation(&id, false).unwrap();
+            } else {
+                lib.quarantine_windows_installation(&id).unwrap();
+            }
             panic!("quarantine worker did not pause");
         }
         for (boundary, conflict) in [
@@ -1329,6 +1333,7 @@ mod tests {
             ("before-phase-update", ""),
             ("after-intent", "destination"),
             ("after-rename", "replacement"),
+            ("during-cleanup", ""),
         ] {
             let mut f = fixture(BYTES.to_vec(), "normal");
             let job = queue(&mut f);
@@ -1367,12 +1372,15 @@ mod tests {
                 .unwrap();
             let unrelated = item.path.with_file_name("unrelated");
             fs::write(&unrelated, b"keep").unwrap();
-            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", "transfer::tests::windows_file_quarantine_recovers_journal_after_process_termination"])
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command.args(["--exact", "transfer::tests::windows_file_quarantine_recovers_journal_after_process_termination"])
                 .env(ROOT, f._root.path())
                 .env(ID, &item.id)
-                .env("APP_DEPOT_REMOVAL_BOUNDARY", boundary)
-                .spawn().unwrap();
+                .env("APP_DEPOT_REMOVAL_BOUNDARY", boundary);
+            if boundary == "during-cleanup" {
+                command.env("APP_DEPOT_CLEANUP_CRASH", "1");
+            }
+            let mut child = command.spawn().unwrap();
             let ready = item.path.with_file_name(".removal-test-ready");
             let deadline = std::time::Instant::now() + Duration::from_secs(15);
             while !ready.exists() && std::time::Instant::now() < deadline {
@@ -1399,11 +1407,37 @@ mod tests {
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .unwrap();
-            assert_eq!(phase, "Intent");
+            assert_eq!(
+                phase,
+                if boundary == "during-cleanup" {
+                    "Quarantined"
+                } else {
+                    "Intent"
+                }
+            );
             assert_eq!(item.path.exists(), boundary == "after-intent");
             let quarantine = item
                 .path
                 .with_file_name(format!(".app-depot-removal-{transaction_id}"));
+            if boundary == "during-cleanup" {
+                for _ in 0..2 {
+                    let lib = Library::open(paths(f._root.path())).unwrap();
+                    assert_eq!(lib.installation(&item.id).unwrap().state, "Removed");
+                    assert!(!quarantine.exists());
+                    let remaining: i64 = lib
+                        .conn
+                        .query_row("SELECT count(*) FROM windows_removals", [], |row| {
+                            row.get(0)
+                        })
+                        .unwrap();
+                    assert_eq!(remaining, 0);
+                    let files = lib.verified_files(Some(&f.profile)).unwrap();
+                    assert_eq!(files.len(), 1);
+                    assert_eq!(fs::read(&files[0].path).unwrap(), BYTES);
+                    assert_eq!(fs::read(&unrelated).unwrap(), b"keep");
+                }
+                continue;
+            }
             match conflict {
                 "destination" => fs::write(&quarantine, b"foreign").unwrap(),
                 "replacement" => {
@@ -1504,14 +1538,25 @@ mod tests {
                 .contains("unexpected")
         );
         fs::remove_dir(unknown).unwrap();
+        let stream = item.path.join("payload:unowned");
+        fs::write(&stream, b"keep stream").unwrap();
         assert!(
             library
                 .remove_installation(&item.id, false)
                 .unwrap_err()
                 .to_string()
-                .contains("preflight passed")
+                .contains("data stream")
         );
+        assert_eq!(fs::read(&stream).unwrap(), b"keep stream");
+        fs::remove_file(stream).unwrap();
         assert_eq!(library.installation(&item.id).unwrap().state, "Ready");
+        fs::create_dir_all(&item.userdata).unwrap();
+        fs::write(item.userdata.join("save"), b"keep").unwrap();
+        library.remove_installation(&item.id, false).unwrap();
+        assert!(!item.path.exists());
+        assert_eq!(library.installation(&item.id).unwrap().state, "Removed");
+        assert_eq!(fs::read(item.userdata.join("save")).unwrap(), b"keep");
+        assert_eq!(library.install_windows_file(&job.id).unwrap().id, item.id);
         assert_eq!(fs::read(&payload).unwrap(), bytes);
         assert_eq!(
             hash_file(

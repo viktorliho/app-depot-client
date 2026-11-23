@@ -686,6 +686,126 @@ fn open_installed_file(directory: &File, name: &str) -> io::Result<File> {
 
 pub(crate) type RemovalIdentities = std::collections::BTreeMap<String, (u64, [u8; 16])>;
 
+/// Validate the entire surviving quarantine before deleting any entry.
+pub(crate) fn cleanup_removal(path: &Path, expected: &RemovalIdentities) -> io::Result<()> {
+    fn scan(
+        path: &Path,
+        relative: &str,
+        directory: File,
+        expected: &RemovalIdentities,
+        handles: &mut Vec<File>,
+    ) -> io::Result<()> {
+        check_identity(&directory, relative, expected)?;
+        require_case_insensitive(&directory)?;
+        for entry in std::fs::read_dir(path)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let component = name
+                .to_str()
+                .ok_or_else(|| invalid("non-Unicode quarantine name"))?;
+            let key = if relative == "." {
+                component.to_owned()
+            } else {
+                format!("{relative}/{component}")
+            };
+            if !expected.contains_key(&key) {
+                return Err(invalid("unexpected quarantine entry; contents retained"));
+            }
+            if entry.file_type()?.is_dir() {
+                let child = open_removal_directory(&directory, &name)?;
+                scan(&entry.path(), &key, child, expected, handles)?;
+            } else {
+                let child = open_removal_file(&directory, &name)?;
+                check_identity(&child, &key, expected)?;
+                handles.push(child);
+            }
+        }
+        handles.push(directory);
+        Ok(())
+    }
+
+    fn check_identity(file: &File, key: &str, expected: &RemovalIdentities) -> io::Result<()> {
+        if expected.get(key) != Some(&file_identity(file)?) {
+            return Err(invalid("quarantine object identity mismatch"));
+        }
+        Ok(())
+    }
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| invalid("missing quarantine parent"))?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| invalid("missing quarantine name"))?;
+    let chain = directory_chain(parent, false)?;
+    let directory = chain.last().unwrap();
+    if expected.get("..") != Some(&file_identity(directory)?) {
+        return Err(invalid("quarantine parent identity mismatch"));
+    }
+    let root = match open_removal_directory(directory, name) {
+        Ok(root) => root,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let mut handles = Vec::new();
+    scan(path, ".", root, expected, &mut handles)?;
+    for file in handles {
+        delete_open_file(file)?;
+        #[cfg(test)]
+        if std::env::var_os("APP_DEPOT_CLEANUP_CRASH").is_some() {
+            let signal = parent.join(".removal-test-ready");
+            File::create_new(signal)?;
+            loop {
+                std::thread::park();
+            }
+        }
+    }
+    Ok(())
+}
+
+fn reject_named_streams(file: &File) -> io::Result<()> {
+    use windows_sys::Win32::{
+        Foundation::ERROR_HANDLE_EOF,
+        Storage::FileSystem::{FILE_STREAM_INFO, FileStreamInfo},
+    };
+    let mut buffer = [0u64; 128];
+    // SAFETY: the buffer is writable, sized and 8-byte aligned, and the handle is live.
+    let ok = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle(),
+            FileStreamInfo,
+            buffer.as_mut_ptr().cast(),
+            size_of_val(&buffer) as u32,
+        )
+    };
+    if ok == 0 {
+        let error = io::Error::last_os_error();
+        return if error.raw_os_error() == Some(ERROR_HANDLE_EOF as i32) {
+            Ok(())
+        } else {
+            Err(error)
+        };
+    }
+    // SAFETY: the initialized buffer is aligned and larger than a complete header.
+    let info = unsafe { &*buffer.as_ptr().cast::<FILE_STREAM_INFO>() };
+    let name = [58u16, 58, 36, 68, 65, 84, 65]; // ::$DATA
+    let offset = offset_of!(FILE_STREAM_INFO, StreamName);
+    // SAFETY: the fixed range is within the initialized and aligned buffer.
+    let stream = unsafe {
+        std::slice::from_raw_parts(
+            buffer.as_ptr().cast::<u8>().add(offset).cast::<u16>(),
+            name.len(),
+        )
+    };
+    if info.NextEntryOffset != 0
+        || info.StreamNameLength as usize != size_of_val(&name)
+        || stream != name
+    {
+        return Err(invalid("unexpected NTFS data stream; quarantine retained"));
+    }
+    Ok(())
+}
+
 pub(crate) struct RemovalInspection {
     chain: Vec<File>,
     root: File,
@@ -775,11 +895,14 @@ fn open_removal_file(parent: &File, name: &OsStr) -> io::Result<File> {
         return Err(invalid("reparse point in managed installation"));
     }
     require_single_link(&file)?;
+    reject_named_streams(&file)?;
     Ok(file)
 }
 
 fn open_removal_directory(parent: &File, name: &OsStr) -> io::Result<File> {
-    directory_child(parent, name, false, DIRECTORY_ACCESS | DELETE)
+    let dir = directory_child(parent, name, false, DIRECTORY_ACCESS | DELETE)?;
+    reject_named_streams(&dir)?;
+    Ok(dir)
 }
 
 /// Constructs a new tree under an exclusive directory handle and publishes it by that handle.

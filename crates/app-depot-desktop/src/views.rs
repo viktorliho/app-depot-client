@@ -1226,23 +1226,44 @@ impl Desktop {
         });
     }
     #[cfg(windows)]
-    fn windows_install_actions(&self, ui: &mut egui::Ui, association: &str, artifact: &str) {
-        if let Some(item) = self.snapshot.installations.iter().find(|item| {
-            self.active.as_ref() == Some(&item.profile_id)
-                && item.association_id == association
-                && item.artifact_id == artifact
-                && item.state == "Ready"
-        }) {
+    fn windows_install_actions(&mut self, ui: &mut egui::Ui, association: &str, artifact: &str) {
+        if let Some(item) = self
+            .snapshot
+            .installations
+            .iter()
+            .find(|item| {
+                self.active.as_ref() == Some(&item.profile_id)
+                    && item.association_id == association
+                    && item.artifact_id == artifact
+                    && matches!(item.state.as_str(), "Ready" | "Removing")
+            })
+            .cloned()
+        {
             ui.horizontal(|ui| {
-                ui.label("Installed");
+                let ready = item.state == "Ready";
+                ui.label(if ready {
+                    "Installed"
+                } else {
+                    "Removal pending"
+                });
+                if let Some(phase) = self.local_operations.get(&item.id) {
+                    ui.label(phase);
+                    return;
+                }
+                if ready && ui.button("Verify").clicked() {
+                    self.send(Command::VerifyInstallation(item.id.clone()));
+                }
                 if ui
-                    .add_enabled(
-                        !self.local_operations.contains_key(&item.id),
-                        egui::Button::new("Verify"),
-                    )
+                    .button(if ready {
+                        "Uninstall…"
+                    } else {
+                        "Retry removal…"
+                    })
                     .clicked()
                 {
-                    self.send(Command::VerifyInstallation(item.id.clone()));
+                    self.remove_target =
+                        Some((item.id.clone(), false, "Windows working copy".into()));
+                    self.confirmation = Some(Confirmation::RemoveInstallation);
                 }
             });
         } else if let Some(job) = self.snapshot.jobs.iter().find(|job| {
@@ -2333,7 +2354,9 @@ impl Desktop {
             }
             Confirmation::RemoveToken => "Remove this server's saved or session token?",
             Confirmation::RemoveInstallation => {
-                if self
+                if cfg!(windows) {
+                    "Uninstall this working copy? Verified downloads and managed saves are kept. Running, modified or unverified installations are refused."
+                } else if self
                     .remove_target
                     .as_ref()
                     .is_some_and(|(_, complete, _)| *complete)

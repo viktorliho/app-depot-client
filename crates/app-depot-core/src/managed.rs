@@ -1169,10 +1169,7 @@ impl Library {
         if complete {
             return Err(invalid("complete Windows removal is unavailable"));
         }
-        self.check_windows_removal(id)?;
-        Err(invalid(
-            "Windows removal remains unavailable; the preflight passed",
-        ))
+        self.remove_windows_runtime(id)
     }
 
     #[cfg(windows)]
@@ -1180,8 +1177,9 @@ impl Library {
         &mut self,
         id: &str,
         complete: bool,
-        _observer: &mut dyn FnMut(&str),
+        observer: &mut dyn FnMut(&str),
     ) -> Result<(), LibraryError> {
+        observer("Checking installation and removing owned files");
         self.remove_installation(id, complete)
     }
 

@@ -17,6 +17,10 @@ CREATE TABLE IF NOT EXISTS windows_removals (
     identities TEXT NOT NULL,
     phase TEXT NOT NULL CHECK(phase IN ('Intent', 'Quarantined')),
     last_error TEXT
+);
+CREATE TABLE IF NOT EXISTS windows_removal_cleanup (
+    installation_id TEXT PRIMARY KEY REFERENCES windows_removals(installation_id) ON DELETE CASCADE,
+    started INTEGER NOT NULL DEFAULT 0 CHECK(started IN (0, 1))
 );";
 
 fn present(path: &Path) -> io::Result<bool> {
@@ -73,6 +77,16 @@ impl Library {
                 return Ok(item);
             }
             Some(item) if item.state == "Preparing" => item.id,
+            Some(item) if item.state == "Removed" => {
+                if present(&item.path)? {
+                    return Err(invalid("a foreign object occupies the installation path"));
+                }
+                self.conn.execute(
+                    "UPDATE installations SET state='Preparing',last_error=NULL,updated_at=?2 WHERE id=?1 AND state='Removed'",
+                    params![item.id, now()?],
+                )?;
+                item.id
+            }
             Some(_) => return Err(invalid("installation must be inspected before retry")),
             None => {
                 let (app, release): (String, String) = self.conn.query_row(
@@ -213,6 +227,33 @@ impl Library {
     /// The public Desktop and uninstall entry points remain gated.
     pub fn quarantine_windows_installation(&mut self, id: &str) -> Result<(), LibraryError> {
         let _slot = self.lock_download_slot()?;
+        self.begin_windows_removal(id, false)
+    }
+
+    pub(crate) fn remove_windows_runtime(&mut self, id: &str) -> Result<(), LibraryError> {
+        let _slot = self.lock_download_slot()?;
+        let item = self.installation(id)?;
+        if item.state == "Removed" {
+            return Ok(());
+        }
+        if item.state == "Ready" {
+            self.begin_windows_removal(id, true)?;
+        } else if item.state == "Removing" {
+            self.conn.execute(
+                "INSERT OR IGNORE INTO windows_removal_cleanup(installation_id) VALUES (?1)",
+                [id],
+            )?;
+        } else {
+            return Err(invalid("installation is not ready for removal"));
+        }
+        self.continue_windows_removal(id)
+    }
+
+    fn begin_windows_removal(
+        &mut self,
+        id: &str,
+        cleanup_requested: bool,
+    ) -> Result<(), LibraryError> {
         let (item, inspection) = self.prepare_windows_quarantine(id)?;
         let transaction_id = Uuid::new_v4();
         let name = format!(".app-depot-removal-{transaction_id}");
@@ -229,6 +270,12 @@ impl Library {
             "INSERT INTO windows_removals(installation_id,transaction_id,identities,phase) VALUES (?1,?2,?3,'Intent')",
             params![id, transaction_id.to_string(), identities],
         )?;
+        if cleanup_requested {
+            transaction.execute(
+                "INSERT INTO windows_removal_cleanup(installation_id) VALUES (?1)",
+                [id],
+            )?;
+        }
         transaction.commit()?;
         #[cfg(test)]
         pause_removal(&item, "after-intent");
@@ -265,9 +312,9 @@ impl Library {
         Ok(())
     }
 
-    pub(crate) fn recover_windows_quarantines(&self) -> Result<(), LibraryError> {
+    pub(crate) fn recover_windows_quarantines(&mut self) -> Result<(), LibraryError> {
         let pending: bool = self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM windows_removals WHERE phase='Intent')",
+            "SELECT EXISTS(SELECT 1 FROM windows_removals WHERE phase='Intent' OR installation_id IN (SELECT installation_id FROM windows_removal_cleanup))",
             [],
             |row| row.get(0),
         )?;
@@ -283,26 +330,75 @@ impl Library {
             }
             Err(error) => return Err(error),
         };
-        let mut stmt = self.conn.prepare(
-            "SELECT installation_id, transaction_id, identities FROM windows_removals WHERE phase='Intent'",
-        )?;
-        let rows = stmt
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        for (id, transaction_id, identities) in rows {
-            if let Err(error) = self.resume_windows_quarantine(&id, &transaction_id, &identities) {
+        let ids = {
+            let mut stmt = self.conn.prepare(
+                "SELECT installation_id FROM windows_removals WHERE phase='Intent' OR installation_id IN (SELECT installation_id FROM windows_removal_cleanup)",
+            )?;
+            stmt.query_map([], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        for id in ids {
+            if let Err(error) = self.continue_windows_removal(&id) {
                 self.conn.execute(
-                    "UPDATE windows_removals SET last_error=?2 WHERE installation_id=?1 AND phase='Intent'",
+                    "UPDATE windows_removals SET last_error=?2 WHERE installation_id=?1",
                     params![id, error.to_string()],
                 )?;
             }
         }
+        Ok(())
+    }
+
+    fn continue_windows_removal(&mut self, id: &str) -> Result<(), LibraryError> {
+        use crate::windows_process::ProcessState;
+        let (nonce, identities, phase, started): (String, String, String, Option<bool>) =
+            self.conn.query_row(
+                "SELECT r.transaction_id,r.identities,r.phase,c.started FROM windows_removals r LEFT JOIN windows_removal_cleanup c USING(installation_id) WHERE r.installation_id=?1",
+                [id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
+            )?;
+        if phase == "Intent" {
+            self.resume_windows_quarantine(id, &nonce, &identities)?;
+        }
+        let Some(started) = started else {
+            return Ok(());
+        };
+        let item = self.installation(id)?;
+        if item.state != "Removing"
+            || self.windows_installation_occupancy(id)? != ProcessState::Idle
+        {
+            return Err(invalid("Windows cleanup requires confirmed idle removal"));
+        }
+        if present(&item.path)? {
+            return Err(invalid("Windows removal source still exists"));
+        }
+        let nonce = Uuid::parse_str(&nonce).map_err(io::Error::other)?;
+        let path = item
+            .path
+            .with_file_name(format!(".app-depot-removal-{nonce}"));
+        let expected: windows_fs::RemovalIdentities =
+            serde_json::from_str(&identities).map_err(io::Error::other)?;
+        if !started {
+            if self.inspect_windows_quarantine(&item, &path)?.identities != expected {
+                return Err(invalid("Windows removal identity mismatch"));
+            }
+            self.conn.execute(
+                "UPDATE windows_removal_cleanup SET started=1 WHERE installation_id=?1",
+                [id],
+            )?;
+        }
+        windows_fs::cleanup_removal(&path, &expected)?;
+        windows_fs::sync_directory(path.parent().unwrap())?;
+        let transaction = self.conn.transaction()?;
+        if transaction.execute(
+            "UPDATE installations SET state='Removed',last_error=NULL,updated_at=?2 WHERE id=?1 AND state='Removing'",
+            params![id, now()?],
+        )? != 1 {
+            return Err(invalid("installation left Removing before finalization"));
+        }
+        transaction.execute(
+            "DELETE FROM windows_removals WHERE installation_id=?1",
+            [id],
+        )?;
+        transaction.commit()?;
         Ok(())
     }
 

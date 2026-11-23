@@ -1750,6 +1750,14 @@ mod tests {
             .with_file_name(format!(".app-depot-removal-{transaction}"));
         crate::windows_fs::verify_tree(&quarantine.join("payload"), &entries).unwrap();
         assert!(quarantine.join("payload/empty/nested").is_dir());
+        library.remove_installation(&item.id, false).unwrap();
+        assert!(!quarantine.exists());
+        assert_eq!(library.installation(&item.id).unwrap().state, "Removed");
+        assert_eq!(
+            library.install_windows_artifact(&job.id).unwrap().id,
+            item.id
+        );
+        library.verify_windows_installation(&item.id).unwrap();
         assert_eq!(library.verified_trees(None).unwrap().len(), 1);
         assert_eq!(library.job(&job.id).unwrap().state, "Completed");
         for entry in entries {
