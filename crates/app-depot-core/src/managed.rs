@@ -2251,8 +2251,8 @@ mod tests {
         assert_eq!(preview.download_bytes, 24);
         // Reopen after the durable batch commit, before any filesystem work.
         {
-            let _lifecycle = lib.lifecycle_lock().unwrap();
-            let _download = lib.lock_download_slot().unwrap();
+            let lifecycle = lib.lifecycle_lock().unwrap();
+            let download = lib.lock_download_slot().unwrap();
             assert_eq!(
                 lib.journal_uninstall(first, "app", &preview.revision)
                     .unwrap()
@@ -2267,6 +2267,11 @@ mod tests {
                     )
                     .is_err()
             );
+            // A parallel fixture can fork between acquiring and dropping these locks.
+            // Unlock the shared file descriptions explicitly so recovery does not
+            // depend on that child's close-on-exec running before this reopen.
+            fs2::FileExt::unlock(&download).unwrap();
+            fs2::FileExt::unlock(&lifecycle).unwrap();
         }
         assert!(path.exists());
         let paths = lib.paths.clone();
