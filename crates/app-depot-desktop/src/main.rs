@@ -510,6 +510,9 @@ fn library_paths() -> Result<LibraryPaths, String> {
 }
 fn main() -> eframe::Result {
     #[cfg(windows)]
+    let _installation_guard = app_depot_core::windows_process::desktop_installation_guard()
+        .map_err(|error| eframe::Error::AppCreation(Box::new(error)))?;
+    #[cfg(windows)]
     app_depot_core::windows_process::supervisor_entrypoint();
     if env::args_os()
         .nth(1)

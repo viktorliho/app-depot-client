@@ -14,12 +14,30 @@ use std::{
 use windows_sys::Win32::{
     Foundation::{ERROR_INVALID_PARAMETER, FILETIME, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT},
     System::Threading::{
-        CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, GetExitCodeProcess,
-        GetProcessTimes, INFINITE, OpenProcess, PROCESS_INFORMATION,
+        CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateMutexW, CreateProcessW,
+        GetExitCodeProcess, GetProcessTimes, INFINITE, OpenProcess, PROCESS_INFORMATION,
         PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, ResumeThread, STARTUPINFOW,
         TerminateProcess, WaitForSingleObject,
     },
 };
+
+/// Keeps Inno Setup from replacing the Desktop executable while it hosts a UI or watcher.
+pub fn desktop_installation_guard() -> io::Result<OwnedHandle> {
+    use windows_sys::w;
+    // SAFETY: the static name is NUL-terminated. No ownership or inheritance is requested.
+    let handle = unsafe {
+        CreateMutexW(
+            null(),
+            0,
+            w!("Local\\io.github.viktorliho.AppDepot.Desktop"),
+        )
+    };
+    if handle.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: a successful call returns a fresh owned handle.
+    Ok(unsafe { OwnedHandle::from_raw_handle(handle) })
+}
 
 /// Run the process watcher before CLI parsing or Desktop initialization.
 pub fn supervisor_entrypoint() {

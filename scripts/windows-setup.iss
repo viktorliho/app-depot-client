@@ -20,6 +20,7 @@ WizardStyle=modern
 Compression=lzma2
 SolidCompression=yes
 CloseApplications=no
+AppMutex=Local\io.github.viktorliho.AppDepot.Desktop
 
 [Tasks]
 Name: "desktopicon"; Description: "Create a desktop shortcut"; Flags: unchecked

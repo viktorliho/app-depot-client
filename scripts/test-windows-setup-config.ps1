@@ -7,6 +7,7 @@ $expected = @{
     ArchitecturesAllowed = 'x64os'
     ArchitecturesInstallIn64BitMode = 'x64os'
     PrivilegesRequired = 'lowest'
+    AppMutex = 'Local\io.github.viktorliho.AppDepot.Desktop'
 }
 foreach ($key in $expected.Keys) {
     $matches = [regex]::Matches($setup, "(?mi)^[ \t]*$key[ \t]*=[ \t]*([^\r\n]+)")
