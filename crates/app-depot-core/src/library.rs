@@ -437,6 +437,8 @@ impl Library {
         } else if version != SCHEMA_VERSION {
             return Err(invalid("library schema migration is required"));
         }
+        #[cfg(windows)]
+        conn.execute_batch(crate::windows_install::REMOVAL_SCHEMA)?;
         let stored: Option<String> = conn
             .query_row(
                 "SELECT value FROM library_meta WHERE key='library_id'",
@@ -468,6 +470,8 @@ impl Library {
             _access_lock: access,
         };
         library.recover_removals()?;
+        #[cfg(windows)]
+        library.recover_windows_quarantines()?;
         Ok(library)
     }
 

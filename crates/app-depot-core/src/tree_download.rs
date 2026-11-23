@@ -1707,6 +1707,61 @@ mod tests {
     }
     #[cfg(windows)]
     #[test]
+    fn windows_tree_quarantine_preserves_inventory_and_cas() {
+        let (_root, mut library, job, entries) = fixture();
+        library.complete_tree(&job, &entries).unwrap();
+        let item = library.install_windows_artifact(&job.id).unwrap();
+        library
+            .conn
+            .execute(
+                "UPDATE installations SET process_start=?2 WHERE id=?1",
+                params![item.id, format!("windows:sv1:exited:{}:0", Uuid::new_v4())],
+            )
+            .unwrap();
+        let locked = {
+            use std::os::windows::fs::OpenOptionsExt;
+            use windows_sys::Win32::Storage::FileSystem::{
+                FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_READ, FILE_SHARE_WRITE,
+            };
+            fs::OpenOptions::new()
+                .read(true)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+                .open(item.path.join("payload/empty/nested"))
+                .unwrap()
+        };
+        assert!(library.quarantine_windows_installation(&item.id).is_err());
+        assert_eq!(library.installation(&item.id).unwrap().state, "Ready");
+        drop(locked);
+        library.quarantine_windows_installation(&item.id).unwrap();
+        let (transaction, phase): (String, String) = library
+            .conn
+            .query_row(
+                "SELECT transaction_id,phase FROM windows_removals WHERE installation_id=?1",
+                [&item.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(phase, "Quarantined");
+        assert_eq!(library.installation(&item.id).unwrap().state, "Removing");
+        assert!(!item.path.exists());
+        let quarantine = item
+            .path
+            .with_file_name(format!(".app-depot-removal-{transaction}"));
+        crate::windows_fs::verify_tree(&quarantine.join("payload"), &entries).unwrap();
+        assert!(quarantine.join("payload/empty/nested").is_dir());
+        assert_eq!(library.verified_trees(None).unwrap().len(), 1);
+        assert_eq!(library.job(&job.id).unwrap().state, "Completed");
+        for entry in entries {
+            if let InventoryEntry::File { size, sha256, .. } = entry {
+                let object = library.object(&format!("adfile:sha256:{sha256}")).unwrap();
+                assert_eq!(crate::transfer::hash_file(&object, size).unwrap(), sha256);
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn windows_tree_activation_rollback_and_offline_inventory_errors() {
         let (_root, mut library, job, entries) = fixture();
         library.complete_tree(&job, &entries).unwrap();

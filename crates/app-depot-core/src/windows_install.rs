@@ -7,8 +7,36 @@ use crate::{
     windows_fs,
 };
 use rusqlite::{OptionalExtension, params};
-use std::{fs::File, io};
+use std::{ffi::OsStr, fs::File, io, path::Path};
 use uuid::Uuid;
+
+pub(crate) const REMOVAL_SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS windows_removals (
+    installation_id TEXT PRIMARY KEY REFERENCES installations(id) ON DELETE RESTRICT,
+    transaction_id TEXT NOT NULL UNIQUE,
+    identities TEXT NOT NULL,
+    phase TEXT NOT NULL CHECK(phase IN ('Intent', 'Quarantined')),
+    last_error TEXT
+);";
+
+fn present(path: &Path) -> io::Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(test)]
+fn pause_removal(item: &Installation, boundary: &str) {
+    if std::env::var("APP_DEPOT_REMOVAL_BOUNDARY").as_deref() == Ok(boundary) {
+        let signal = item.path.with_file_name(".removal-test-ready");
+        File::create_new(signal).unwrap();
+        loop {
+            std::thread::park();
+        }
+    }
+}
 
 fn invalid(message: &str) -> LibraryError {
     LibraryError::Invalid(message.into())
@@ -133,6 +161,14 @@ impl Library {
     /// Success only validates the current snapshot of managed occupancy and layout.
     pub fn check_windows_removal(&self, id: &str) -> Result<(), LibraryError> {
         let _slot = self.lock_download_slot()?;
+        self.prepare_windows_quarantine(id)?;
+        Ok(())
+    }
+
+    fn prepare_windows_quarantine(
+        &self,
+        id: &str,
+    ) -> Result<(Installation, windows_fs::RemovalInspection), LibraryError> {
         let item = self.installation(id)?;
         if item.state != "Ready" {
             return Err(invalid("installation is not ready"));
@@ -149,20 +185,163 @@ impl Library {
             }
             ProcessState::Idle => {}
         }
-        let job = self.completed_install_job(&item)?;
+        let inspection = self.inspect_windows_quarantine(&item, &item.path)?;
+        Ok((item, inspection))
+    }
+
+    fn inspect_windows_quarantine(
+        &self,
+        item: &Installation,
+        path: &Path,
+    ) -> Result<windows_fs::RemovalInspection, LibraryError> {
+        let job = self.completed_install_job(item)?;
         let payload = self.verified_windows_payload(&job)?;
-        match &payload {
+        Ok(match &payload {
             WindowsPayload::File(digest) => windows_fs::inspect_removal_layout(
-                &item.path,
-                id,
+                path,
+                &item.id,
                 |file| verify(file, job.expected_size, digest),
                 None,
             )?,
             WindowsPayload::Tree(entries) => {
-                windows_fs::inspect_removal_layout(&item.path, id, |_| Ok(()), Some(entries))?
+                windows_fs::inspect_removal_layout(path, &item.id, |_| Ok(()), Some(entries))?
+            }
+        })
+    }
+
+    /// Isolate a verified Windows runtime without deleting it or releasing content references.
+    /// The public Desktop and uninstall entry points remain gated.
+    pub fn quarantine_windows_installation(&mut self, id: &str) -> Result<(), LibraryError> {
+        let _slot = self.lock_download_slot()?;
+        let (item, inspection) = self.prepare_windows_quarantine(id)?;
+        let transaction_id = Uuid::new_v4();
+        let name = format!(".app-depot-removal-{transaction_id}");
+        let identities = serde_json::to_string(&inspection.identities).map_err(io::Error::other)?;
+        let transaction = self.conn.transaction()?;
+        if transaction.execute(
+            "UPDATE installations SET state='Removing',updated_at=?2 WHERE id=?1 AND state='Ready'",
+            params![id, now()?],
+        )? != 1
+        {
+            return Err(invalid("installation left Ready before removal intent"));
+        }
+        transaction.execute(
+            "INSERT INTO windows_removals(installation_id,transaction_id,identities,phase) VALUES (?1,?2,?3,'Intent')",
+            params![id, transaction_id.to_string(), identities],
+        )?;
+        transaction.commit()?;
+        #[cfg(test)]
+        pause_removal(&item, "after-intent");
+        inspection.quarantine(OsStr::new(&name))?;
+        #[cfg(test)]
+        pause_removal(&item, "after-rename");
+        drop(inspection);
+        self.record_windows_quarantine(&item, &name, &identities)
+    }
+
+    fn record_windows_quarantine(
+        &self,
+        item: &Installation,
+        name: &str,
+        identities: &str,
+    ) -> Result<(), LibraryError> {
+        if present(&item.path)? {
+            return Err(invalid("Windows removal source still exists"));
+        }
+        let path = item.path.with_file_name(name);
+        let inspection = self.inspect_windows_quarantine(item, &path)?;
+        let expected: windows_fs::RemovalIdentities =
+            serde_json::from_str(identities).map_err(io::Error::other)?;
+        if inspection.identities != expected {
+            return Err(invalid("Windows removal identity mismatch"));
+        }
+        windows_fs::sync_directory(path.parent().unwrap())?;
+        #[cfg(test)]
+        pause_removal(item, "before-phase-update");
+        self.conn.execute(
+            "UPDATE windows_removals SET phase='Quarantined',last_error=NULL WHERE installation_id=?1 AND phase='Intent'",
+            [&item.id],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn recover_windows_quarantines(&self) -> Result<(), LibraryError> {
+        let pending: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM windows_removals WHERE phase='Intent')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !pending {
+            return Ok(());
+        }
+        let _slot = match self.lock_download_slot() {
+            Ok(slot) => slot,
+            Err(LibraryError::Invalid(message))
+                if message == "another application download holds the library slot" =>
+            {
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        let mut stmt = self.conn.prepare(
+            "SELECT installation_id, transaction_id, identities FROM windows_removals WHERE phase='Intent'",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        for (id, transaction_id, identities) in rows {
+            if let Err(error) = self.resume_windows_quarantine(&id, &transaction_id, &identities) {
+                self.conn.execute(
+                    "UPDATE windows_removals SET last_error=?2 WHERE installation_id=?1 AND phase='Intent'",
+                    params![id, error.to_string()],
+                )?;
             }
         }
         Ok(())
+    }
+
+    fn resume_windows_quarantine(
+        &self,
+        id: &str,
+        transaction_id: &str,
+        identities: &str,
+    ) -> Result<(), LibraryError> {
+        use crate::windows_process::ProcessState;
+        let item = self.installation(id)?;
+        if item.state != "Removing"
+            || self.windows_installation_occupancy(id)? != ProcessState::Idle
+        {
+            return Err(invalid(
+                "Windows removal is not in a confirmed idle Removing state",
+            ));
+        }
+        let id = Uuid::parse_str(transaction_id).map_err(io::Error::other)?;
+        let name = format!(".app-depot-removal-{id}");
+        let quarantine = item.path.with_file_name(&name);
+        match (present(&item.path)?, present(&quarantine)?) {
+            (true, false) => {
+                let inspection = self.inspect_windows_quarantine(&item, &item.path)?;
+                let expected: windows_fs::RemovalIdentities =
+                    serde_json::from_str(identities).map_err(io::Error::other)?;
+                if inspection.identities != expected {
+                    return Err(invalid("Windows removal identity mismatch"));
+                }
+                inspection.quarantine(OsStr::new(&name))?;
+            }
+            (false, true) => {}
+            _ => {
+                return Err(invalid(
+                    "Windows removal source and quarantine locations conflict",
+                ));
+            }
+        }
+        self.record_windows_quarantine(&item, &name, identities)
     }
 
     fn verified_windows_payload<'a>(

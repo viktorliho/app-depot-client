@@ -1308,6 +1308,159 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn windows_file_quarantine_recovers_journal_after_process_termination() {
+        use crate::library::LibraryPaths;
+        const ROOT: &str = "APP_DEPOT_REMOVAL_ROOT";
+        const ID: &str = "APP_DEPOT_REMOVAL_ID";
+        const BYTES: &[u8] = b"quarantine fixture";
+        let paths = |root: &Path| LibraryPaths {
+            metadata: root.join("data"),
+            content: root.join("content"),
+        };
+        if let Some(root) = std::env::var_os(ROOT) {
+            let mut lib = Library::open(paths(Path::new(&root))).unwrap();
+            lib.quarantine_windows_installation(&std::env::var(ID).unwrap())
+                .unwrap();
+            panic!("quarantine worker did not pause");
+        }
+        for (boundary, conflict) in [
+            ("after-intent", ""),
+            ("after-rename", ""),
+            ("before-phase-update", ""),
+            ("after-intent", "destination"),
+            ("after-rename", "replacement"),
+        ] {
+            let mut f = fixture(BYTES.to_vec(), "normal");
+            let job = queue(&mut f);
+            f.library.run_file_job(&f.client, &job.id, None).unwrap();
+            let item = f.library.install_windows_file(&job.id).unwrap();
+            assert!(
+                f.library
+                    .quarantine_windows_installation(&item.id)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("uncertain")
+            );
+            // SAFETY: GetCurrentProcess returns a valid pseudo-handle to this test process.
+            let process = unsafe { windows_sys::Win32::System::Threading::GetCurrentProcess() };
+            let start = crate::windows_process::creation_time(process).unwrap();
+            f.library
+                .conn
+                .execute(
+                    "UPDATE installations SET process_id=?2, process_start=?3 WHERE id=?1",
+                    params![item.id, std::process::id(), format!("windows:{start}")],
+                )
+                .unwrap();
+            assert!(
+                f.library
+                    .quarantine_windows_installation(&item.id)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("still running")
+            );
+            f.library
+                .conn
+                .execute(
+                    "UPDATE installations SET process_id=NULL,process_start=?2 WHERE id=?1",
+                    params![item.id, format!("windows:sv1:exited:{}:0", Uuid::new_v4())],
+                )
+                .unwrap();
+            let unrelated = item.path.with_file_name("unrelated");
+            fs::write(&unrelated, b"keep").unwrap();
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "transfer::tests::windows_file_quarantine_recovers_journal_after_process_termination"])
+                .env(ROOT, f._root.path())
+                .env(ID, &item.id)
+                .env("APP_DEPOT_REMOVAL_BOUNDARY", boundary)
+                .spawn().unwrap();
+            let ready = item.path.with_file_name(".removal-test-ready");
+            let deadline = std::time::Instant::now() + Duration::from_secs(15);
+            while !ready.exists() && std::time::Instant::now() < deadline {
+                if child.try_wait().unwrap().is_some() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            let play_error = f
+                .library
+                .play_declared(&f.profile, "release", "association", "entry", "revision")
+                .err();
+            let terminated = child.kill();
+            child.wait().unwrap();
+            assert!(ready.exists(), "{boundary}: worker did not pause");
+            terminated.unwrap();
+            assert!(play_error.unwrap().to_string().contains("library slot"));
+            let (transaction_id, phase): (String, String) = f
+                .library
+                .conn
+                .query_row(
+                    "SELECT transaction_id,phase FROM windows_removals WHERE installation_id=?1",
+                    [&item.id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(phase, "Intent");
+            assert_eq!(item.path.exists(), boundary == "after-intent");
+            let quarantine = item
+                .path
+                .with_file_name(format!(".app-depot-removal-{transaction_id}"));
+            match conflict {
+                "destination" => fs::write(&quarantine, b"foreign").unwrap(),
+                "replacement" => {
+                    let original = quarantine.join("payload");
+                    fs::rename(&original, quarantine.join("retained")).unwrap();
+                    fs::write(&original, BYTES).unwrap();
+                    fs::rename(
+                        quarantine.join("retained"),
+                        item.path.with_file_name("retained"),
+                    )
+                    .unwrap();
+                }
+                _ => {}
+            }
+            for _ in 0..2 {
+                let mut lib = Library::open(paths(f._root.path())).unwrap();
+                let (phase, error): (String, Option<String>) = lib
+                    .conn
+                    .query_row(
+                        "SELECT phase,last_error FROM windows_removals WHERE installation_id=?1",
+                        [&item.id],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .unwrap();
+                assert_eq!(lib.installation(&item.id).unwrap().state, "Removing");
+                assert!(lib.install_windows_file(&job.id).is_err());
+                assert!(lib.verify_windows_installation(&item.id).is_err());
+                assert_eq!(fs::read(&unrelated).unwrap(), b"keep");
+                let files = lib.verified_files(Some(&f.profile)).unwrap();
+                assert_eq!(files.len(), 1);
+                assert_eq!(fs::read(&files[0].path).unwrap(), BYTES);
+                if conflict == "destination" {
+                    assert_eq!(phase, "Intent");
+                    assert!(error.unwrap().contains("conflict"));
+                    assert_eq!(fs::read(&quarantine).unwrap(), b"foreign");
+                    assert_eq!(fs::read(item.path.join("payload")).unwrap(), BYTES);
+                } else {
+                    assert_eq!(fs::read(quarantine.join("payload")).unwrap(), BYTES);
+                    assert!(!item.path.exists());
+                    if conflict == "replacement" {
+                        assert_eq!(phase, "Intent");
+                        assert!(error.unwrap().contains("identity mismatch"));
+                        assert_eq!(
+                            fs::read(item.path.with_file_name("retained")).unwrap(),
+                            BYTES
+                        );
+                    } else {
+                        assert_eq!(phase, "Quarantined");
+                        assert!(error.is_none());
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn windows_file_removal_diagnostics_preserve_locked_linked_and_unexpected_data() {
         let bytes = b"removal ownership fixture";
         let mut fixture = fixture(bytes.to_vec(), "normal");
