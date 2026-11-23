@@ -2,7 +2,8 @@ param(
     [Parameter(Mandatory)][string]$OutputDirectory,
     [string]$InnoCompiler = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
     [ValidatePattern('^[1-9][0-9]{0,3}$')][string]$Candidate = '2',
-    [switch]$BinaryOnly
+    [switch]$BinaryOnly,
+    [switch]$Stable
 )
 $ErrorActionPreference = 'Stop'
 
@@ -10,8 +11,8 @@ $root = Split-Path -Parent $PSScriptRoot
 $out = [IO.Directory]::CreateDirectory($OutputDirectory).FullName
 $version = [regex]::Match((Get-Content "$root\Cargo.toml" -Raw), '(?m)^version = "([0-9]+\.[0-9]+\.[0-9]+)"\r?$').Groups[1].Value
 if (!$version) { throw 'Workspace version missing' }
-$displayVersion = "$version-windows-rc.$Candidate"
-$numericVersion = "$version.$Candidate"
+$displayVersion = if ($Stable) { $version } else { "$version-windows-rc.$Candidate" }
+$numericVersion = if ($Stable) { "$version.0" } else { "$version.$Candidate" }
 $icon = Join-Path $out 'AppDepot.ico'
 $resource = Join-Path $out 'desktop.res'
 $resourceSource = Join-Path $out 'desktop.rc'
@@ -78,9 +79,13 @@ try {
         & $InnoCompiler "/DAppDepotVersion=$displayVersion" "/DAppDepotNumericVersion=$numericVersion" "/DAppDepotIcon=$icon" "/DAppDepotExecutable=$exe" "/O$out" "$PSScriptRoot\windows-setup.iss"
         if ($LASTEXITCODE) { throw 'Inno Setup packaging failed' }
         $files += Join-Path $out $setupName
+        if ((Get-Item -LiteralPath $files[-1]).VersionInfo.ProductVersion.Trim() -ne $displayVersion) {
+            throw 'Incorrect Windows installer product version'
+        }
     }
     $manifest = Join-Path $out 'SHA256SUMS'
-    $files | ForEach-Object {
+    $checksummedFiles = if ($Stable -and !$BinaryOnly) { $files[-1] } else { $files }
+    $checksummedFiles | ForEach-Object {
         "{0}  {1}" -f (Get-FileHash -Algorithm SHA256 -LiteralPath $_).Hash.ToLowerInvariant(), (Split-Path -Leaf $_)
     } | Set-Content -LiteralPath $manifest -Encoding Ascii
     Get-Content -LiteralPath $manifest

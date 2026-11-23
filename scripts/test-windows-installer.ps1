@@ -1,6 +1,7 @@
 param(
     [Parameter(Mandatory)][string]$PackageDirectory,
-    [switch]$RequireWindows10
+    [switch]$RequireWindows10,
+    [switch]$SetupOnlyManifest
 )
 $ErrorActionPreference = 'Stop'
 
@@ -18,7 +19,8 @@ $package = (Resolve-Path -LiteralPath $PackageDirectory).Path
 $binary = Join-Path $package 'app-depot-desktop.exe'
 $setup = Join-Path $package 'AppDepot-Desktop-Windows-x64-Setup.exe'
 $checksums = @(Get-Content -LiteralPath (Join-Path $package 'SHA256SUMS'))
-foreach ($file in @($setup, $binary)) {
+$files = if ($SetupOnlyManifest) { @($setup) } else { @($setup, $binary) }
+foreach ($file in $files) {
     $hash = (Get-FileHash -LiteralPath $file).Hash.ToLowerInvariant()
     if ("$hash  $(Split-Path -Leaf $file)" -cnotin $checksums) {
         throw "Checksum mismatch: $file"

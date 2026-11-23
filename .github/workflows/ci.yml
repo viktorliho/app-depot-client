@@ -16,6 +16,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - run: bash scripts/test-desktop-publish.sh
       - name: Install Linux build dependencies
         run: sudo apt-get update && sudo apt-get install -y pkg-config libdbus-1-dev libxkbcommon-dev libwayland-dev libx11-dev libxcb1-dev libgl1-mesa-dev libegl1-mesa-dev desktop-file-utils appstream zsync
       - name: Pin Rust toolchain
@@ -55,11 +56,11 @@ jobs:
         shell: cmd
         run: |
           for /f "usebackq delims=" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do call "%%i\Common7\Tools\VsDevCmd.bat" -arch=x64 -host_arch=x64
-          powershell -NoProfile -ExecutionPolicy RemoteSigned -File scripts\build-windows.ps1 -OutputDirectory "%RUNNER_TEMP%\app-depot-windows-rc"
+          powershell -NoProfile -ExecutionPolicy RemoteSigned -File scripts\build-windows.ps1 -Stable -OutputDirectory "%RUNNER_TEMP%\app-depot-windows-rc"
       - name: Verify Windows installer and update
         shell: pwsh
         run: |
-          ./scripts/test-windows-installer.ps1 -PackageDirectory "$env:RUNNER_TEMP/app-depot-windows-rc"
+          ./scripts/test-windows-installer.ps1 -SetupOnlyManifest -PackageDirectory "$env:RUNNER_TEMP/app-depot-windows-rc"
       - name: Upload unsigned Windows candidate
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -84,4 +85,5 @@ jobs:
           path: ${{ runner.temp }}/app-depot-windows-rc
       - name: Verify Windows 10 per-user installer
         shell: powershell
-        run: ./scripts/test-windows-installer.ps1 -PackageDirectory "$env:RUNNER_TEMP/app-depot-windows-rc" -RequireWindows10
+        run: |
+          ./scripts/test-windows-installer.ps1 -PackageDirectory "$env:RUNNER_TEMP/app-depot-windows-rc" -RequireWindows10 -SetupOnlyManifest
