@@ -25,6 +25,8 @@ const RELEASES: &str =
     "https://api.github.com/repos/viktorliho/app-depot-client/releases?per_page=100";
 const MAX_METADATA: u64 = 1_048_576;
 const MAX_IMAGE: u64 = 600 * 1024 * 1024;
+const SETUP: &str = "AppDepot-Desktop-Windows-x64-Setup.exe";
+const MANIFEST: &str = "SHA256SUMS";
 const CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -80,6 +82,31 @@ struct ApiAsset {
 
 fn expected_url(tag: &str, filename: &str) -> String {
     format!("https://github.com/{REPO}/releases/download/{tag}/{filename}")
+}
+
+fn asset<'a>(
+    release: &'a ApiRelease,
+    name: &str,
+    max: u64,
+) -> Result<(&'a ApiAsset, String), String> {
+    let mut matches = release.assets.iter().filter(|asset| asset.name == name);
+    let asset = matches
+        .next()
+        .ok_or_else(|| format!("Release is missing {name}"))?;
+    if matches.next().is_some()
+        || asset.size == 0
+        || asset.size > max
+        || asset.browser_download_url != expected_url(&release.tag_name, name)
+    {
+        return Err(format!("Invalid release asset: {name}"));
+    }
+    let hash = asset
+        .digest
+        .as_deref()
+        .and_then(|digest| digest.strip_prefix("sha256:"))
+        .filter(|digest| hex_digest(digest))
+        .ok_or_else(|| format!("GitHub SHA-256 is missing or invalid for {name}"))?;
+    Ok((asset, hash.to_ascii_lowercase()))
 }
 
 #[cfg(windows)]
@@ -350,34 +377,57 @@ fn release_history() -> Result<Vec<ApiRelease>, String> {
     Err("GitHub release history exceeded the Desktop discovery limit".into())
 }
 
-#[cfg(target_os = "linux")]
-fn latest_linux_release(
+fn complete_desktop_version(release: &ApiRelease) -> Option<Version> {
+    if release.draft || release.prerelease {
+        return None;
+    }
+    let tag = release.tag_name.strip_prefix('v')?;
+    let version = Version::parse(tag)?;
+    if tag != format!("{}.{}.{}", version.0, version.1, version.2) {
+        return None;
+    }
+    let image = format!("AppDepot-{tag}-x86_64.AppImage");
+    for (name, limit) in [
+        (image.as_str(), MAX_IMAGE),
+        (&format!("{image}.sha256"), 4096),
+        (&format!("{image}.zsync"), MAX_IMAGE),
+        (SETUP, MAX_IMAGE),
+        (MANIFEST, 4096),
+    ] {
+        asset(release, name, limit).ok()?;
+    }
+    Some(version)
+}
+
+fn latest_desktop_release(
     latest: ApiRelease,
+    current: Version,
     history: impl FnOnce() -> Result<Vec<ApiRelease>, String>,
 ) -> Result<Option<ApiRelease>, String> {
-    if latest.tag_name.starts_with('v') {
-        return Ok(Some(latest));
+    if let Some(version) = complete_desktop_version(&latest) {
+        return Ok((version > current).then_some(latest));
     }
     Ok(history()?
         .into_iter()
-        .filter(|release| !release.draft && !release.prerelease)
         .filter_map(|release| {
-            let tag = release.tag_name.strip_prefix('v')?;
-            let version = Version::parse(tag)?;
-            (tag == format!("{}.{}.{}", version.0, version.1, version.2))
-                .then_some((version, release))
+            let version = complete_desktop_version(&release)?;
+            (version > current).then_some((version, release))
         })
         .max_by_key(|(version, _)| *version)
         .map(|(_, release)| release))
 }
 
-#[cfg(target_os = "linux")]
-fn check() -> Result<Option<Release>, String> {
-    let current = Version::parse(env!("CARGO_PKG_VERSION")).ok_or("Invalid running version")?;
+fn discover_desktop_release(current: Version) -> Result<Option<ApiRelease>, String> {
     let bytes = read_bounded(API, MAX_METADATA, ResponseKind::ReleaseJson)?;
     let latest: ApiRelease =
         serde_json::from_slice(&bytes).map_err(|e| format!("Invalid release metadata: {e}"))?;
-    let Some(latest) = latest_linux_release(latest, release_history)? else {
+    latest_desktop_release(latest, current, release_history)
+}
+
+#[cfg(target_os = "linux")]
+fn check() -> Result<Option<Release>, String> {
+    let current = Version::parse(env!("CARGO_PKG_VERSION")).ok_or("Invalid running version")?;
+    let Some(latest) = discover_desktop_release(current)? else {
         return Ok(None);
     };
     let Some((release, checksum_url)) = parse_linux_release(latest, current)? else {
@@ -554,7 +604,7 @@ impl Updater {
             self.release = None;
         }
         self.busy = true;
-        self.status = "Checking for updates…".into();
+        self.status = "Checking for updatesÃ¢â‚¬Â¦".into();
         self.last_check = Some(Instant::now());
         let tx = self.tx.clone();
         let ctx = ctx.clone();
@@ -587,16 +637,16 @@ impl Updater {
                     #[cfg(target_os = "linux")]
                     let no_update = "Up to date";
                     #[cfg(windows)]
-                    let no_update = "No newer stable Windows release found";
+                    let no_update = "No newer complete stable Desktop release found";
                     self.status = release.as_ref().map_or(no_update.into(), |r| {
-                        format!("Update available — {}", r.tag)
+                        format!("Update available Ã¢â‚¬â€ {}", r.tag)
                     });
                     self.release = release;
                     self.busy = false;
                 }
                 UpdateEvent::Progress(done, total) => {
                     self.progress = Some((done, total));
-                    self.status = "Downloading update…".into();
+                    self.status = "Downloading updateÃ¢â‚¬Â¦".into();
                 }
                 #[cfg(target_os = "linux")]
                 UpdateEvent::Staged {
@@ -651,7 +701,7 @@ impl Updater {
         let cancel = Arc::new(AtomicBool::new(false));
         self.download_cancel = Some(Arc::clone(&cancel));
         self.busy = true;
-        self.status = "Downloading update…".into();
+        self.status = "Downloading updateÃ¢â‚¬Â¦".into();
         let (tx, ctx) = (self.tx.clone(), ctx.clone());
         thread::spawn(move || {
             let result = windows_release::download(&release, &cancel, |bytes| {
@@ -681,7 +731,7 @@ impl Updater {
             return;
         }
         self.busy = true;
-        self.status = "Downloading update…".into();
+        self.status = "Downloading updateÃ¢â‚¬Â¦".into();
         let (image, release, tx, ctx) =
             (image.clone(), release.clone(), self.tx.clone(), ctx.clone());
         thread::spawn(move || {
@@ -885,40 +935,100 @@ fn stage(
     result
 }
 
-#[cfg(all(test, target_os = "linux"))]
-mod tests {
+#[cfg(test)]
+mod channel_tests {
     use super::*;
-    use std::net::TcpListener;
 
-    #[test]
-    fn linux_discovery_recovers_when_a_windows_release_is_latest() {
-        let entry = |tag: &str, prerelease| ApiRelease {
+    fn complete(tag: &str) -> ApiRelease {
+        let image = format!("AppDepot-{}-x86_64.AppImage", tag.trim_start_matches('v'));
+        let names = [
+            image.clone(),
+            format!("{image}.sha256"),
+            format!("{image}.zsync"),
+            SETUP.into(),
+            MANIFEST.into(),
+        ];
+        ApiRelease {
             tag_name: tag.into(),
             draft: false,
-            prerelease,
+            prerelease: false,
             body: None,
-            assets: Vec::new(),
-        };
-        let windows = entry("windows-v9.0.0", false);
-        let linux = latest_linux_release(windows, || {
+            assets: names
+                .into_iter()
+                .map(|name| ApiAsset {
+                    size: 100,
+                    browser_download_url: expected_url(tag, &name),
+                    digest: Some(format!("sha256:{}", "a".repeat(64))),
+                    name,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn unified_stable_channels_require_both_platforms_and_a_newer_version() {
+        let mut linux_only = complete("v0.1.5");
+        linux_only.assets.retain(|asset| asset.name != SETUP);
+        let mut windows_only = complete("v0.1.6");
+        windows_only
+            .assets
+            .retain(|asset| [SETUP, MANIFEST].contains(&asset.name.as_str()));
+        let mut draft = complete("v0.1.7");
+        draft.draft = true;
+        let mut prerelease = complete("v0.1.8");
+        prerelease.prerelease = true;
+        let mut invalid = complete("v0.1.9");
+        invalid.assets[0].browser_download_url = "https://github.com/another/repository".into();
+        let selected = latest_desktop_release(complete("decky-v8.0.0"), Version(0, 1, 3), || {
             Ok(vec![
-                entry("v1.0.0", false),
-                entry("windows-v9.0.0", false),
-                entry("decky-v3.0.0", false),
-                entry("v2.0.0", false),
-                entry("v3.0.0", true),
+                linux_only,
+                windows_only,
+                draft,
+                prerelease,
+                invalid,
+                complete("windows-v9.0.0"),
+                complete("decky-v8.0.0"),
+                complete("v0.1.4"),
             ])
         })
         .unwrap()
         .unwrap();
-        assert_eq!(linux.tag_name, "v2.0.0");
-        let latest = latest_linux_release(entry("v1.0.0", false), || {
-            panic!("must keep the Linux Latest fast path")
-        })
-        .unwrap()
-        .unwrap();
-        assert_eq!(latest.tag_name, "v1.0.0");
+        assert_eq!(selected.tag_name, "v0.1.4");
+        assert!(
+            asset(&selected, SETUP, MAX_IMAGE)
+                .unwrap()
+                .0
+                .browser_download_url
+                .ends_with(".exe")
+        );
+        assert!(
+            asset(&selected, "AppDepot-0.1.4-x86_64.AppImage", MAX_IMAGE)
+                .unwrap()
+                .0
+                .browser_download_url
+                .ends_with(".AppImage")
+        );
+        assert!(
+            latest_desktop_release(complete("v0.1.4"), Version(0, 1, 4), || panic!(
+                "complete Latest needs no fallback"
+            ))
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            latest_desktop_release(complete("v0.1.4"), Version(0, 1, 3), || panic!(
+                "complete Latest needs no fallback"
+            ))
+            .unwrap()
+            .is_some()
+        );
     }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use std::net::TcpListener;
 
     #[test]
     fn github_style_asset_redirect_delivers_checksum_bytes() {

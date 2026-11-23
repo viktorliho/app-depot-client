@@ -83,7 +83,9 @@ Catalog grid/list share the same filtered App set. The details header offers dir
 
 ### ADR-015: Official AppImage distribution and updater (M2.4)
 
-The release build embeds a numeric workspace version, Git revision and official build marker. A pinned Ubuntu-based GitHub Actions workflow builds a Type 2 Linux x86_64 AppImage with fixed desktop/AppStream identity and icon sizes. The dedicated desktop updater queries only official stable GitHub Releases; it never uses a configured App Depot Server or its Bearer token. It requires the exact architecture-specific asset, GitHub's asset SHA-256 digest and a matching checksum asset, then stages verified bytes beside a supported user-owned AppImage. A separate helper performs a hash-rechecked atomic exchange after the desktop exits and retains the prior image for recovery. Development and package-managed binaries have no in-place update path. The local library, credentials and download queue are outside the AppImage and outside the updater's write scope. See [DISTRIBUTION.md](DISTRIBUTION.md) for the release and activation procedure.
+Desktop is one cross-platform product. Every new stable Desktop release publishes all supported platforms together from one annotated `vX.Y.Z` tag, one immutable main commit and one workspace version. Linux x86-64 AppImage and Windows x64 Inno Setup are required. macOS joins the release set when officially supported. GitHub Latest is reserved for the complete stable Desktop release. SteamOS Decky publishes independently under `decky-vX.Y.Z`.
+
+The release workflow builds and verifies both platform packages before its publish job can create or finalize a draft. The dedicated Desktop updater queries the official GitHub release without App Depot Server credentials. Both platforms require the complete stable release and verify their exact platform asset and checksum. The Linux helper preserves atomic exchange and recovery for user-owned AppImages. Windows verifies installer downloads. In-app execution and relaunch remain pending. See [DISTRIBUTION.md](DISTRIBUTION.md).
 
 ### ADR-016. SteamOS Decky and the four-platform strategy (M3.0)
 

@@ -33,13 +33,13 @@ Client CI checks the version floor and x64 configuration in the actual Inno Setu
 
 When a dedicated disposable Windows 10 x64 workstation runner is available, give it the `app-depot-windows-10` label and manually dispatch **Client CI** on `main` with `windows_10_smoke` enabled. That job consumes the exact setup artifact produced by the workflow, verifies the OS and exercises the same install, reinstall and uninstall smoke checks. It needs no build tools on the test machine. Keep personal PCs off the runner pool.
 
-The first public Windows candidate should use a distinct prerelease tag such as `windows-v0.1.3-rc.2` on the exact verified main commit, marked prerelease and explicitly excluded from Latest. Attach only setup and the corresponding checksum manifest, plus the standalone executable if desired. Publish after owner approval and acceptance. The Linux AppImage release workflow uses `v*` tags and the existing stable release remains separate.
+Historical Windows-only prereleases may retain their tags. Stable Windows packages now ship with Linux under one annotated Desktop `vX.Y.Z` tag. The release workflow passes `-Stable` to the build script so the installer and installed executable report the shared product version. The workflow requires both platforms before making the release public.
 
 ## Desktop release channels
 
-- Windows x64 checks the official repository's release history from **Updates & About**. Stable Windows releases use `windows-vX.Y.Z` with the same product version as the package. Publish them with Latest disabled. Keep `windows-vX.Y.Z-rc.N` releases marked prerelease. The stable updater skips prereleases, drafts, Linux and Decky releases. RCs remain manual downloads.
+- Windows x64 checks the official repository from **Updates & About**. It selects only complete stable Desktop `vX.Y.Z` releases with both current platforms. It skips drafts, prereleases, former Windows-only tags and Decky releases. RCs remain manual downloads.
 - A stable Windows release supplies `AppDepot-Desktop-Windows-x64-Setup.exe` and `SHA256SUMS`. The updater validates the exact GitHub URLs, checks the manifest against GitHub's asset size and SHA-256, and requires the manifest's installer SHA-256 to agree with GitHub's. The installer download is bounded by the exact expected size, checked against the agreed digest and validated as a PE executable before it is exposed in a temporary folder. Cancel or discard removes the temporary download. To install at this checkpoint, copy the verified installer outside that folder before closing Desktop and run Setup manually. Automatic handoff and relaunch are pending.
-- Linux keeps using the official GitHub Latest release for stable AppImages. If Latest belongs to another platform, Linux searches the same bounded history for the newest stable canonical `vX.Y.Z` tag. The existing AppImage validation, handoff and rollback path is retained. The macOS distribution channel is reserved for future work.
+- Linux uses the same complete-release discovery and keeps the existing AppImage validation, handoff and rollback path. If Latest is incomplete or belongs to a separate channel, both clients search bounded release history for a complete stable Desktop version. macOS joins the same release contract once supported.
 
 ## Short Windows 10 hardware acceptance
 

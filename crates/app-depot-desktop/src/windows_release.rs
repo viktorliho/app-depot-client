@@ -1,6 +1,6 @@
 use super::{
-    ApiAsset, ApiRelease, MAX_IMAGE, Release, ResponseKind, Version, expected_url, hex_digest,
-    read_bounded, release_history, request, stream_verified, validate_response_kind,
+    MANIFEST, MAX_IMAGE, Release, ResponseKind, SETUP, Version, asset, discover_desktop_release,
+    hex_digest, read_bounded, request, stream_verified, validate_response_kind,
 };
 use sha2::{Digest, Sha256};
 use std::{
@@ -8,56 +8,6 @@ use std::{
     path::PathBuf,
     sync::atomic::{AtomicBool, Ordering},
 };
-
-const SETUP: &str = "AppDepot-Desktop-Windows-x64-Setup.exe";
-const MANIFEST: &str = "SHA256SUMS";
-
-fn newest(releases: Vec<ApiRelease>, current: Version) -> Result<Option<ApiRelease>, String> {
-    let mut best = None;
-    let mut best_version = current;
-    for release in releases {
-        if release.draft || release.prerelease {
-            continue;
-        }
-        let Some(tag) = release.tag_name.strip_prefix("windows-v") else {
-            continue;
-        };
-        let version = Version::parse(tag).ok_or("Malformed stable Windows release version")?;
-        if tag != format!("{}.{}.{}", version.0, version.1, version.2) {
-            return Err("Malformed stable Windows release version".into());
-        }
-        if version > best_version {
-            best_version = version;
-            best = Some(release);
-        }
-    }
-    Ok(best)
-}
-
-fn asset<'a>(
-    release: &'a ApiRelease,
-    name: &str,
-    max: u64,
-) -> Result<(&'a ApiAsset, String), String> {
-    let mut matches = release.assets.iter().filter(|asset| asset.name == name);
-    let asset = matches
-        .next()
-        .ok_or_else(|| format!("Release is missing {name}"))?;
-    if matches.next().is_some()
-        || asset.size == 0
-        || asset.size > max
-        || asset.browser_download_url != expected_url(&release.tag_name, name)
-    {
-        return Err(format!("Invalid release asset: {name}"));
-    }
-    let hash = asset
-        .digest
-        .as_deref()
-        .and_then(|digest| digest.strip_prefix("sha256:"))
-        .filter(|digest| hex_digest(digest))
-        .ok_or_else(|| format!("GitHub SHA-256 is missing or invalid for {name}"))?;
-    Ok((asset, hash.to_ascii_lowercase()))
-}
 
 fn validate_manifest(
     bytes: &[u8],
@@ -87,7 +37,7 @@ fn validate_manifest(
 
 pub(super) fn check() -> Result<Option<Release>, String> {
     let current = Version::parse(env!("CARGO_PKG_VERSION")).ok_or("Invalid running version")?;
-    let Some(release) = newest(release_history()?, current)? else {
+    let Some(release) = discover_desktop_release(current)? else {
         return Ok(None);
     };
     let (setup, setup_hash) = asset(&release, SETUP, MAX_IMAGE)?;
@@ -209,6 +159,7 @@ fn stage(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::updater::{ApiAsset, ApiRelease, expected_url};
 
     fn release(tag: &str, draft: bool, prerelease: bool) -> ApiRelease {
         ApiRelease {
@@ -221,35 +172,9 @@ mod tests {
     }
 
     #[test]
-    fn selects_only_the_newest_stable_windows_version() {
-        let picked = newest(
-            vec![
-                release("windows-v0.2.9", false, false),
-                release("windows-v0.3.0", false, false),
-                release("v5.0.0", false, false),
-                release("decky-v6.0.0", false, false),
-                release("windows-v9.0.0-rc.1", false, true),
-                release("windows-v9.0.0", true, false),
-            ],
-            Version(0, 2, 0),
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(picked.tag_name, "windows-v0.3.0");
-        assert!(newest(vec![picked], Version(0, 3, 0)).unwrap().is_none());
-        assert!(
-            newest(
-                vec![release("windows-vv1.0.0", false, false)],
-                Version(0, 3, 0)
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
     fn requires_exact_asset_url_and_agreeing_manifest() {
         let hash = "a".repeat(64);
-        let mut item = release("windows-v1.0.0", false, false);
+        let mut item = release("v1.0.0", false, false);
         item.assets.push(ApiAsset {
             name: SETUP.into(),
             size: 100,
@@ -287,7 +212,7 @@ mod tests {
         bytes[60] = 64;
         bytes[64..68].copy_from_slice(b"PE\0\0");
         let mut release = Release {
-            tag: "windows-v1.0.0".into(),
+            tag: "v1.0.0".into(),
             notes: String::new(),
             image_url: String::new(),
             image_size: bytes.len() as u64,
