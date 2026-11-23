@@ -4,8 +4,12 @@ use super::{
 };
 use sha2::{Digest, Sha256};
 use std::{
+    ffi::OsString,
+    fs::OpenOptions,
     io::{self, Read, Seek, SeekFrom},
+    os::windows::fs::{MetadataExt, OpenOptionsExt},
     path::PathBuf,
+    process::Command,
     sync::atomic::{AtomicBool, Ordering},
 };
 
@@ -37,16 +41,51 @@ fn validate_manifest(
 
 pub(super) fn check() -> Result<Option<Release>, String> {
     let current = Version::parse(env!("CARGO_PKG_VERSION")).ok_or("Invalid running version")?;
-    let Some(release) = discover_desktop_release(current)? else {
+    #[cfg(feature = "windows-update-fixture")]
+    if let Some(path) = fixture_directory() {
+        let metadata = fixture_bytes(&path.join("latest.json"), super::MAX_METADATA)?;
+        let entry = serde_json::from_slice(&metadata).map_err(|error| error.to_string())?;
+        return verified_release(
+            super::latest_desktop_release(entry, current, || Ok(Vec::new()))?,
+            |asset| fixture_bytes(&path.join(MANIFEST), asset.size),
+        );
+    }
+    verified_release(discover_desktop_release(current)?, |asset| {
+        read_bounded(
+            &asset.browser_download_url,
+            asset.size,
+            ResponseKind::Checksum,
+        )
+    })
+}
+
+#[cfg(feature = "windows-update-fixture")]
+fn fixture_directory() -> Option<PathBuf> {
+    std::env::var_os("APP_DEPOT_WINDOWS_UPDATE_FIXTURE").map(PathBuf::from)
+}
+
+#[cfg(feature = "windows-update-fixture")]
+fn fixture_bytes(path: &std::path::Path, limit: u64) -> Result<Vec<u8>, String> {
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .and_then(|file| file.take(limit + 1).read_to_end(&mut bytes))
+        .map_err(|error| error.to_string())?;
+    if bytes.len() as u64 > limit {
+        return Err("Update fixture exceeds the expected length".into());
+    }
+    Ok(bytes)
+}
+
+fn verified_release(
+    candidate: Option<super::ApiRelease>,
+    read_manifest: impl FnOnce(&super::ApiAsset) -> Result<Vec<u8>, String>,
+) -> Result<Option<Release>, String> {
+    let Some(release) = candidate else {
         return Ok(None);
     };
     let (setup, setup_hash) = asset(&release, SETUP, MAX_IMAGE)?;
     let (manifest, manifest_hash) = asset(&release, MANIFEST, 4096)?;
-    let bytes = read_bounded(
-        &manifest.browser_download_url,
-        manifest.size,
-        ResponseKind::Checksum,
-    )?;
+    let bytes = read_manifest(manifest)?;
     validate_manifest(&bytes, manifest.size, &manifest_hash, &setup_hash)?;
     Ok(Some(Release {
         image_size: setup.size,
@@ -65,11 +104,64 @@ pub(super) fn check() -> Result<Option<Release>, String> {
 #[derive(Debug)]
 pub(crate) struct VerifiedInstaller {
     directory: tempfile::TempDir,
+    size: u64,
+    sha256: String,
 }
 
 impl VerifiedInstaller {
     pub fn path(&self) -> PathBuf {
         self.directory.path().join(SETUP)
+    }
+
+    fn pin_verified(&self) -> Result<std::fs::File, String> {
+        // Deny writes, deletion and rename while rechecking and starting Setup.
+        let mut installer = OpenOptions::new()
+            .read(true)
+            .share_mode(1) // FILE_SHARE_READ
+            .custom_flags(0x00200000) // FILE_FLAG_OPEN_REPARSE_POINT
+            .open(self.path())
+            .map_err(|error| format!("Cannot open staged Setup: {error}"))?;
+        let metadata = installer.metadata().map_err(|error| error.to_string())?;
+        if !metadata.is_file() || metadata.file_attributes() & 0x400 != 0 {
+            return Err("Staged Setup is not a regular file".into());
+        }
+        stream_verified(
+            &mut installer,
+            &mut io::sink(),
+            self.size,
+            &self.sha256,
+            |_| {},
+        )?;
+        verify_pe(&mut installer, self.size).map_err(|error| error.to_string())?;
+        Ok(installer)
+    }
+
+    pub(super) fn start_update(&self) -> Result<(), String> {
+        let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+        let directory = executable
+            .parent()
+            .ok_or("Desktop installation path is unavailable")?;
+        if !directory.join("unins000.exe").is_file() {
+            return Err(
+                "Open an installed copy of App Depot from Start to apply the update".into(),
+            );
+        }
+        let mut destination = OsString::from("/DIR=");
+        destination.push(directory);
+        let _pinned = self.pin_verified()?;
+        Command::new(self.path())
+            .arg(destination)
+            .args(["/APPDEPOTUPDATE=1", "/NORESTART", "/NOCLOSEAPPLICATIONS"])
+            .env_remove("APP_DEPOT_TOKEN")
+            .current_dir(directory)
+            .spawn()
+            .map_err(|error| format!("Cannot start verified Windows Setup: {error}"))?;
+        Ok(())
+    }
+
+    pub(super) fn keep_for_setup(self) {
+        // Setup may still be reading the downloaded executable after Desktop exits.
+        let _ = self.directory.keep();
     }
 }
 
@@ -113,6 +205,11 @@ pub(super) fn download(
     cancel: &AtomicBool,
     mut progress: impl FnMut(u64),
 ) -> Result<VerifiedInstaller, String> {
+    #[cfg(feature = "windows-update-fixture")]
+    if let Some(path) = fixture_directory() {
+        let file = std::fs::File::open(path.join(SETUP)).map_err(|error| error.to_string())?;
+        return stage(file, release, cancel, &mut progress);
+    }
     let response = request(&release.image_url)?;
     validate_response_kind(&response, ResponseKind::WindowsInstaller)?;
     if let Some(length) = response.header("Content-Length")
@@ -150,7 +247,11 @@ fn stage(
     )?;
     verify_pe(file.as_file_mut(), release.image_size).map_err(|e| e.to_string())?;
     file.as_file().sync_all().map_err(|e| e.to_string())?;
-    let installer = VerifiedInstaller { directory };
+    let installer = VerifiedInstaller {
+        directory,
+        size: release.image_size,
+        sha256: release.sha256.clone(),
+    };
     file.persist_noclobber(installer.path())
         .map_err(|e| e.to_string())?;
     Ok(installer)
@@ -221,6 +322,13 @@ mod tests {
         let cancel = AtomicBool::new(false);
         let saved = stage(&bytes[..], &release, &cancel, |_| {}).unwrap();
         assert_eq!(std::fs::read(saved.path()).unwrap(), bytes);
+        let pin = saved.pin_verified().unwrap();
+        assert!(std::fs::write(saved.path(), bytes).is_err());
+        drop(pin);
+        let mut modified = bytes;
+        modified[95] = 1;
+        std::fs::write(saved.path(), modified).unwrap();
+        assert!(saved.pin_verified().unwrap_err().contains("SHA-256"));
         assert!(stage(&bytes[..95], &release, &cancel, |_| {}).is_err());
         cancel.store(true, Ordering::Relaxed);
         assert!(

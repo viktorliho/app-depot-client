@@ -26,6 +26,10 @@ fn main() {
     );
     let official = std::env::var("APP_DEPOT_OFFICIAL_RELEASE").as_deref() == Ok("1");
     if official {
+        assert!(
+            std::env::var_os("CARGO_FEATURE_WINDOWS_UPDATE_FIXTURE").is_none(),
+            "official builds cannot use update fixtures"
+        );
         assert_ne!(
             revision, "unknown",
             "official builds require a source revision"

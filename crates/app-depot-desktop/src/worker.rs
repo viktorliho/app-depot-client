@@ -64,6 +64,8 @@ pub struct Snapshot {
     pub local_issues: Vec<LocalIssue>,
     pub installations: Vec<Installation>,
     pub launches: Vec<LaunchCandidate>,
+    #[cfg(windows)]
+    pub update_occupancy_clear: Option<bool>,
     pub library_data: PathBuf,
     pub library_content: PathBuf,
 }
@@ -478,6 +480,13 @@ pub(crate) fn snapshot(
                 }
             }
         }
+    }
+    #[cfg(windows)]
+    {
+        result.update_occupancy_clear = lib
+            .windows_active_processes()
+            .ok()
+            .map(|processes| processes.is_empty());
     }
     Ok(result)
 }

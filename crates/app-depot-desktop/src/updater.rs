@@ -523,6 +523,8 @@ pub struct Updater {
     last_check: Option<Instant>,
     #[cfg(windows)]
     pub download_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    #[cfg(windows)]
+    pub confirm_windows_update: bool,
     tx: Sender<UpdateEvent>,
     rx: Receiver<UpdateEvent>,
 }
@@ -570,6 +572,8 @@ impl Updater {
             last_check: None,
             #[cfg(windows)]
             download_cancel: None,
+            #[cfg(windows)]
+            confirm_windows_update: false,
             tx,
             rx,
         };
@@ -661,11 +665,21 @@ impl Updater {
                 }
                 #[cfg(windows)]
                 UpdateEvent::WindowsStaged(installer) => {
-                    self.staged = Some(installer);
-                    self.download_cancel = None;
+                    let cancelled = self
+                        .download_cancel
+                        .take()
+                        .is_some_and(|cancel| cancel.load(std::sync::atomic::Ordering::Relaxed));
+                    if !cancelled {
+                        self.staged = Some(installer);
+                    }
                     self.progress = None;
                     self.busy = false;
-                    self.status = "Installer downloaded and verified".into();
+                    self.status = if cancelled {
+                        "Update download cancelled"
+                    } else {
+                        "Installer downloaded and verified"
+                    }
+                    .into();
                 }
                 #[cfg(windows)]
                 UpdateEvent::Cancelled => {
@@ -821,6 +835,14 @@ impl Updater {
             let _ = fs::remove_file(helper_copy);
             return Err(format!("Cannot start update helper: {error}"));
         }
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    pub fn handoff(&mut self) -> Result<(), String> {
+        let stage = self.staged.as_ref().ok_or("Update has not been staged")?;
+        stage.start_update()?;
+        self.staged.take().unwrap().keep_for_setup();
         Ok(())
     }
 }

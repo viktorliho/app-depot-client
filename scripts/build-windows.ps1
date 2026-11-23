@@ -3,7 +3,8 @@ param(
     [string]$InnoCompiler = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
     [ValidatePattern('^[1-9][0-9]{0,3}$')][string]$Candidate = '2',
     [switch]$BinaryOnly,
-    [switch]$Stable
+    [switch]$Stable,
+    [switch]$UpdateFixture
 )
 $ErrorActionPreference = 'Stop'
 
@@ -59,7 +60,8 @@ try {
     $metadata = & cargo +1.100.0 metadata --no-deps --format-version 1 --locked
     if ($LASTEXITCODE) { throw 'Cargo metadata failed' }
     $targetDir = ($metadata | ConvertFrom-Json).target_directory
-    & cargo +1.100.0 rustc --locked --release -p app-depot-desktop --bin app-depot-desktop --target x86_64-pc-windows-msvc -- -C "link-arg=$resource"
+    $fixtureFeatures = if ($UpdateFixture) { @('--features', 'windows-update-fixture') } else { @() }
+    & cargo +1.100.0 rustc --locked --release -p app-depot-desktop --bin app-depot-desktop --target x86_64-pc-windows-msvc @fixtureFeatures -- -C "link-arg=$resource"
     if ($LASTEXITCODE) { throw 'Windows release build failed' }
     Copy-Item -LiteralPath "$targetDir\x86_64-pc-windows-msvc\release\app-depot-desktop.exe" -Destination $exe
     $headers = & dumpbin.exe /nologo /headers $exe

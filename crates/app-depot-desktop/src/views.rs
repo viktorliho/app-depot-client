@@ -173,19 +173,59 @@ impl Desktop {
             ui.label(RichText::new("Updates use the official GitHub release, verify its SHA-256 and keep the previous AppImage for recovery. Your library and credentials remain outside the AppImage.").color(design::palette(ui).muted));
             #[cfg(windows)]
             {
-                if let Some(installer) = &self.updater.staged {
-                    copy_line(
-                        ui,
-                        "Temporary installer",
-                        &installer.path().display().to_string(),
-                    );
-                    ui.label("Copy the verified installer to another folder before closing Desktop to install it.");
+                if self.updater.staged.is_some() {
+                    let busy = self.snapshot.update_occupancy_clear != Some(true)
+                        || self.launch_states.values().any(|(state, _)| {
+                            matches!(
+                                state.as_str(),
+                                "Starting" | "Preparing" | "Running" | "ProcessUnknown"
+                            )
+                        })
+                        || self.snapshot.jobs.iter().any(|job| {
+                            matches!(
+                                job.state.as_str(),
+                                "Queued"
+                                    | "FetchingInventory"
+                                    | "Downloading"
+                                    | "Verifying"
+                                    | "Committing"
+                            )
+                        })
+                        || !self.local_operations.is_empty();
+                    if busy {
+                        ui.label("Wait for managed applications and local operations to finish before installing.");
+                    }
                     if ui.button("Discard downloaded installer").clicked() {
                         self.updater.staged = None;
+                        self.updater.confirm_windows_update = false;
                         self.updater.status = "Installer discarded".into();
+                    } else if self.updater.confirm_windows_update {
+                        ui.label("App Depot will close. Complete the Setup wizard to reopen it. Your library stays in place.");
+                        ui.horizontal(|ui| {
+                            if ui.button("Keep App Depot open").clicked() {
+                                self.updater.confirm_windows_update = false;
+                            } else if ui
+                                .add_enabled(!busy, egui::Button::new("Close and start Setup"))
+                                .clicked()
+                            {
+                                match self.updater.handoff() {
+                                    Ok(()) => {
+                                        self.exit_allowed = true;
+                                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                                    }
+                                    Err(error) => {
+                                        self.updater.last_error = Some(error.clone());
+                                        self.updater.status = error;
+                                    }
+                                }
+                            }
+                        });
+                    } else if ui
+                        .add_enabled(!busy, egui::Button::new("Install update…"))
+                        .clicked()
+                    {
+                        self.updater.confirm_windows_update = true;
                     }
-                } else {
-                    ui.label("Windows installs are started separately after Desktop closes.");
                 }
             }
         });

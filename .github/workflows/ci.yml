@@ -71,6 +71,20 @@ jobs:
             ${{ runner.temp }}/app-depot-windows-rc/app-depot-desktop.exe
             ${{ runner.temp }}/app-depot-windows-rc/SHA256SUMS
 
+      - name: Build isolated Windows update fixtures
+        shell: cmd
+        run: |
+          for /f "usebackq delims=" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do call "%%i\Common7\Tools\VsDevCmd.bat" -arch=x64 -host_arch=x64
+          powershell -NoProfile -ExecutionPolicy RemoteSigned -File scripts\build-windows-update-fixture.ps1 -OutputDirectory "%RUNNER_TEMP%\app-depot-update-fixtures"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: AppDepot-Windows-Update-Fixtures
+          if-no-files-found: error
+          path: |
+            ${{ runner.temp }}/app-depot-update-fixtures/*/AppDepot-Desktop-Windows-x64-Setup.exe
+            ${{ runner.temp }}/app-depot-update-fixtures/*/SHA256SUMS
+            ${{ runner.temp }}/app-depot-update-fixtures/B/latest.json
+
   windows-10-installer:
     if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.windows_10_smoke
     needs: windows
