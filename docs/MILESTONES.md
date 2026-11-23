@@ -211,4 +211,8 @@ An explicit runtime Uninstall requests cleanup in the same SQLite transaction as
 
 The shared Windows release-detail actions expose working-copy Uninstall and retry. Full library removal, Repair and physical CAS collection remain unavailable. Windows packaging and clean-machine acceptance are documented in [Windows Desktop](WINDOWS_DESKTOP.md).
 
+#### M4.3 — Windows release discovery and installer downloads
+
+The shared Updates & About screen checks stable Windows releases from the official GitHub repository, verifies their checksum manifest and can download the verified installer. Windows release tags are separate from stable Linux AppImages. Installation handoff and an end-to-end in-app update remain pending. [Desktop release channels](WINDOWS_DESKTOP.md#desktop-release-channels)
+
 Windows Server 2022 runner image `win22/20261116.370` reported sharing violation 32 in eight File/Tree tests. Windows 11 and the Windows Server 2025 runner passed. The reported failures reach directory publication, and their original logs lack the first failing Windows API. Running `interrupted_committing_recovers_without_network` and `windows_file_activation_retries_after_sqlite_rollback_and_detects_modification` with `--nocapture` now captures sharing violations at the handle-relative open, no-replace rename and parent-directory flush. Reproduce on an isolated NTFS volume and compare the first error and access masks with Windows 11 before attributing it to the runner image. Windows 10 behavior for this issue remains unverified.

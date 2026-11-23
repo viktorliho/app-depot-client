@@ -13,7 +13,7 @@ type LibraryItem = (
 );
 
 impl Desktop {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     fn updates_settings(&mut self, ui: &mut egui::Ui) {
         section(ui, "App Depot updates", |ui| {
             ui.label(
@@ -28,20 +28,30 @@ impl Desktop {
             ));
             ui.add_space(8.0);
             match &self.updater.mode {
+                #[cfg(target_os = "linux")]
                 updater::InstallMode::OfficialAppImage { .. } => {
                     ui.label("Official AppImage · stable GitHub releases");
                 }
+                #[cfg(target_os = "linux")]
                 updater::InstallMode::Development => {
                     ui.label("Development build. Automatic installation is disabled.");
                 }
+                #[cfg(target_os = "linux")]
                 updater::InstallMode::Unsupported(reason) => {
                     ui.label(reason);
+                }
+                #[cfg(windows)]
+                updater::InstallMode::WindowsStable => {
+                    ui.label("Windows x64 · stable GitHub releases");
                 }
             }
             ui.add_space(12.0);
             ui.horizontal(|ui| {
                 if ui
-                    .add_enabled(!self.updater.busy, egui::Button::new("Check for updates"))
+                    .add_enabled(
+                        self.updater.can_check(),
+                        egui::Button::new("Check for updates"),
+                    )
                     .clicked()
                 {
                     self.updater.check(ui.ctx());
@@ -77,16 +87,32 @@ impl Desktop {
                     )),
                 );
             }
+            #[cfg(windows)]
+            if let Some(cancel) = &self.updater.download_cancel
+                && ui.button("Cancel download").clicked()
+            {
+                cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
             if let Some(release) = &self.updater.release {
                 let tag = release.tag.clone();
                 let notes = release.notes.clone();
                 ui.add_space(14.0);
                 ui.label(RichText::new(format!("Available: {tag}")).strong());
+                #[cfg(windows)]
+                ui.label(format!(
+                    "Installer size: {}",
+                    format_bytes(release.image_size)
+                ));
+                #[cfg(windows)]
+                ui.collapsing("Installer integrity", |ui| {
+                    copy_line(ui, "Published SHA-256", &release.sha256);
+                });
                 if !notes.is_empty() {
                     egui::CollapsingHeader::new("Release notes").show(ui, |ui| {
                         ui.label(notes);
                     });
                 }
+                #[cfg(target_os = "linux")]
                 if self.updater.staged.is_none()
                     && matches!(
                         self.updater.mode,
@@ -98,10 +124,22 @@ impl Desktop {
                 {
                     self.updater.download(ui.ctx());
                 }
+                #[cfg(windows)]
+                if self.updater.staged.is_none()
+                    && ui
+                        .add_enabled(
+                            !self.updater.busy,
+                            egui::Button::new("Download verified installer"),
+                        )
+                        .clicked()
+                {
+                    self.updater.download(ui.ctx());
+                }
                 if !self.updater.dismissed && ui.button("Later").clicked() {
                     self.updater.dismissed = true;
                 }
             }
+            #[cfg(target_os = "linux")]
             if self.updater.staged.is_some() {
                 let active_transfer = self.snapshot.jobs.iter().any(|job| {
                     matches!(
@@ -131,7 +169,25 @@ impl Desktop {
                 }
             }
             ui.add_space(10.0);
+            #[cfg(target_os = "linux")]
             ui.label(RichText::new("Updates use the official GitHub release, verify its SHA-256 and keep the previous AppImage for recovery. Your library and credentials remain outside the AppImage.").color(design::palette(ui).muted));
+            #[cfg(windows)]
+            {
+                if let Some(installer) = &self.updater.staged {
+                    copy_line(
+                        ui,
+                        "Temporary installer",
+                        &installer.path().display().to_string(),
+                    );
+                    ui.label("Copy the verified installer to another folder before closing Desktop to install it.");
+                    if ui.button("Discard downloaded installer").clicked() {
+                        self.updater.staged = None;
+                        self.updater.status = "Installer discarded".into();
+                    }
+                } else {
+                    ui.label("Windows installs are started separately after Desktop closes.");
+                }
+            }
         });
     }
     fn titlebar(&mut self, ui: &mut egui::Ui) {
@@ -334,7 +390,7 @@ impl Desktop {
                     }
                     ui.add_space(5.0);
                 }
-                #[cfg(target_os = "linux")]
+                #[cfg(any(target_os = "linux", windows))]
                 {
                     let update_label = if self.updater.last_error.is_some() {
                         Some("Update needs attention".to_owned())
@@ -2272,9 +2328,9 @@ impl Desktop {
                 }
             }); }
             if self.settings_tab==SettingsTab::Updates {
-                #[cfg(target_os = "linux")]
+                #[cfg(any(target_os = "linux", windows))]
                 self.updates_settings(ui);
-                #[cfg(not(target_os = "linux"))]
+                #[cfg(not(any(target_os = "linux", windows)))]
                 ui.label("Automatic updates are currently supported only for official Linux AppImages.");
             }
             if self.settings_tab==SettingsTab::Diagnostics {
@@ -2950,7 +3006,7 @@ fn open_account(ctx: &egui::Context, url: &str) {
 impl eframe::App for Desktop {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll(ctx);
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", windows))]
         {
             self.updater.poll();
             self.updater.periodic(ctx);

@@ -2,7 +2,7 @@
 mod design;
 mod preferences;
 mod telemetry;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 mod updater;
 mod views;
 mod worker;
@@ -77,7 +77,7 @@ struct Desktop {
     #[cfg(target_os = "linux")]
     update_ack_armed: bool,
     app_icon: TextureHandle,
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     updater: updater::Updater,
     worker: Worker,
     snapshot: Snapshot,
@@ -150,7 +150,7 @@ impl Desktop {
             #[cfg(target_os = "linux")]
             update_ack_armed: false,
             app_icon,
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", windows))]
             updater: updater::Updater::new(ctx),
             worker: Worker::start(paths, ctx.clone()),
             snapshot: Snapshot::default(),

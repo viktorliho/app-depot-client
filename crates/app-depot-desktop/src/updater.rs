@@ -1,13 +1,18 @@
-//! Official AppImage updates. No App Depot Server profile or library state is used.
+//! Official Desktop release discovery, independent of App Depot Server profiles.
 use eframe::egui;
+#[cfg(target_os = "linux")]
 use fs2::available_space;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+#[cfg(target_os = "linux")]
 use std::{
     fs::{self, File, OpenOptions},
-    io::{self, Read, Write},
+    io,
     os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
+};
+use std::{
+    io::{Read, Write},
     sync::mpsc::{self, Receiver, Sender},
     thread,
     time::{Duration, Instant},
@@ -16,6 +21,8 @@ use url::Url;
 
 const REPO: &str = "viktorliho/app-depot-client";
 const API: &str = "https://api.github.com/repos/viktorliho/app-depot-client/releases/latest";
+const RELEASES: &str =
+    "https://api.github.com/repos/viktorliho/app-depot-client/releases?per_page=100";
 const MAX_METADATA: u64 = 1_048_576;
 const MAX_IMAGE: u64 = 600 * 1024 * 1024;
 const CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
@@ -75,9 +82,22 @@ fn expected_url(tag: &str, filename: &str) -> String {
     format!("https://github.com/{REPO}/releases/download/{tag}/{filename}")
 }
 
+#[cfg(windows)]
+#[path = "windows_release.rs"]
+mod windows_release;
+
+#[cfg(all(test, target_os = "linux"))]
 fn parse_release(bytes: &[u8], current: Version) -> Result<Option<(Release, String)>, String> {
     let value: ApiRelease =
         serde_json::from_slice(bytes).map_err(|e| format!("Invalid release metadata: {e}"))?;
+    parse_linux_release(value, current)
+}
+
+#[cfg(target_os = "linux")]
+fn parse_linux_release(
+    value: ApiRelease,
+    current: Version,
+) -> Result<Option<(Release, String)>, String> {
     if value.draft || value.prerelease {
         return Ok(None);
     }
@@ -138,6 +158,7 @@ fn hex_digest(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+#[cfg(target_os = "linux")]
 fn checksum_digest(bytes: &[u8], tag: &str) -> Result<String, String> {
     let version = tag.strip_prefix('v').ok_or("Invalid release tag")?;
     let name = format!("AppDepot-{version}-x86_64.AppImage");
@@ -239,7 +260,10 @@ fn follow_redirects(
 enum ResponseKind {
     ReleaseJson,
     Checksum,
+    #[cfg(target_os = "linux")]
     AppImage,
+    #[cfg(windows)]
+    WindowsInstaller,
 }
 
 fn validate_response_kind(response: &ureq::Response, kind: ResponseKind) -> Result<(), String> {
@@ -259,7 +283,15 @@ fn validate_response_kind(response: &ureq::Response, kind: ResponseKind) -> Resu
             media_type.as_str(),
             "application/octet-stream" | "text/plain"
         ),
+        #[cfg(target_os = "linux")]
         ResponseKind::AppImage => media_type == "application/octet-stream",
+        #[cfg(windows)]
+        ResponseKind::WindowsInstaller => matches!(
+            media_type.as_str(),
+            "application/octet-stream"
+                | "application/x-msdownload"
+                | "application/vnd.microsoft.portable-executable"
+        ),
     };
     if !valid_type {
         return Err(format!(
@@ -267,7 +299,10 @@ fn validate_response_kind(response: &ureq::Response, kind: ResponseKind) -> Resu
             match kind {
                 ResponseKind::ReleaseJson => "GitHub release JSON",
                 ResponseKind::Checksum => "a checksum asset",
+                #[cfg(target_os = "linux")]
                 ResponseKind::AppImage => "an AppImage asset",
+                #[cfg(windows)]
+                ResponseKind::WindowsInstaller => "a Windows installer asset",
             }
         ));
     }
@@ -296,10 +331,56 @@ fn read_bounded(url: &str, limit: u64, kind: ResponseKind) -> Result<Vec<u8>, St
     read_response_bounded(request(url)?, limit, kind)
 }
 
+fn release_history() -> Result<Vec<ApiRelease>, String> {
+    let mut releases = Vec::new();
+    for page in 1..=3 {
+        let bytes = read_bounded(
+            &format!("{RELEASES}&page={page}"),
+            8 * MAX_METADATA,
+            ResponseKind::ReleaseJson,
+        )?;
+        let batch: Vec<ApiRelease> = serde_json::from_slice(&bytes)
+            .map_err(|error| format!("Invalid GitHub releases: {error}"))?;
+        let last = batch.len() < 100;
+        releases.extend(batch);
+        if last {
+            return Ok(releases);
+        }
+    }
+    Err("GitHub release history exceeded the Desktop discovery limit".into())
+}
+
+#[cfg(target_os = "linux")]
+fn latest_linux_release(
+    latest: ApiRelease,
+    history: impl FnOnce() -> Result<Vec<ApiRelease>, String>,
+) -> Result<Option<ApiRelease>, String> {
+    if latest.tag_name.starts_with('v') {
+        return Ok(Some(latest));
+    }
+    Ok(history()?
+        .into_iter()
+        .filter(|release| !release.draft && !release.prerelease)
+        .filter_map(|release| {
+            let tag = release.tag_name.strip_prefix('v')?;
+            let version = Version::parse(tag)?;
+            (tag == format!("{}.{}.{}", version.0, version.1, version.2))
+                .then_some((version, release))
+        })
+        .max_by_key(|(version, _)| *version)
+        .map(|(_, release)| release))
+}
+
+#[cfg(target_os = "linux")]
 fn check() -> Result<Option<Release>, String> {
     let current = Version::parse(env!("CARGO_PKG_VERSION")).ok_or("Invalid running version")?;
     let bytes = read_bounded(API, MAX_METADATA, ResponseKind::ReleaseJson)?;
-    let Some((release, checksum_url)) = parse_release(&bytes, current)? else {
+    let latest: ApiRelease =
+        serde_json::from_slice(&bytes).map_err(|e| format!("Invalid release metadata: {e}"))?;
+    let Some(latest) = latest_linux_release(latest, release_history)? else {
+        return Ok(None);
+    };
+    let Some((release, checksum_url)) = parse_linux_release(latest, current)? else {
         return Ok(None);
     };
     let checksum = read_bounded(&checksum_url, 4096, ResponseKind::Checksum)?;
@@ -309,6 +390,10 @@ fn check() -> Result<Option<Release>, String> {
     Ok(Some(release))
 }
 
+#[cfg(windows)]
+use windows_release::check;
+
+#[cfg(target_os = "linux")]
 fn appimage_header(path: &Path) -> io::Result<bool> {
     let mut header = [0_u8; 11];
     File::open(path)?.read_exact(&mut header)?;
@@ -317,11 +402,17 @@ fn appimage_header(path: &Path) -> io::Result<bool> {
 
 #[derive(Clone, Debug)]
 pub enum InstallMode {
+    #[cfg(target_os = "linux")]
     OfficialAppImage { image: PathBuf, helper: PathBuf },
+    #[cfg(target_os = "linux")]
     Development,
+    #[cfg(windows)]
+    WindowsStable,
+    #[cfg(target_os = "linux")]
     Unsupported(String),
 }
 
+#[cfg(target_os = "linux")]
 pub fn install_mode() -> InstallMode {
     if env!("APP_DEPOT_BUILD_KIND") != "official" {
         return InstallMode::Development;
@@ -350,10 +441,15 @@ pub fn install_mode() -> InstallMode {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub enum UpdateEvent {
     Checked(Option<Release>),
     Progress(u64, u64),
+    #[cfg(windows)]
+    WindowsStaged(windows_release::VerifiedInstaller),
+    #[cfg(windows)]
+    Cancelled,
+    #[cfg(target_os = "linux")]
     Staged {
         path: PathBuf,
         old_sha: String,
@@ -365,13 +461,18 @@ pub enum UpdateEvent {
 pub struct Updater {
     pub mode: InstallMode,
     pub release: Option<Release>,
+    #[cfg(target_os = "linux")]
     pub staged: Option<(PathBuf, String, String)>,
+    #[cfg(windows)]
+    pub staged: Option<windows_release::VerifiedInstaller>,
     pub status: String,
     pub progress: Option<(u64, u64)>,
     pub busy: bool,
     pub dismissed: bool,
     pub last_error: Option<String>,
     last_check: Option<Instant>,
+    #[cfg(windows)]
+    pub download_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     tx: Sender<UpdateEvent>,
     rx: Receiver<UpdateEvent>,
 }
@@ -379,7 +480,11 @@ pub struct Updater {
 impl Updater {
     pub fn new(ctx: &egui::Context) -> Self {
         let (tx, rx) = mpsc::channel();
+        #[cfg(windows)]
+        let mode = InstallMode::WindowsStable;
+        #[cfg(target_os = "linux")]
         let mode = install_mode();
+        #[cfg(target_os = "linux")]
         let last_error = if let InstallMode::OfficialAppImage { image, .. } = &mode {
             image.parent().and_then(|parent| {
                 let path = parent.join(".appdepot-update-error");
@@ -408,19 +513,45 @@ impl Updater {
             progress: None,
             busy: false,
             dismissed: false,
+            #[cfg(target_os = "linux")]
             last_error,
+            #[cfg(windows)]
+            last_error: None,
             last_check: None,
+            #[cfg(windows)]
+            download_cancel: None,
             tx,
             rx,
         };
-        if matches!(this.mode, InstallMode::OfficialAppImage { .. }) {
+        if this.check_automatically() {
             this.check(ctx);
         }
         this
     }
+    fn check_automatically(&self) -> bool {
+        match self.mode {
+            #[cfg(target_os = "linux")]
+            InstallMode::OfficialAppImage { .. } => true,
+            #[cfg(target_os = "linux")]
+            _ => false,
+            #[cfg(windows)]
+            InstallMode::WindowsStable => true,
+        }
+    }
+    pub fn can_check(&self) -> bool {
+        #[cfg(windows)]
+        if self.staged.is_some() {
+            return false;
+        }
+        !self.busy
+    }
     pub fn check(&mut self, ctx: &egui::Context) {
-        if self.busy {
+        if !self.can_check() {
             return;
+        }
+        #[cfg(windows)]
+        {
+            self.release = None;
         }
         self.busy = true;
         self.status = "Checking for updates…".into();
@@ -437,7 +568,7 @@ impl Updater {
         });
     }
     pub fn periodic(&mut self, ctx: &egui::Context) {
-        if matches!(self.mode, InstallMode::OfficialAppImage { .. })
+        if self.check_automatically()
             && self
                 .last_check
                 .is_some_and(|at| at.elapsed() >= CHECK_INTERVAL)
@@ -453,7 +584,11 @@ impl Updater {
                     if release.as_ref().map(|r| &r.tag) != self.release.as_ref().map(|r| &r.tag) {
                         self.dismissed = false;
                     }
-                    self.status = release.as_ref().map_or("Up to date".into(), |r| {
+                    #[cfg(target_os = "linux")]
+                    let no_update = "Up to date";
+                    #[cfg(windows)]
+                    let no_update = "No newer stable Windows release found";
+                    self.status = release.as_ref().map_or(no_update.into(), |r| {
                         format!("Update available — {}", r.tag)
                     });
                     self.release = release;
@@ -463,6 +598,7 @@ impl Updater {
                     self.progress = Some((done, total));
                     self.status = "Downloading update…".into();
                 }
+                #[cfg(target_os = "linux")]
                 UpdateEvent::Staged {
                     path,
                     old_sha,
@@ -473,14 +609,68 @@ impl Updater {
                     self.busy = false;
                     self.status = "Ready to restart".into();
                 }
+                #[cfg(windows)]
+                UpdateEvent::WindowsStaged(installer) => {
+                    self.staged = Some(installer);
+                    self.download_cancel = None;
+                    self.progress = None;
+                    self.busy = false;
+                    self.status = "Installer downloaded and verified".into();
+                }
+                #[cfg(windows)]
+                UpdateEvent::Cancelled => {
+                    self.download_cancel = None;
+                    self.progress = None;
+                    self.busy = false;
+                    self.status = "Update download cancelled".into();
+                }
                 UpdateEvent::Error(error) => {
                     self.progress = None;
+                    #[cfg(windows)]
+                    {
+                        self.download_cancel = None;
+                    }
                     self.busy = false;
                     self.status = error;
                 }
             }
         }
     }
+    #[cfg(windows)]
+    pub fn download(&mut self, ctx: &egui::Context) {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        let Some(release) = self.release.clone() else {
+            return;
+        };
+        if self.busy || self.staged.is_some() {
+            return;
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.download_cancel = Some(Arc::clone(&cancel));
+        self.busy = true;
+        self.status = "Downloading update…".into();
+        let (tx, ctx) = (self.tx.clone(), ctx.clone());
+        thread::spawn(move || {
+            let result = windows_release::download(&release, &cancel, |bytes| {
+                let _ = tx.send(UpdateEvent::Progress(bytes, release.image_size));
+                ctx.request_repaint();
+            });
+            let event = if cancel.load(Ordering::Relaxed) {
+                UpdateEvent::Cancelled
+            } else {
+                match result {
+                    Ok(installer) => UpdateEvent::WindowsStaged(installer),
+                    Err(error) => UpdateEvent::Error(error),
+                }
+            };
+            let _ = tx.send(event);
+            ctx.request_repaint();
+        });
+    }
+    #[cfg(target_os = "linux")]
     pub fn download(&mut self, ctx: &egui::Context) {
         let (InstallMode::OfficialAppImage { image, .. }, Some(release)) =
             (&self.mode, &self.release)
@@ -507,6 +697,7 @@ impl Updater {
             ctx.request_repaint();
         });
     }
+    #[cfg(target_os = "linux")]
     pub fn handoff(&mut self) -> Result<(), String> {
         let InstallMode::OfficialAppImage { image, helper } = &self.mode else {
             return Err("In-place updates are unavailable for this build".into());
@@ -584,6 +775,7 @@ impl Updater {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn digest(path: &Path) -> Result<String, String> {
     let mut file = File::open(path).map_err(|e| e.to_string())?;
     let mut hash = Sha256::new();
@@ -630,6 +822,7 @@ fn stream_verified<R: Read, W: Write>(
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn stage(
     image: &Path,
     release: &Release,
@@ -692,10 +885,40 @@ fn stage(
     result
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
     use std::net::TcpListener;
+
+    #[test]
+    fn linux_discovery_recovers_when_a_windows_release_is_latest() {
+        let entry = |tag: &str, prerelease| ApiRelease {
+            tag_name: tag.into(),
+            draft: false,
+            prerelease,
+            body: None,
+            assets: Vec::new(),
+        };
+        let windows = entry("windows-v9.0.0", false);
+        let linux = latest_linux_release(windows, || {
+            Ok(vec![
+                entry("v1.0.0", false),
+                entry("windows-v9.0.0", false),
+                entry("decky-v3.0.0", false),
+                entry("v2.0.0", false),
+                entry("v3.0.0", true),
+            ])
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(linux.tag_name, "v2.0.0");
+        let latest = latest_linux_release(entry("v1.0.0", false), || {
+            panic!("must keep the Linux Latest fast path")
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(latest.tag_name, "v1.0.0");
+    }
 
     #[test]
     fn github_style_asset_redirect_delivers_checksum_bytes() {
