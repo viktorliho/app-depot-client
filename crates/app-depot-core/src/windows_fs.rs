@@ -1080,6 +1080,38 @@ mod tests {
     }
 
     #[test]
+    fn quarantine_preserves_ntfs_ids_and_exposes_identical_replacements() {
+        let fixture = tempfile::tempdir().unwrap();
+        let live = fixture.path().join("installed");
+        let quarantine = fixture.path().join("quarantine");
+        ensure_directory(&live).unwrap();
+        fs::write(live.join("payload"), b"verified bytes").unwrap();
+
+        let identities = |path: &Path| {
+            let chain = directory_chain(path, false).unwrap();
+            let dir = chain.last().unwrap();
+            let file = open_removal_file(dir, OsStr::new("payload")).unwrap();
+            (file_identity(dir).unwrap(), file_identity(&file).unwrap())
+        };
+
+        let (root_id, payload_id) = identities(&live);
+        rename_directory_noreplace(&live, &quarantine).unwrap();
+        assert!(!live.exists());
+        assert_eq!(identities(&quarantine), (root_id, payload_id));
+
+        let moved = fixture.path().join("original");
+        fs::rename(quarantine.join("payload"), &moved).unwrap();
+        fs::copy(&moved, quarantine.join("payload")).unwrap();
+        let (reopened_root_id, replacement_id) = identities(&quarantine);
+        assert_eq!(reopened_root_id, root_id);
+        assert_eq!(
+            fs::read(quarantine.join("payload")).unwrap(),
+            fs::read(&moved).unwrap()
+        );
+        assert_ne!(replacement_id, payload_id);
+    }
+
+    #[test]
     fn creates_regular_files_exclusively_and_reads_flushed_bytes() {
         use std::io::{Read, Write};
         let fixture = tempfile::tempdir().unwrap();
