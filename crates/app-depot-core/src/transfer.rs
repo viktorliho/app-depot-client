@@ -1308,6 +1308,70 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn windows_file_removal_diagnostics_preserve_locked_linked_and_unexpected_data() {
+        let bytes = b"removal ownership fixture";
+        let mut fixture = fixture(bytes.to_vec(), "normal");
+        let job = queue(&mut fixture);
+        let library = &mut fixture.library;
+        library
+            .run_file_job(&fixture.client, &job.id, None)
+            .unwrap();
+        let item = library.install_windows_file(&job.id).unwrap();
+        assert!(
+            library
+                .remove_installation(&item.id, false)
+                .unwrap_err()
+                .to_string()
+                .contains("uncertain")
+        );
+        // Seed a positive completion record solely to exercise the removal preflight.
+        library
+            .conn
+            .execute(
+                "UPDATE installations SET process_start=?2 WHERE id=?1",
+                params![item.id, format!("windows:sv1:exited:{}:0", Uuid::new_v4())],
+            )
+            .unwrap();
+        let payload = item.path.join("payload");
+        let locked = open_regular(&payload, false).unwrap();
+        assert!(library.check_windows_removal(&item.id).is_err());
+        drop(locked);
+        let outside = fixture._root.path().join("alias");
+        fs::hard_link(&payload, &outside).unwrap();
+        assert!(library.check_windows_removal(&item.id).is_err());
+        assert_eq!(fs::read(&outside).unwrap(), bytes);
+        fs::remove_file(outside).unwrap();
+        let unknown = item.path.join("saves");
+        fs::create_dir(&unknown).unwrap();
+        assert!(
+            library
+                .check_windows_removal(&item.id)
+                .unwrap_err()
+                .to_string()
+                .contains("unexpected")
+        );
+        fs::remove_dir(unknown).unwrap();
+        assert!(
+            library
+                .remove_installation(&item.id, false)
+                .unwrap_err()
+                .to_string()
+                .contains("preflight passed")
+        );
+        assert_eq!(library.installation(&item.id).unwrap().state, "Ready");
+        assert_eq!(fs::read(&payload).unwrap(), bytes);
+        assert_eq!(
+            hash_file(
+                &library.object(&job.artifact_id).unwrap(),
+                job.expected_size
+            )
+            .unwrap(),
+            digest(&job.artifact_id).unwrap()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn windows_file_activation_retries_after_sqlite_rollback_and_detects_modification() {
         let mut fixture = fixture(b"file activation fixture".to_vec(), "normal");
         let job = queue(&mut fixture);

@@ -1725,12 +1725,37 @@ mod tests {
             library.reconcile_windows_installations().unwrap();
             library.verify_windows_installation(&pending.id).unwrap();
         }
+        assert!(
+            library
+                .check_windows_removal(&pending.id)
+                .unwrap_err()
+                .to_string()
+                .contains("uncertain")
+        );
+        library
+            .conn
+            .execute(
+                "UPDATE installations SET process_start=?2 WHERE id=?1",
+                params![
+                    pending.id,
+                    format!("windows:sv1:exited:{}:0", Uuid::new_v4())
+                ],
+            )
+            .unwrap();
+        library.check_windows_removal(&pending.id).unwrap();
         let payload = pending.path.join("payload");
         let unexpected = payload.join("unknown.txt");
         fs::write(&unexpected, b"sibling data").unwrap();
         assert!(
             library
                 .verify_windows_installation(&pending.id)
+                .unwrap_err()
+                .to_string()
+                .contains("unexpected")
+        );
+        assert!(
+            library
+                .check_windows_removal(&pending.id)
                 .unwrap_err()
                 .to_string()
                 .contains("unexpected")

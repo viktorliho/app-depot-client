@@ -661,6 +661,54 @@ fn open_installed_file(directory: &File, name: &str) -> io::Result<File> {
     Ok(file)
 }
 
+/// Read-only removal preflight. A successful scan does not authorize deletion.
+/// A future transaction must revalidate ownership while holding deletion handles.
+pub(crate) fn inspect_removal_layout(
+    installation: &Path,
+    id: &str,
+    verify_file: impl FnOnce(&File) -> io::Result<()>,
+    entries: Option<&[crate::models::InventoryEntry]>,
+) -> io::Result<()> {
+    let chain = directory_chain(installation, false)?;
+    let root = chain.last().unwrap();
+    require_case_insensitive(root)?;
+    for entry in std::fs::read_dir(installation)? {
+        let name = entry?.file_name();
+        if name != ".app-depot-installation-id" && name != "payload" {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unexpected installation entry: {}", name.to_string_lossy()),
+            ));
+        }
+    }
+    let marker = open_removal_file(root, OsStr::new(".app-depot-installation-id"))?;
+    let mut contents = String::new();
+    (&marker).take(37).read_to_string(&mut contents)?;
+    if contents != id {
+        return Err(invalid("installation ownership marker mismatch"));
+    }
+    match entries {
+        Some(entries) => verify_tree_inner(&installation.join("payload"), entries, true),
+        None => verify_file(&open_removal_file(root, OsStr::new("payload"))?),
+    }
+}
+
+fn open_removal_file(parent: &File, name: &OsStr) -> io::Result<File> {
+    let file = open_child(
+        parent,
+        name,
+        GENERIC_READ | DELETE | SYNCHRONIZE,
+        FILE_OPEN,
+        FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT,
+        0,
+    )?;
+    if file.metadata()?.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(invalid("reparse point in managed installation"));
+    }
+    require_single_link(&file)?;
+    Ok(file)
+}
+
 /// Constructs a new tree under an exclusive directory handle and publishes it by that handle.
 pub(crate) fn publish_tree(
     destination: &Path,
@@ -749,6 +797,14 @@ pub(crate) fn verify_tree(
     path: &Path,
     entries: &[crate::models::InventoryEntry],
 ) -> io::Result<()> {
+    verify_tree_inner(path, entries, false)
+}
+
+fn verify_tree_inner(
+    path: &Path,
+    entries: &[crate::models::InventoryEntry],
+    removal: bool,
+) -> io::Result<()> {
     use crate::models::InventoryEntry;
     use std::collections::HashMap;
     fn scan(
@@ -756,6 +812,7 @@ pub(crate) fn verify_tree(
         path: &Path,
         prefix: &str,
         remaining: &mut HashMap<&str, &InventoryEntry>,
+        removal: bool,
     ) -> io::Result<()> {
         require_case_insensitive(dir)?;
         for child in std::fs::read_dir(path)? {
@@ -779,17 +836,21 @@ pub(crate) fn verify_tree(
             match entry {
                 InventoryEntry::Directory { .. } => {
                     let subdir = directory_child(dir, &name, false, DIRECTORY_ACCESS)?;
-                    scan(&subdir, &child.path(), &relative, remaining)?;
+                    scan(&subdir, &child.path(), &relative, remaining, removal)?;
                 }
                 InventoryEntry::File { size, sha256, .. } => {
-                    let file = open_child(
-                        dir,
-                        &name,
-                        GENERIC_READ | SYNCHRONIZE,
-                        FILE_OPEN,
-                        FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT,
-                        FILE_SHARE_READ,
-                    )?;
+                    let file = if removal {
+                        open_removal_file(dir, &name)?
+                    } else {
+                        open_child(
+                            dir,
+                            &name,
+                            GENERIC_READ | SYNCHRONIZE,
+                            FILE_OPEN,
+                            FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT,
+                            FILE_SHARE_READ,
+                        )?
+                    };
                     let meta = file.metadata()?;
                     if !meta.is_file() || meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
                     {
@@ -810,7 +871,7 @@ pub(crate) fn verify_tree(
     }
     let chain = directory_chain(path, false)?;
     let mut remaining = entries.iter().map(|entry| (entry.path(), entry)).collect();
-    scan(chain.last().unwrap(), path, "", &mut remaining)?;
+    scan(chain.last().unwrap(), path, "", &mut remaining, removal)?;
     if let Some(missing) = remaining.keys().min() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,

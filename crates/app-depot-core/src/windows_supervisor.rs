@@ -273,7 +273,6 @@ pub(crate) fn play_state(record: &str) -> Option<ProcessState> {
 pub(crate) fn occupancy(record: Option<&str>, state: ProcessState) -> ProcessState {
     match (record, state) {
         (_, ProcessState::Running) => ProcessState::Running,
-        (None, ProcessState::Idle) => ProcessState::Idle,
         (Some(record), ProcessState::Idle) if clean_exit(record) => ProcessState::Idle,
         _ => ProcessState::Unknown,
     }
@@ -290,6 +289,7 @@ mod tests {
             play_state(&format!("{PREFIX}1:{job}:1:1:0")),
             Some(ProcessState::Unknown)
         );
+        assert_eq!(occupancy(None, ProcessState::Idle), ProcessState::Unknown);
         assert_eq!(
             occupancy(Some("windows:12"), ProcessState::Idle),
             ProcessState::Unknown

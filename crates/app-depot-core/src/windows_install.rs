@@ -129,6 +129,42 @@ impl Library {
         Ok(())
     }
 
+    /// Diagnose blockers without touching installation, download or CAS state.
+    /// Success only validates the current snapshot of managed occupancy and layout.
+    pub fn check_windows_removal(&self, id: &str) -> Result<(), LibraryError> {
+        let _slot = self.lock_download_slot()?;
+        let item = self.installation(id)?;
+        if item.state != "Ready" {
+            return Err(invalid("installation is not ready"));
+        }
+        use crate::windows_process::ProcessState;
+        match self.windows_installation_occupancy(id)? {
+            ProcessState::Running => {
+                return Err(invalid("a managed Windows process is still running"));
+            }
+            ProcessState::Unknown => {
+                return Err(invalid(
+                    "Windows occupancy is uncertain; preserve the installation",
+                ));
+            }
+            ProcessState::Idle => {}
+        }
+        let job = self.completed_install_job(&item)?;
+        let payload = self.verified_windows_payload(&job)?;
+        match &payload {
+            WindowsPayload::File(digest) => windows_fs::inspect_removal_layout(
+                &item.path,
+                id,
+                |file| verify(file, job.expected_size, digest),
+                None,
+            )?,
+            WindowsPayload::Tree(entries) => {
+                windows_fs::inspect_removal_layout(&item.path, id, |_| Ok(()), Some(entries))?
+            }
+        }
+        Ok(())
+    }
+
     fn verified_windows_payload<'a>(
         &self,
         job: &'a DownloadJob,

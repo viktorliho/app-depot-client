@@ -1164,14 +1164,35 @@ impl Library {
         Ok(())
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(windows)]
+    pub fn remove_installation(&mut self, id: &str, complete: bool) -> Result<(), LibraryError> {
+        if complete {
+            return Err(invalid("complete Windows removal is unavailable"));
+        }
+        self.check_windows_removal(id)?;
+        Err(invalid(
+            "Windows removal remains unavailable; the preflight passed",
+        ))
+    }
+
+    #[cfg(windows)]
+    pub fn remove_installation_observed(
+        &mut self,
+        id: &str,
+        complete: bool,
+        _observer: &mut dyn FnMut(&str),
+    ) -> Result<(), LibraryError> {
+        self.remove_installation(id, complete)
+    }
+
+    #[cfg(not(any(target_os = "linux", windows)))]
     pub fn remove_installation(&mut self, _id: &str, _complete: bool) -> Result<(), LibraryError> {
         Err(invalid(
             "managed removal is currently available only on Linux",
         ))
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", windows)))]
     pub fn remove_installation_observed(
         &mut self,
         _id: &str,
