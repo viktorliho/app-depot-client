@@ -692,9 +692,15 @@ pub(crate) fn inspect_removal_layout(
     verify_file: impl FnOnce(&File) -> io::Result<()>,
     entries: Option<&[crate::models::InventoryEntry]>,
 ) -> io::Result<()> {
-    let chain = directory_chain(installation, false)?;
-    let root = chain.last().unwrap();
-    require_case_insensitive(root)?;
+    let parent = installation
+        .parent()
+        .ok_or_else(|| invalid("missing installation parent"))?;
+    let name = installation
+        .file_name()
+        .ok_or_else(|| invalid("missing installation name"))?;
+    let chain = directory_chain(parent, false)?;
+    let root = open_removal_directory(chain.last().unwrap(), name)?;
+    require_case_insensitive(&root)?;
     for entry in std::fs::read_dir(installation)? {
         let name = entry?.file_name();
         if name != ".app-depot-installation-id" && name != "payload" {
@@ -704,15 +710,18 @@ pub(crate) fn inspect_removal_layout(
             ));
         }
     }
-    let marker = open_removal_file(root, OsStr::new(".app-depot-installation-id"))?;
+    let marker = open_removal_file(&root, OsStr::new(".app-depot-installation-id"))?;
     let mut contents = String::new();
     (&marker).take(37).read_to_string(&mut contents)?;
     if contents != id {
         return Err(invalid("installation ownership marker mismatch"));
     }
     match entries {
-        Some(entries) => verify_tree_inner(&installation.join("payload"), entries, true),
-        None => verify_file(&open_removal_file(root, OsStr::new("payload"))?),
+        Some(entries) => {
+            let payload = open_removal_directory(&root, OsStr::new("payload"))?;
+            verify_tree_inner(&installation.join("payload"), entries, Some(&payload))
+        }
+        None => verify_file(&open_removal_file(&root, OsStr::new("payload"))?),
     }
 }
 
@@ -730,6 +739,10 @@ fn open_removal_file(parent: &File, name: &OsStr) -> io::Result<File> {
     }
     require_single_link(&file)?;
     Ok(file)
+}
+
+fn open_removal_directory(parent: &File, name: &OsStr) -> io::Result<File> {
+    directory_child(parent, name, false, DIRECTORY_ACCESS | DELETE)
 }
 
 /// Constructs a new tree under an exclusive directory handle and publishes it by that handle.
@@ -820,13 +833,13 @@ pub(crate) fn verify_tree(
     path: &Path,
     entries: &[crate::models::InventoryEntry],
 ) -> io::Result<()> {
-    verify_tree_inner(path, entries, false)
+    verify_tree_inner(path, entries, None)
 }
 
 fn verify_tree_inner(
     path: &Path,
     entries: &[crate::models::InventoryEntry],
-    removal: bool,
+    removal_root: Option<&File>,
 ) -> io::Result<()> {
     use crate::models::InventoryEntry;
     use std::collections::HashMap;
@@ -858,7 +871,11 @@ fn verify_tree_inner(
             })?;
             match entry {
                 InventoryEntry::Directory { .. } => {
-                    let subdir = directory_child(dir, &name, false, DIRECTORY_ACCESS)?;
+                    let subdir = if removal {
+                        open_removal_directory(dir, &name)?
+                    } else {
+                        directory_child(dir, &name, false, DIRECTORY_ACCESS)?
+                    };
                     scan(&subdir, &child.path(), &relative, remaining, removal)?;
                 }
                 InventoryEntry::File { size, sha256, .. } => {
@@ -892,9 +909,13 @@ fn verify_tree_inner(
         }
         Ok(())
     }
-    let chain = directory_chain(path, false)?;
     let mut remaining = entries.iter().map(|entry| (entry.path(), entry)).collect();
-    scan(chain.last().unwrap(), path, "", &mut remaining, removal)?;
+    if let Some(root) = removal_root {
+        scan(root, path, "", &mut remaining, true)?;
+    } else {
+        let chain = directory_chain(path, false)?;
+        scan(chain.last().unwrap(), path, "", &mut remaining, false)?;
+    }
     if let Some(missing) = remaining.keys().min() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,

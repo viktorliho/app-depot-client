@@ -1744,6 +1744,25 @@ mod tests {
             .unwrap();
         library.check_windows_removal(&pending.id).unwrap();
         let payload = pending.path.join("payload");
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            use windows_sys::Win32::Storage::FileSystem::{
+                FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_READ, FILE_SHARE_WRITE,
+            };
+            let locked = fs::OpenOptions::new()
+                .read(true)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+                .open(payload.join("empty/nested"))
+                .unwrap();
+            assert!(matches!(
+                library.check_windows_removal(&pending.id),
+                Err(LibraryError::Io(error)) if error.raw_os_error() == Some(32)
+            ));
+            assert!(payload.join("empty/nested").is_dir());
+            drop(locked);
+        }
+        library.check_windows_removal(&pending.id).unwrap();
         let unexpected = payload.join("unknown.txt");
         fs::write(&unexpected, b"sibling data").unwrap();
         assert!(
