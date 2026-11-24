@@ -122,6 +122,14 @@ fn nt_result(status: i32) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
+fn trace_sharing_violation(error: &io::Error, operation: std::fmt::Arguments<'_>) {
+    if error.raw_os_error() == Some(windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION as i32)
+    {
+        eprintln!("Windows filesystem sharing violation: {operation}");
+    }
+}
+
 fn open_child(
     parent: &File,
     name: &OsStr,
@@ -163,7 +171,17 @@ fn open_child(
             0,
         )
     };
-    nt_result(status)?;
+    let result = nt_result(status);
+    #[cfg(test)]
+    if let Err(error) = &result {
+        trace_sharing_violation(
+            error,
+            format_args!(
+                "NtCreateFile status={status:#010x} access={access:#010x} share={share:#x} disposition={disposition:#x} options={options:#x}"
+            ),
+        );
+    }
+    result?;
     // SAFETY: NtCreateFile succeeded and returned an owned synchronous file handle.
     Ok(unsafe { File::from_raw_handle(raw) })
 }
@@ -318,13 +336,18 @@ pub(crate) fn sync_directory(path: &Path) -> io::Result<()> {
         return Err(invalid("directory sync requires a named directory"));
     };
     let chain = directory_chain(parent, false)?;
-    directory_child(
+    let result = directory_child(
         chain.last().unwrap(),
         name,
         false,
         DIRECTORY_ACCESS | GENERIC_WRITE,
     )?
-    .sync_all()
+    .sync_all();
+    #[cfg(test)]
+    if let Err(error) = &result {
+        trace_sharing_violation(error, format_args!("parent directory flush"));
+    }
+    result
 }
 
 #[repr(C)]
@@ -950,7 +973,17 @@ fn rename_noreplace(source: &File, target: &File, name: &[u16]) -> io::Result<()
             FileRenameInformation,
         )
     };
-    nt_result(status)
+    let result = nt_result(status);
+    #[cfg(test)]
+    if let Err(error) = &result {
+        trace_sharing_violation(
+            error,
+            format_args!(
+                "NtSetInformationFile(FileRenameInformation) status={status:#010x} flags=0"
+            ),
+        );
+    }
+    result
 }
 
 #[cfg(test)]

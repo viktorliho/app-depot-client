@@ -1,7 +1,7 @@
 name: Client CI
 on:
   push:
-    branches: [main, feature/windows-desktop-m4]
+    branches: [main, 'feature/**']
   pull_request:
 permissions:
   contents: read
