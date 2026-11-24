@@ -32,7 +32,7 @@ jobs:
           for size in 256 128 64 48 32; do test -s "target/AppDepot.AppDir/usr/share/icons/hicolor/${size}x${size}/apps/io.github.viktorliho.AppDepot.png"; done
 
   windows:
-    runs-on: windows-2022
+    runs-on: windows-2025
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - name: Pin Rust MSVC toolchain
