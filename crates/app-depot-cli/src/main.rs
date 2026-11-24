@@ -1314,6 +1314,8 @@ fn run() -> Result<(), CliError> {
 }
 
 fn main() -> ExitCode {
+    #[cfg(windows)]
+    app_depot_core::windows_process::supervisor_entrypoint();
     #[cfg(all(feature = "decky", target_os = "linux"))]
     let trace_launch = decky::launch_invocation();
     #[cfg(all(feature = "decky", target_os = "linux"))]

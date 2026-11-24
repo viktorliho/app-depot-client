@@ -410,13 +410,15 @@ impl Library {
                         let (target, work) = windows_paths(file, &target_path, &work);
                         use crate::windows_process::ProcessState;
                         match self.windows_process_state(&runtime.id)? {
-                            ProcessState::Running => {
-                                issue(&mut c, "Running", "The launched Windows process is running")
-                            }
+                            ProcessState::Running => issue(
+                                &mut c,
+                                "Running",
+                                "A process from this Windows launch is still running",
+                            ),
                             ProcessState::Unknown => issue(
                                 &mut c,
                                 "ProcessUnknown",
-                                "A previous launch cannot be safely classified",
+                                "A previous Windows launch has uncertain occupancy. Preserve this installation if its supervisor is unavailable.",
                             ),
                             ProcessState::Idle => match crate::windows_fs::bind_launch_target(
                                 &runtime.path,

@@ -21,6 +21,13 @@ use windows_sys::Win32::{
     },
 };
 
+/// Run the process watcher before CLI parsing or Desktop initialization.
+pub fn supervisor_entrypoint() {
+    if let Some(ok) = crate::windows_supervisor::dispatch() {
+        std::process::exit(i32::from(!ok));
+    }
+}
+
 pub struct WindowsChild {
     handle: OwnedHandle,
     id: u32,
@@ -166,6 +173,10 @@ pub(crate) struct Suspended {
 }
 
 impl Suspended {
+    pub(crate) fn raw_process(&self) -> HANDLE {
+        self.child.as_ref().unwrap().handle.as_raw_handle()
+    }
+
     pub(crate) fn identity(&self) -> io::Result<(u32, u64)> {
         let child = self.child.as_ref().unwrap();
         Ok((child.id(), creation_time(child.handle.as_raw_handle())?))
@@ -189,7 +200,7 @@ impl Drop for Suspended {
     }
 }
 
-fn creation_time(process: HANDLE) -> io::Result<u64> {
+pub(crate) fn creation_time(process: HANDLE) -> io::Result<u64> {
     let (mut created, mut exited, mut kernel, mut user) = (
         FILETIME::default(),
         FILETIME::default(),
@@ -252,6 +263,20 @@ impl Library {
         Ok(self::process_state(pid, time.as_deref()))
     }
 
+    /// Managed launch occupancy. Future removal callers must hold the lifecycle lock
+    /// across this query and their state change.
+    pub fn windows_installation_occupancy(&self, id: &str) -> Result<ProcessState, LibraryError> {
+        let record: Option<String> = self.conn.query_row(
+            "SELECT process_start FROM installations WHERE id=?1",
+            [id],
+            |row| row.get(0),
+        )?;
+        Ok(crate::windows_supervisor::occupancy(
+            record.as_deref(),
+            self.windows_process_state(id)?,
+        ))
+    }
+
     pub fn windows_active_processes(&self) -> Result<Vec<(String, ProcessState)>, LibraryError> {
         let mut statement = self.conn.prepare(
             "SELECT id,process_id,process_start FROM installations WHERE process_id IS NOT NULL OR process_start IS NOT NULL ORDER BY id",
@@ -295,6 +320,11 @@ impl Library {
         let target = candidate.target.as_deref().unwrap();
         let work = candidate.working_directory.as_deref().unwrap();
         let pinned = windows_fs::bind_launch_target(&install.path, &install.id, target, work)?;
+        let (prior_pid, prior): (Option<i64>, Option<String>) = self.conn.query_row(
+            "SELECT process_id,process_start FROM installations WHERE id=?1",
+            [&install.id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
         if self.conn.execute(
             "UPDATE installations SET process_id=NULL,process_start='windows:pending' WHERE id=?1 AND state='Ready'", [&install.id],
         )? != 1 {
@@ -307,7 +337,7 @@ impl Library {
         ) {
             Ok(process) => process,
             Err(error) => {
-                self.conn.execute("UPDATE installations SET process_start=NULL WHERE id=?1 AND process_start='windows:pending'", [&install.id])?;
+                self.conn.execute("UPDATE installations SET process_start=?2,process_id=?3 WHERE id=?1 AND process_start='windows:pending'", params![install.id, prior, prior_pid])?;
                 return Err(error.into());
             }
         };
@@ -318,9 +348,20 @@ impl Library {
             ));
         }
         let (pid, start) = initial.identity()?;
+        let record = crate::windows_supervisor::prepare(
+            &self.paths,
+            &install.id,
+            &initial,
+            start,
+            prior.as_deref(),
+        );
+        let (record, _job) = match record {
+            Ok((record, job)) => (record, Some(job)),
+            Err(_) => (format!("windows:{start}"), None),
+        };
         if self.conn.execute(
             "UPDATE installations SET process_id=?2,process_start=?3 WHERE id=?1 AND process_start='windows:pending'",
-            params![install.id, pid, format!("windows:{start}")],
+            params![install.id, pid, record],
         )? != 1 {
             return Err(LibraryError::Invalid("could not persist launch identity".into()));
         }
@@ -329,6 +370,9 @@ impl Library {
 }
 
 fn process_state(pid: Option<i64>, time: Option<&str>) -> ProcessState {
+    if let Some(state) = time.and_then(crate::windows_supervisor::play_state) {
+        return state;
+    }
     match (pid, time) {
         (None, None) => ProcessState::Idle,
         (Some(pid), Some(time)) => match (
@@ -350,7 +394,6 @@ fn process_state(pid: Option<i64>, time: Option<&str>) -> ProcessState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND};
 
     #[test]
     fn suspended_extensionless_child_has_stable_identity_before_running() {
@@ -387,71 +430,7 @@ mod tests {
             ProcessState::Unknown
         );
     }
-    use windows_sys::Win32::System::JobObjects::{
-        AssignProcessToJobObject, CreateJobObjectW, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
-        JobObjectBasicAccountingInformation, OpenJobObjectW, QueryInformationJobObject,
-    };
-    use windows_sys::Win32::System::SystemServices::JOB_OBJECT_QUERY;
-
-    fn job_name(id: uuid::Uuid) -> Vec<u16> {
-        format!("Global\\AppDepot.Process.{id}")
-            .encode_utf16()
-            .chain([0])
-            .collect()
-    }
-
-    fn new_job(id: uuid::Uuid, child: &Suspended) -> io::Result<OwnedHandle> {
-        let name = job_name(id);
-        // SAFETY: name is nul-terminated. Default security attributes do not inherit the handle.
-        let raw = unsafe { CreateJobObjectW(null(), name.as_ptr()) };
-        let status = io::Error::last_os_error();
-        if raw.is_null() {
-            return Err(status);
-        }
-        // SAFETY: CreateJobObjectW returned a fresh owned handle, even on an existing-name error.
-        let job = unsafe { OwnedHandle::from_raw_handle(raw) };
-        if status.raw_os_error() == Some(ERROR_ALREADY_EXISTS as i32) {
-            return Err(status);
-        }
-        let process = child.child.as_ref().unwrap().handle.as_raw_handle();
-        // SAFETY: both handles remain live and refer to the job and our suspended child.
-        if unsafe { AssignProcessToJobObject(job.as_raw_handle(), process) } == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(job)
-    }
-
-    fn job_active(id: uuid::Uuid) -> io::Result<Option<bool>> {
-        let name = job_name(id);
-        // SAFETY: name is nul-terminated and the result is either null or an owned handle.
-        let raw = unsafe { OpenJobObjectW(JOB_OBJECT_QUERY, 0, name.as_ptr()) };
-        if raw.is_null() {
-            let error = io::Error::last_os_error();
-            return if error.raw_os_error() == Some(ERROR_FILE_NOT_FOUND as i32) {
-                Ok(None)
-            } else {
-                Err(error)
-            };
-        }
-        // SAFETY: OpenJobObjectW returned a valid owned handle.
-        let job = unsafe { OwnedHandle::from_raw_handle(raw) };
-        let mut counts = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
-        // SAFETY: the live job and output buffer match the information class.
-        if unsafe {
-            QueryInformationJobObject(
-                job.as_raw_handle(),
-                JobObjectBasicAccountingInformation,
-                (&raw mut counts).cast(),
-                size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
-                std::ptr::null_mut(),
-            )
-        } == 0
-        {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(Some(counts.ActiveProcesses != 0))
-    }
-
+    use crate::windows_supervisor::{job_active, new_job};
     #[test]
     fn named_job_reports_detached_descendant_after_primary_and_handle_exit() {
         let cwd = std::env::current_dir().unwrap();
@@ -475,12 +454,25 @@ mod tests {
                 std::process::exit(1);
             }
             use std::os::windows::process::CommandExt;
+            const TEST: &str = "windows_process::tests::named_job_reports_detached_descendant_after_primary_and_handle_exit";
+            let attempted_breakaway = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST])
+                .env("M41B2_JOB_DESCENDANT", "1")
+                .current_dir(&cwd)
+                .creation_flags(windows_sys::Win32::System::Threading::CREATE_BREAKAWAY_FROM_JOB)
+                .spawn();
+            if let Ok(mut unexpected) = attempted_breakaway {
+                std::fs::write("descendant-release", b"").unwrap();
+                unexpected.wait().unwrap();
+                panic!("the fixture unexpectedly allowed breakaway");
+            }
             let child = std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", "windows_process::tests::named_job_reports_detached_descendant_after_primary_and_handle_exit"])
+                .args(["--exact", TEST])
                 .env("M41B2_JOB_DESCENDANT", "1")
                 .current_dir(&cwd)
                 .creation_flags(windows_sys::Win32::System::Threading::DETACHED_PROCESS)
-                .spawn().unwrap();
+                .spawn()
+                .unwrap();
             assert_ne!(child.id(), std::process::id());
             std::process::exit(0);
         }

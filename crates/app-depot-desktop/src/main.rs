@@ -509,6 +509,8 @@ fn library_paths() -> Result<LibraryPaths, String> {
     Ok(p)
 }
 fn main() -> eframe::Result {
+    #[cfg(windows)]
+    app_depot_core::windows_process::supervisor_entrypoint();
     if env::args_os()
         .nth(1)
         .is_some_and(|argument| argument == "--version")

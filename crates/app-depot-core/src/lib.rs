@@ -19,6 +19,8 @@ mod windows_fs;
 mod windows_install;
 #[cfg(windows)]
 pub mod windows_process;
+#[cfg(windows)]
+mod windows_supervisor;
 
 /// Locally generated identity for a configured Server profile. A URL is not an identity:
 /// endpoints may move, and different profiles may use the same URL with different credentials.
