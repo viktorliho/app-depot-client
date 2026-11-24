@@ -115,6 +115,16 @@ jobs:
           for /f "usebackq delims=" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do call "%%i\Common7\Tools\VsDevCmd.bat" -arch=x64 -host_arch=x64
           powershell -NoProfile -ExecutionPolicy RemoteSigned -File scripts\build-windows.ps1 -Stable -OutputDirectory "%RUNNER_TEMP%\app-depot-desktop-release"
       - run: ./scripts/test-windows-installer.ps1 -SetupOnlyManifest -PackageDirectory "$env:RUNNER_TEMP/app-depot-desktop-release"
+      - name: Check official Windows build version and source revision
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ needs.source.outputs.tag }}
+        run: |
+          $exe = Join-Path $env:RUNNER_TEMP 'app-depot-desktop-release/app-depot-desktop.exe'
+          $version = $env:RELEASE_TAG.Substring(1)
+          $expected = "App Depot Desktop $version (official, $env:APP_DEPOT_SOURCE_REVISION)"
+          $actual = (& $exe --version | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0 -or $actual -cne $expected) { throw "Unexpected Windows build identity: $actual" }
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: desktop-windows
@@ -123,7 +133,7 @@ jobs:
             ${{ runner.temp }}/app-depot-desktop-release/AppDepot-Desktop-Windows-x64-Setup.exe
             ${{ runner.temp }}/app-depot-desktop-release/SHA256SUMS
 
-  publish:
+  draft:
     needs: [source, linux, windows]
     runs-on: ubuntu-24.04
     concurrency:
@@ -140,7 +150,7 @@ jobs:
           pattern: desktop-*
           path: release-assets
           merge-multiple: true
-      - name: Verify draft and publish complete Desktop release
+      - name: Stage and verify the complete Desktop draft
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ needs.source.outputs.tag }}

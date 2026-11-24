@@ -75,5 +75,4 @@ test "$actual_names" = "$expected_names"
 verify_tag
 verify_latest_version
 gh release view "$tag" --json isDraft,isPrerelease --jq '.isDraft and (.isPrerelease | not)' | grep -Fx true
-gh release edit "$tag" --draft=false --prerelease=false --latest=true
-test "$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq '.tag_name')" = "$tag"
+echo "Verified complete Desktop draft $tag at $APP_DEPOT_SOURCE_REVISION. Owner publication is a separate step."

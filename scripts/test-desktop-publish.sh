@@ -32,10 +32,7 @@ case "$2" in
   create) test ! -e created; touch created ;;
   upload) test ! -e "draft/$(basename "$4")"; cp "$4" draft/ ;;
   download) test "$4" = --pattern; test "$6" = --dir; cp "draft/$5" "$7/" ;;
-  edit)
-    test "$*" = 'release edit v0.1.4 --draft=false --prerelease=false --latest=true'
-    test "$(find draft -type f | wc -l)" -eq 5
-    touch published ;;
+  edit) touch published; exit 1 ;;
   view)
     test -e created
     query="${!#}"
@@ -77,15 +74,16 @@ test ! -e published
 test "$(find draft -type f | wc -l)" -eq 1
 cp "assets/$image" "draft/$image"
 bash "$script" assets
-test -e published
+test ! -e published
+test "$(find draft -type f | wc -l)" -eq 5
 
 # A first run creates a new draft only after the same complete asset checks.
 mv draft resumed-draft
 mv created resumed-created
-mv published resumed-published
 mkdir draft
 export RESUME_DRAFT=false
 bash "$script" assets
 test -e created
-test -e published
+test ! -e published
+test "$(find draft -type f | wc -l)" -eq 5
 echo 'Desktop release draft fixtures passed'
