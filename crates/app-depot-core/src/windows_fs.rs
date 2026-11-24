@@ -939,18 +939,32 @@ fn rename_noreplace(source: &File, target: &File, name: &[u16]) -> io::Result<()
     };
     info.name[..name.len()].copy_from_slice(name);
     let mut status_block = IO_STATUS_BLOCK::default();
-    // SAFETY: fixed C layout checked against the SDK binding. Both endpoint handles and the
-    // complete name buffer remain valid for this synchronous operation. Flags forbid replacement.
-    let status = unsafe {
-        NtSetInformationFile(
-            source.as_raw_handle(),
-            &mut status_block,
-            (&raw const info).cast(),
-            size_of::<RenameInformation>() as u32,
-            FileRenameInformation,
-        )
-    };
-    nt_result(status)
+    // Transient opens by another process can prevent a directory rename even if the
+    // directory itself is pinned. Retry the same operation with the same handles.
+    for retry in 0..=20 {
+        // SAFETY: fixed C layout checked against the SDK binding. Both endpoint handles and
+        // the complete name buffer remain valid. Flags forbid replacement.
+        let status = unsafe {
+            NtSetInformationFile(
+                source.as_raw_handle(),
+                &mut status_block,
+                (&raw mut info).cast(),
+                size_of::<RenameInformation>() as u32,
+                FileRenameInformation,
+            )
+        };
+        match nt_result(status) {
+            Err(error)
+                if error.raw_os_error()
+                    == Some(windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION as i32)
+                    && retry < 20 =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            result => return result,
+        }
+    }
+    unreachable!()
 }
 
 #[cfg(test)]
