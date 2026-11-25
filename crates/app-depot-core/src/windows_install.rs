@@ -533,6 +533,15 @@ impl Library {
         if ambiguous {
             return Err(invalid("generation prerequisite occupancy is uncertain"));
         }
+        for attempt in self.prerequisite_attempt_ids(id)? {
+            let workspace =
+                crate::materialization::prerequisite_workspace(&self.paths.content, &attempt)?;
+            if present(&workspace)? {
+                return Err(invalid(
+                    "retained prerequisite workspace; inspect prerequisite progress before removal",
+                ));
+            }
+        }
         Ok(())
     }
 

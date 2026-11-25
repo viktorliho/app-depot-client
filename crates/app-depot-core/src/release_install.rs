@@ -1894,6 +1894,34 @@ mod tests {
         );
         assert_eq!(fs::read_to_string(&extra).unwrap(), "preserve");
         fs::remove_file(&extra).unwrap();
+        let pending_id = &next.generations[1].id;
+        let fingerprint = lib
+            .prerequisite_requirements(&profile, &blocked_id)
+            .unwrap()
+            .fingerprint;
+        let consent = lib
+            .confirm_prerequisites(
+                &profile,
+                pending_id,
+                &fingerprint,
+                &["required".into()],
+                false,
+            )
+            .unwrap();
+        let attempt = id();
+        lib.conn.execute("INSERT INTO prerequisite_attempts(id,consent_id,prerequisite_id,state) VALUES (?1,?2,'required','Failed')", params![attempt,consent]).unwrap();
+        let workspace =
+            crate::materialization::prerequisite_workspace(&lib.paths.content, &attempt).unwrap();
+        fs::create_dir(&workspace).unwrap();
+        let foreign = workspace.join("foreign.txt");
+        fs::write(&foreign, "preserve").unwrap();
+        assert!(
+            lib.uninstall_release_installation(&profile, &release)
+                .is_err()
+        );
+        assert_eq!(fs::read_to_string(&foreign).unwrap(), "preserve");
+        fs::remove_file(&foreign).unwrap();
+        fs::remove_dir(&workspace).unwrap();
         lib.uninstall_release_installation(&profile, &release)
             .unwrap();
         assert!(

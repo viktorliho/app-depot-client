@@ -124,8 +124,9 @@ interrupted or ambiguous attempts retain their source workspace for review.
 Progress reports remaining workspaces and retries cleanup of definite
 outcomes. A retry always uses a new independent layout. Linux uninstall checks
 attempt workspaces for running processes and removes them before deleting their
-journal. Windows Standard removal integration must consume the same attempt
-IDs and establish process quiescence before removing any retained workspace.
+journal. Windows Standard removal refuses ambiguous attempts and retained attempt
+workspaces, preserving their journal until prerequisite progress can establish
+safe cleanup.
 No additional schema migration is needed.
 The final map is independently copied into a new
 writable `payload/` directory. On Linux its reproducible staging directory is
