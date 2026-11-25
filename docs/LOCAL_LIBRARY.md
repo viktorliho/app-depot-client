@@ -100,7 +100,8 @@ Schema version 7 adds `release_installations`, `installation_generations` and
 `installation_sources` in an additive transaction. The stable local installation
 identity is keyed by profile and Release, and each new generation references
 one saved plan ID. Legacy `installations`, verified downloads, jobs, saved
-plans and credentials remain unchanged. Older clients refuse schema 7; use a
+plans and credentials remain unchanged. Schema version 8 additionally journals
+prerequisite consent rounds and outcomes. Older clients refuse schema 8; use a
 pre-upgrade backup to return to an older executable.
 
 An explicit Standard install journals a `Preparing` generation and all final
@@ -108,15 +109,36 @@ payload source Association/Artifact pairs before acquisition. Existing completed
 jobs and verified references are reused; absent sources use the existing File
 or Tree jobs and normal authorization. Each saved source is checked against
 its completed File identity or Tree inventory and its CAS object is rehashed.
-Prerequisite source references remain inert metadata, not a request to download
-or execute a prerequisite. The final map is independently copied into a new
+Prerequisite source pairs are retained with the generation but downloads are
+acquired and verified only for explicitly selected prerequisites during processing.
+The final map is independently copied into a new
 writable `payload/` directory. On Linux its reproducible staging directory is
 `staging/manifest-<generation-id>`; retry of the same saved plan discards only
 that interrupted staging directory and rebuilds from verified sources. A
 published generation is reverified on retry, never overwritten. The SQLite
 activation transaction retires the former active generation, sets the new
 state and switches the active pointer together after filesystem synchronization.
-A required prerequisite produces `PrerequisitesPending`, not `Ready`.
+Any declared prerequisite, including an optional-only list, produces
+`PrerequisitesPending` without changing the active pointer. Only completion of
+the prerequisite lifecycle activates that generation.
+
+The consent journal binds a generation to its exact saved plan fingerprint and
+explicit selected prerequisite IDs; all required IDs must be selected. Each
+round is single-use. Outcomes are recorded in manifest order (declined,
+running, succeeded, failed, cancelled, ambiguous or verified reuse), with
+timestamps, actual exit codes and diagnostics. The saved plan retains expected
+exit codes and source identities. Failure or cancellation stops the round;
+another attempt requires explicit retry authorization, including review of an
+interrupted running attempt (recorded as ambiguous when progress is inspected
+without an active coordinator, or when retry is confirmed).
+A prior completion may be reused only after the platform executor verifies its
+effects in the same generation and the source is revalidated. The final Ready
+transition, retirement and active pointer change commit in one SQLite
+transaction. An interrupted activation therefore retains the prior active
+generation; explicit retry can recover after verifying prior completions.
+Schema-7 generations and active pointers are preserved during migration;
+previously activated pending generations remain unready, and no historic
+consent or prerequisite completion is inferred.
 
 An error retains the previous active generation and the pending journal with
 its diagnostic. `install PLAN_ID` resumes that journal; another saved plan

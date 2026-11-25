@@ -171,7 +171,14 @@ mod coordinator {
                     .or_default()
                     .push(source);
             }
-            for (association, artifact) in sources.keys() {
+            let mut retained: std::collections::BTreeSet<_> = sources.keys().copied().collect();
+            retained.extend(
+                plan.prerequisites
+                    .iter()
+                    .flatten()
+                    .map(|p| (p.file.association_id.as_str(), p.file.artifact_id.as_str())),
+            );
+            for (association, artifact) in &retained {
                 if self.conn.query_row("SELECT EXISTS(SELECT 1 FROM installations WHERE profile_id=?1 AND association_id=?2 AND artifact_id=?3 AND state='Removing' AND remove_complete=1)",params![profile.0,association,artifact],|r| r.get::<_,bool>(0))? {return Err(invalid("source removal is pending; complete removal before installing"));}
             }
             let existing = self.release_installation(profile, &plan.release_id)?;
@@ -184,23 +191,32 @@ mod coordinator {
             let install_id = existing
                 .as_ref()
                 .map_or_else(|| Uuid::new_v4().to_string(), |i| i.id.clone());
-            let pending = existing
-                .as_ref()
-                .and_then(|i| i.generations.iter().find(|g| g.state == "Preparing"));
+            let pending = existing.as_ref().and_then(|i| {
+                i.generations
+                    .iter()
+                    .find(|g| g.state == "Preparing")
+                    .or_else(|| {
+                        i.generations
+                            .iter()
+                            .rev()
+                            .find(|g| g.state == "PrerequisitesPending")
+                    })
+            });
             if pending.is_some_and(|g| g.plan_id != plan_id) {
                 return Err(invalid(
                     "retry the pending plan or uninstall before selecting another plan",
                 ));
             }
+            let already_prepared = pending.is_some_and(|g| g.state == "PrerequisitesPending");
             let id = pending.map_or_else(|| Uuid::new_v4().to_string(), |g| g.id.clone());
             canonical(&id)?;
             let tx = self.conn.transaction()?;
             tx.execute("INSERT OR IGNORE INTO release_installations(id,profile_id,app_id,release_id) VALUES (?1,?2,?3,?4)",params![install_id,profile.0,plan.app_id,plan.release_id])?;
             if pending.is_none() {
                 tx.execute("INSERT INTO installation_generations(id,installation_id,plan_id,state) VALUES (?1,?2,?3,'Preparing')",params![id,install_id,plan_id])?;
-                for (association, artifact) in sources.keys() {
-                    tx.execute("INSERT INTO installation_sources(generation_id,association_id,artifact_id) VALUES (?1,?2,?3)",params![id,association,artifact])?;
-                }
+            }
+            for (association, artifact) in &retained {
+                tx.execute("INSERT OR IGNORE INTO installation_sources(generation_id,association_id,artifact_id) VALUES (?1,?2,?3)",params![id,association,artifact])?;
             }
             tx.commit()?;
             let prepared = (|| -> Result<(), LibraryError> {
@@ -218,7 +234,7 @@ mod coordinator {
                 let target = self.paths.content.join("apps").join(&id);
                 match fs::symlink_metadata(&target) {
                     Ok(_) => verify_generation(&target, &id, &layout)?,
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound && !already_prepared => {
                         publish_generation(&self.paths.content, &id, &layout, |digest| {
                             self.object(&format!("adfile:sha256:{digest}"))
                         })?
@@ -227,24 +243,25 @@ mod coordinator {
                 }
                 crate::transfer::sync_dir(&self.paths.content.join("apps"))?;
                 crate::transfer::sync_dir(&self.paths.content.join("staging"))?;
-                let state = if plan
+                if already_prepared {
+                    return Ok(());
+                }
+                let state = if !plan
                     .prerequisites
                     .as_ref()
                     .expect("Standard plan")
-                    .iter()
-                    .any(|p| !p.optional)
+                    .is_empty()
                 {
                     "PrerequisitesPending"
                 } else {
                     "Ready"
                 };
                 let tx = self.conn.transaction()?;
-                tx.execute("UPDATE installation_generations SET state='Retired' WHERE id=(SELECT active_generation FROM release_installations WHERE id=?1)",[&install_id])?;
+
                 if tx.execute("UPDATE installation_generations SET state=?2,last_error=NULL WHERE id=?1 AND installation_id=?3 AND state='Preparing'",params![id,state,install_id])? != 1 {return Err(invalid("pending generation changed before activation"));}
-                tx.execute(
-                    "UPDATE release_installations SET active_generation=?2 WHERE id=?1",
-                    params![install_id, id],
-                )?;
+                if state == "Ready" {
+                    Self::activate_generation(&tx, &install_id, &id)?;
+                }
                 tx.commit()?;
                 Ok(())
             })();
@@ -257,6 +274,296 @@ mod coordinator {
             }
             self.release_installation(profile, &plan.release_id)?
                 .ok_or_else(|| invalid("installation missing after activation"))
+        }
+
+        fn activate_generation(
+            tx: &rusqlite::Transaction<'_>,
+            installation: &str,
+            generation: &str,
+        ) -> Result<(), LibraryError> {
+            tx.execute("UPDATE installation_generations SET state='Retired' WHERE id=(SELECT active_generation FROM release_installations WHERE id=?1) AND id<>?2",params![installation,generation])?;
+            tx.execute(
+                "UPDATE release_installations SET active_generation=?2 WHERE id=?1",
+                params![installation, generation],
+            )?;
+            Ok(())
+        }
+
+        fn authorize_prerequisite_path(
+            &self,
+            job: &DownloadJob,
+            p: &crate::installation::Prerequisite,
+        ) -> Result<(), LibraryError> {
+            if let Some(file_id) = &p.file.file_id {
+                let entries = self
+                    .tree_inventory(&job.id)?
+                    .ok_or_else(|| invalid("missing prerequisite inventory"))?;
+                if !entries.iter().any(|e| matches!(e, InventoryEntry::File { path, file_id: id, .. } if path == &p.path && id == file_id)) {
+                    return Err(invalid("prerequisite path does not match verified Tree member"));
+                }
+            } else if !p.path.is_empty() {
+                return Err(invalid("File prerequisite must have an empty source path"));
+            }
+            Ok(())
+        }
+
+        fn pending_prerequisite_generation(
+            &self,
+            profile: &ServerProfileId,
+            generation: &str,
+        ) -> Result<(String, String, String, Plan), LibraryError> {
+            canonical(generation)?;
+            let (installation, plan_id, fingerprint): (String, String, String) = self.conn.query_row(
+                "SELECT i.id,g.plan_id,p.fingerprint FROM installation_generations g JOIN release_installations i ON i.id=g.installation_id JOIN installation_plans p ON p.id=g.plan_id WHERE g.id=?1 AND i.profile_id=?2 AND p.profile_id=?2 AND g.state='PrerequisitesPending' AND NOT EXISTS(SELECT 1 FROM installation_generations newer WHERE newer.installation_id=g.installation_id AND newer.rowid>g.rowid AND newer.state IN ('Preparing','PrerequisitesPending'))",
+                params![generation, profile.0], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))
+            ).optional()?.ok_or_else(|| invalid("pending prerequisite generation not found"))?;
+            let plan = self.load_install_plan(profile, &plan_id)?;
+            if crate::launch::host() != Some(&plan.platform) {
+                return Err(invalid("installation platform does not match this host"));
+            }
+            Ok((installation, plan_id, fingerprint, plan))
+        }
+
+        /// Exact immutable saved plan (including unresolved notes) for review.
+        pub fn prerequisite_requirements(
+            &self,
+            profile: &ServerProfileId,
+            plan_id: &str,
+        ) -> Result<crate::installation::SavedPlan, LibraryError> {
+            self.load_install_plan(profile, plan_id)?;
+            self.saved_plans(profile)?
+                .into_iter()
+                .find(|p| p.id == plan_id)
+                .ok_or_else(|| invalid("saved plan not found"))
+        }
+
+        /// Durable consent rounds and outcomes for a profile-owned generation.
+        pub fn prerequisite_progress(
+            &self,
+            profile: &ServerProfileId,
+            generation: &str,
+        ) -> Result<serde_json::Value, LibraryError> {
+            use serde_json::{Value, json};
+            canonical(generation)?;
+            // If the lifecycle lock is free, no coordinator can still be
+            // recording an outcome for this generation. A surviving child may
+            // nevertheless have external effects, so never infer its result.
+            let lock = self.manifest_lifecycle_lock().ok();
+            let (plan_id,state,last_error): (String,String,Option<String>) = self.conn.query_row("SELECT g.plan_id,g.state,g.last_error FROM installation_generations g JOIN release_installations i ON i.id=g.installation_id WHERE g.id=?1 AND i.profile_id=?2",params![generation,profile.0],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?.ok_or_else(||invalid("generation not found"))?;
+            if lock.is_some() {
+                let tx = self.conn.unchecked_transaction()?;
+                tx.execute("UPDATE prerequisite_attempts SET state='Ambiguous',detail='Interrupted before outcome was recorded',finished_at=unixepoch() WHERE state='Running' AND consent_id IN (SELECT id FROM prerequisite_consents WHERE generation_id=?1)",[generation])?;
+                tx.execute("UPDATE prerequisite_consents SET state='Finished' WHERE generation_id=?1 AND state='Running'",[generation])?;
+                tx.commit()?;
+            }
+            let saved = self.prerequisite_requirements(profile, &plan_id)?;
+            let mut rounds = Vec::new();
+            let mut consents = self.conn.prepare("SELECT id,fingerprint,selected_json,state,created_at,retry_authorized FROM prerequisite_consents WHERE generation_id=?1 ORDER BY rowid")?;
+            let mut rows = consents.query([generation])?;
+            while let Some(row) = rows.next()? {
+                let id: String = row.get(0)?;
+                let selected: String = row.get(2)?;
+                let mut attempts = self.conn.prepare("SELECT id,prerequisite_id,state,exit_code,detail,started_at,finished_at FROM prerequisite_attempts WHERE consent_id=?1 ORDER BY rowid")?;
+                let outcomes = attempts.query_map([&id], |a| Ok(json!({"id":a.get::<_,String>(0)?,"prerequisiteId":a.get::<_,String>(1)?,"state":a.get::<_,String>(2)?,"exitCode":a.get::<_,Option<i32>>(3)?,"detail":a.get::<_,Option<String>>(4)?,"startedAt":a.get::<_,i64>(5)?,"finishedAt":a.get::<_,Option<i64>>(6)?})))?.collect::<Result<Vec<Value>,_>>()?;
+                rounds.push(json!({"id":id,"fingerprint":row.get::<_,String>(1)?,"selected":serde_json::from_str::<Value>(&selected)?,"state":row.get::<_,String>(3)?,"createdAt":row.get::<_,i64>(4)?,"retryAuthorized":row.get::<_,bool>(5)?,"attempts":outcomes}));
+            }
+            Ok(
+                json!({"generationId":generation,"state":state,"lastError":last_error,"savedPlan":saved,"consents":rounds}),
+            )
+        }
+
+        fn validate_prerequisite_selection(
+            plan: &Plan,
+            selected: &[String],
+        ) -> Result<(), LibraryError> {
+            let requirements = plan.prerequisites.as_deref().unwrap_or_default();
+            let choices: std::collections::HashSet<_> = selected.iter().collect();
+            if choices.len() != selected.len()
+                || selected
+                    .iter()
+                    .any(|id| !requirements.iter().any(|p| &p.id == id))
+                || requirements
+                    .iter()
+                    .any(|p| !p.optional && !choices.contains(&p.id))
+            {
+                return Err(invalid(
+                    "select every required prerequisite and only declared IDs",
+                ));
+            }
+            Ok(())
+        }
+
+        /// Explicitly authorize one processing round. Retry must be explicitly set.
+        /// The caller must present the fingerprint and exact selected IDs.
+        pub fn confirm_prerequisites(
+            &mut self,
+            profile: &ServerProfileId,
+            generation: &str,
+            fingerprint: &str,
+            selected: &[String],
+            retry: bool,
+        ) -> Result<String, LibraryError> {
+            let _lock = self.manifest_lifecycle_lock()?;
+            let (_, _, expected, plan) =
+                self.pending_prerequisite_generation(profile, generation)?;
+            if fingerprint != expected {
+                return Err(invalid("saved plan fingerprint changed"));
+            }
+            let attempted: bool = self.conn.query_row("SELECT EXISTS(SELECT 1 FROM prerequisite_consents WHERE generation_id=?1 AND state IN ('Running','Finished','Superseded') AND (state<>'Superseded' OR EXISTS(SELECT 1 FROM prerequisite_attempts WHERE consent_id=prerequisite_consents.id)))",[generation],|r|r.get(0))?;
+            if attempted && !retry {
+                return Err(invalid("explicit retry authorization required"));
+            }
+            Self::validate_prerequisite_selection(&plan, selected)?;
+            let id = Uuid::new_v4().to_string();
+            let tx = self.conn.transaction()?;
+            tx.execute("UPDATE prerequisite_attempts SET state='Ambiguous',detail='Interrupted before outcome was recorded',finished_at=unixepoch() WHERE state='Running' AND consent_id IN (SELECT id FROM prerequisite_consents WHERE generation_id=?1)",[generation])?;
+            tx.execute("UPDATE prerequisite_consents SET state='Superseded' WHERE generation_id=?1 AND state IN ('Confirmed','Running')",[generation])?;
+            tx.execute("INSERT INTO prerequisite_consents(id,generation_id,fingerprint,selected_json,retry_authorized,state) VALUES (?1,?2,?3,?4,?5,'Confirmed')",params![id,generation,fingerprint,serde_json::to_string(selected)?,retry])?;
+            tx.commit()?;
+            Ok(id)
+        }
+
+        /// Process the confirmed selection in manifest order. A confirmation is
+        /// single use; an interrupted round never silently starts another installer.
+        pub fn process_prerequisites(
+            &mut self,
+            profile: &ServerProfileId,
+            generation: &str,
+            consent: &str,
+            client: Option<&ApiClient>,
+            executor: &mut impl crate::prerequisite::PrerequisiteExecutor,
+        ) -> Result<ReleaseInstallation, LibraryError> {
+            use crate::prerequisite::{PrerequisiteOutcome, PrerequisiteRequest};
+            let _lock = self.manifest_lifecycle_lock()?;
+            let (installation, _, fingerprint, plan) =
+                self.pending_prerequisite_generation(profile, generation)?;
+            let selected: String = self.conn.query_row("SELECT selected_json FROM prerequisite_consents WHERE id=?1 AND generation_id=?2 AND fingerprint=?3 AND state='Confirmed'",params![consent,generation,fingerprint],|r|r.get(0)).optional()?.ok_or_else(|| invalid("fresh matching prerequisite consent required"))?;
+            let selected: Vec<String> = serde_json::from_str(&selected)?;
+            Self::validate_prerequisite_selection(&plan, &selected)?;
+            let root = self.paths.content.join("apps").join(generation);
+            let payload = root.join("payload");
+            verify_generation(&root, generation, &destination_layout(&plan)?)?;
+            let tx = self.conn.transaction()?;
+            for p in plan.prerequisites.iter().flatten() {
+                tx.execute("INSERT OR IGNORE INTO installation_sources(generation_id,association_id,artifact_id) VALUES (?1,?2,?3)",params![generation,p.file.association_id,p.file.artifact_id])?;
+            }
+            tx.execute(
+                "UPDATE prerequisite_consents SET state='Running' WHERE id=?1",
+                [consent],
+            )?;
+            tx.commit()?;
+            for p in plan.prerequisites.iter().flatten() {
+                let attempt = Uuid::new_v4().to_string();
+                if !selected.contains(&p.id) {
+                    self.conn.execute("INSERT INTO prerequisite_attempts(id,consent_id,prerequisite_id,state,finished_at) VALUES (?1,?2,?3,'Declined',unixepoch())",params![attempt,consent,p.id])?;
+                    continue;
+                }
+                let source = (|| -> Result<PathBuf, LibraryError> {
+                    let job = self.acquire_plan_source(
+                        profile,
+                        &plan.release_id,
+                        &p.file.association_id,
+                        &p.file.artifact_id,
+                        client,
+                    )?;
+                    self.authorize_plan_files(&job, &[&p.file])?;
+                    self.authorize_prerequisite_path(&job, p)?;
+                    self.object(&format!("adfile:sha256:{}", p.file.sha256))
+                })();
+                let source = match source {
+                    Ok(source) => source,
+                    Err(e) => {
+                        let tx = self.conn.transaction()?;
+                        tx.execute("INSERT INTO prerequisite_attempts(id,consent_id,prerequisite_id,state,detail,finished_at) VALUES (?1,?2,?3,'Failed',?4,unixepoch())",params![attempt,consent,p.id,e.to_string()])?;
+                        tx.execute(
+                            "UPDATE prerequisite_consents SET state='Finished' WHERE id=?1",
+                            [consent],
+                        )?;
+                        tx.execute(
+                            "UPDATE installation_generations SET last_error=?2 WHERE id=?1",
+                            params![generation, format!("Prerequisite {}: {e}", p.id)],
+                        )?;
+                        tx.commit()?;
+                        return self
+                            .release_installation(profile, &plan.release_id)?
+                            .ok_or_else(|| invalid("installation missing"));
+                    }
+                };
+                let request = PrerequisiteRequest {
+                    generation_id: generation,
+                    attempt_id: &attempt,
+                    payload: &payload,
+                    verified_source: &source,
+                    prerequisite: p,
+                };
+                let previous: Option<(String,String)> = self.conn.query_row("SELECT CASE WHEN a.state='Reused' THEN a.detail ELSE a.id END,a.state FROM prerequisite_attempts a JOIN prerequisite_consents c ON c.id=a.consent_id WHERE c.generation_id=?1 AND c.fingerprint=?2 AND a.prerequisite_id=?3 ORDER BY a.rowid DESC LIMIT 1",params![generation,fingerprint,p.id],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+                if let Some((previous, state)) = previous
+                    && matches!(state.as_str(), "Succeeded" | "Reused")
+                {
+                    let prior = PrerequisiteRequest {
+                        attempt_id: &previous,
+                        ..request
+                    };
+                    if executor.verify_completion(&prior) {
+                        self.conn.execute("INSERT INTO prerequisite_attempts(id,consent_id,prerequisite_id,state,detail,finished_at) VALUES (?1,?2,?3,'Reused',?4,unixepoch())",params![attempt,consent,p.id,previous])?;
+                        continue;
+                    }
+                }
+                self.conn.execute("INSERT INTO prerequisite_attempts(id,consent_id,prerequisite_id,state) VALUES (?1,?2,?3,'Running')",params![attempt,consent,p.id])?;
+                let outcome = executor.execute(&request);
+                let (state, code, detail) = match outcome {
+                    PrerequisiteOutcome::Exited(code) if p.success_exit_codes.contains(&code) => {
+                        ("Succeeded", Some(code), None)
+                    }
+                    PrerequisiteOutcome::Exited(code) => (
+                        "Failed",
+                        Some(code),
+                        Some("Unexpected exit code".to_owned()),
+                    ),
+                    PrerequisiteOutcome::Failed(reason) => ("Failed", None, Some(reason)),
+                    PrerequisiteOutcome::Cancelled => ("Cancelled", None, None),
+                    PrerequisiteOutcome::Ambiguous(reason) => ("Ambiguous", None, Some(reason)),
+                };
+                self.conn.execute("UPDATE prerequisite_attempts SET state=?2,exit_code=?3,detail=?4,finished_at=unixepoch() WHERE id=?1",params![attempt,state,code,detail])?;
+                if state != "Succeeded" {
+                    let tx = self.conn.transaction()?;
+                    tx.execute(
+                        "UPDATE prerequisite_consents SET state='Finished' WHERE id=?1",
+                        [consent],
+                    )?;
+                    tx.execute(
+                        "UPDATE installation_generations SET last_error=?2 WHERE id=?1",
+                        params![generation, format!("Prerequisite {}: {state}", p.id)],
+                    )?;
+                    tx.commit()?;
+                    return self
+                        .release_installation(profile, &plan.release_id)?
+                        .ok_or_else(|| invalid("installation missing"));
+                }
+            }
+            let activation = (|| -> Result<(), LibraryError> {
+                verify_generation(&root, generation, &destination_layout(&plan)?)?;
+                // Activation and completion are atomic; an interrupted transaction
+                // leaves the old generation active and requires fresh authorization.
+                let tx = self.conn.transaction()?;
+                tx.execute(
+                    "UPDATE prerequisite_consents SET state='Finished' WHERE id=?1",
+                    [consent],
+                )?;
+                tx.execute("UPDATE installation_generations SET state='Ready',last_error=NULL WHERE id=?1 AND state='PrerequisitesPending'",[generation])?;
+                Self::activate_generation(&tx, &installation, generation)?;
+                tx.commit()?;
+                Ok(())
+            })();
+            if let Err(e) = activation {
+                self.conn.execute(
+                    "UPDATE installation_generations SET last_error=?2 WHERE id=?1",
+                    params![generation, e.to_string()],
+                )?;
+                return Err(e);
+            }
+            self.release_installation(profile, &plan.release_id)?
+                .ok_or_else(|| invalid("installation missing"))
         }
 
         fn acquire_plan_source(
@@ -779,10 +1086,7 @@ mod tests {
             blocked.generations.last().unwrap().state,
             "PrerequisitesPending"
         );
-        assert_ne!(
-            lib.launch_candidates(&profile, &release).unwrap()[0].status,
-            "Ready"
-        );
+        assert_eq!(blocked.active_generation.as_deref(), Some(pending.as_str()));
         lib.uninstall_release_installation(&profile, &release)
             .unwrap();
         assert!(!payload.exists());
@@ -795,6 +1099,259 @@ mod tests {
         lib.install_saved_plan(&profile, &plan_id, None).unwrap();
         lib.verify_release_installation(&profile, &release).unwrap();
     }
+    #[test]
+    fn prerequisite_consent_order_outcomes_and_recoverable_activation() {
+        use crate::prerequisite::{PrerequisiteExecutor, PrerequisiteOutcome, PrerequisiteRequest};
+        use std::collections::VecDeque;
+        struct Mock {
+            outcomes: VecDeque<PrerequisiteOutcome>,
+            seen: Vec<String>,
+            verify: bool,
+        }
+        impl PrerequisiteExecutor for Mock {
+            fn execute(&mut self, request: &PrerequisiteRequest<'_>) -> PrerequisiteOutcome {
+                assert!(request.payload.is_dir());
+                assert_eq!(fs::read(request.verified_source).unwrap(), b"installer");
+                self.seen.push(request.prerequisite.id.clone());
+                self.outcomes.pop_front().expect("unexpected execution")
+            }
+            fn verify_completion(&mut self, _: &PrerequisiteRequest<'_>) -> bool {
+                self.verify
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let paths = LibraryPaths {
+            metadata: temp.path().join("metadata"),
+            content: temp.path().join("content"),
+        };
+        let mut lib = Library::open(paths.clone()).unwrap();
+        let profile = lib
+            .add_profile("fixture", "http://localhost:8787", false)
+            .unwrap()
+            .id;
+        let (app, release, revision) = (id(), id(), id());
+        lib.conn
+            .execute(
+                "INSERT INTO apps(profile_id,id,metadata_json,last_seen) VALUES (?1,?2,'{}',0)",
+                params![profile.0, app],
+            )
+            .unwrap();
+        lib.conn.execute("INSERT INTO releases(profile_id,id,app_id,metadata_json,last_seen) VALUES (?1,?2,?3,'{}',0)",params![profile.0,release,app]).unwrap();
+        let payload = source(&lib, &profile, &release, b"payload", false);
+        let installer = source(&lib, &profile, &release, b"installer", true);
+        let mut plan = json!({"version":1,"appId":app,"releaseId":release,"revisionId":revision,"platform":crate::launch::host().unwrap(),"selections":{},"unresolved":[],"files":{"payload":payload},"directories":[],"prerequisites":[],"launch":null});
+        let old = lib
+            .install_saved_plan(&profile, &save(&lib, &profile, &plan), None)
+            .unwrap()
+            .active_generation
+            .unwrap();
+        plan["prerequisites"] = json!([
+            {"id":"first","name":"First","file":installer,"path":"original","arguments":["literal argument"],"optional":false,"evidence":"fixture","successExitCodes":[7]},
+            {"id":"optional","name":"Optional","file":installer,"path":"original","arguments":[],"optional":true,"evidence":"fixture","successExitCodes":[0]},
+            {"id":"last","name":"Last","file":installer,"path":"original","arguments":[],"optional":false,"evidence":"fixture","successExitCodes":[0]}
+        ]);
+        let plan_id = save(&lib, &profile, &plan);
+        let pending = lib.install_saved_plan(&profile, &plan_id, None).unwrap();
+        let generation = pending.generations.last().unwrap().id.clone();
+        assert_eq!(pending.active_generation.as_deref(), Some(old.as_str()));
+        assert_eq!(
+            pending.generations.last().unwrap().state,
+            "PrerequisitesPending"
+        );
+        lib.conn.execute_batch("DROP TABLE prerequisite_attempts; DROP TABLE prerequisite_consents; PRAGMA user_version=7;").unwrap();
+        drop(lib);
+        let mut lib = Library::open(paths.clone()).unwrap();
+        assert_eq!(
+            lib.release_installation(&profile, &release)
+                .unwrap()
+                .unwrap()
+                .active_generation
+                .as_deref(),
+            Some(old.as_str())
+        );
+        assert_eq!(
+            lib.prerequisite_progress(&profile, &generation).unwrap()["consents"],
+            json!([])
+        );
+        let saved = lib.prerequisite_requirements(&profile, &plan_id).unwrap();
+        let fingerprint = saved.fingerprint;
+        let selected = vec!["last".to_owned(), "optional".to_owned(), "first".to_owned()];
+        let required = vec!["first".into(), "last".into()];
+        assert!(
+            lib.confirm_prerequisites(&profile, &generation, "wrong", &selected, false)
+                .is_err()
+        );
+        assert!(
+            lib.confirm_prerequisites(
+                &profile,
+                &generation,
+                &fingerprint,
+                &["first".into()],
+                false
+            )
+            .is_err()
+        );
+        let mut mock = Mock {
+            outcomes: VecDeque::from([
+                PrerequisiteOutcome::Exited(7),
+                PrerequisiteOutcome::Exited(0),
+                PrerequisiteOutcome::Exited(9),
+            ]),
+            seen: vec![],
+            verify: false,
+        };
+        assert!(
+            lib.process_prerequisites(&profile, &generation, "missing", None, &mut mock)
+                .is_err()
+        );
+        let consent = lib
+            .confirm_prerequisites(&profile, &generation, &fingerprint, &selected, false)
+            .unwrap();
+        let result = lib
+            .process_prerequisites(&profile, &generation, &consent, None, &mut mock)
+            .unwrap();
+        assert_eq!(mock.seen, ["first", "optional", "last"]);
+        assert_eq!(result.active_generation.as_deref(), Some(old.as_str()));
+        assert!(
+            lib.process_prerequisites(&profile, &generation, &consent, None, &mut mock)
+                .is_err()
+        );
+        assert!(
+            lib.confirm_prerequisites(&profile, &generation, &fingerprint, &required, false)
+                .is_err()
+        );
+        let progress = lib.prerequisite_progress(&profile, &generation).unwrap();
+        assert_eq!(progress["consents"][0]["attempts"][0]["exitCode"], 7);
+        assert_eq!(progress["consents"][0]["attempts"][2]["state"], "Failed");
+        assert_eq!(progress["consents"][0]["attempts"][2]["exitCode"], 9);
+        drop(lib);
+        let mut lib = Library::open(paths.clone()).unwrap();
+        for outcome in [
+            PrerequisiteOutcome::Cancelled,
+            PrerequisiteOutcome::Ambiguous("unknown".into()),
+            PrerequisiteOutcome::Failed("unavailable".into()),
+        ] {
+            let consent = lib
+                .confirm_prerequisites(&profile, &generation, &fingerprint, &required, true)
+                .unwrap();
+            let mut mock = Mock {
+                outcomes: VecDeque::from([outcome]),
+                seen: vec![],
+                verify: true,
+            };
+            let result = lib
+                .process_prerequisites(&profile, &generation, &consent, None, &mut mock)
+                .unwrap();
+            assert_eq!(mock.seen, ["last"]);
+            assert_eq!(result.active_generation.as_deref(), Some(old.as_str()));
+        }
+        // Fail the activation transaction after successful durable outcomes.
+        let consent = lib
+            .confirm_prerequisites(&profile, &generation, &fingerprint, &required, true)
+            .unwrap();
+        lib.conn.execute_batch("CREATE TRIGGER fail_prereq_activation BEFORE UPDATE OF active_generation ON release_installations BEGIN SELECT RAISE(ABORT,'synthetic crash'); END;").unwrap();
+        let mut mock = Mock {
+            outcomes: VecDeque::from([PrerequisiteOutcome::Exited(0)]),
+            seen: vec![],
+            verify: true,
+        };
+        assert!(
+            lib.process_prerequisites(&profile, &generation, &consent, None, &mut mock)
+                .is_err()
+        );
+        assert_eq!(
+            lib.release_installation(&profile, &release)
+                .unwrap()
+                .unwrap()
+                .active_generation
+                .as_deref(),
+            Some(old.as_str())
+        );
+        lib.conn
+            .execute_batch("DROP TRIGGER fail_prereq_activation;")
+            .unwrap();
+        drop(lib);
+        let mut lib = Library::open(paths).unwrap();
+        let consent = lib
+            .confirm_prerequisites(&profile, &generation, &fingerprint, &required, true)
+            .unwrap();
+        let mut mock = Mock {
+            outcomes: VecDeque::new(),
+            seen: vec![],
+            verify: true,
+        };
+        let result = lib
+            .process_prerequisites(&profile, &generation, &consent, None, &mut mock)
+            .unwrap();
+        assert!(mock.seen.is_empty());
+        assert_eq!(
+            result.active_generation.as_deref(),
+            Some(generation.as_str())
+        );
+        assert_eq!(result.generations[0].state, "Retired");
+        assert_eq!(result.generations[1].state, "Ready");
+        let progress = lib.prerequisite_progress(&profile, &generation).unwrap();
+        assert_eq!(progress["consents"][1]["attempts"][2]["state"], "Cancelled");
+        assert_eq!(progress["consents"][2]["attempts"][2]["state"], "Ambiguous");
+        assert_eq!(progress["consents"][5]["attempts"][0]["state"], "Reused");
+        assert_eq!(progress["consents"][5]["attempts"][1]["state"], "Declined");
+        assert_eq!(progress["consents"][5]["attempts"][2]["state"], "Reused");
+        assert_eq!(progress["consents"][5]["retryAuthorized"], true);
+        // Optional-only plans still require explicit review, but a declined
+        // prerequisite is not acquired or executed, even if its source is absent.
+        plan["prerequisites"] = json!([{"id":"optional","name":"Optional","file":installer,"path":"original","arguments":[],"optional":true,"evidence":"fixture","successExitCodes":[0]}]);
+        let optional_id = save(&lib, &profile, &plan);
+        let next = lib
+            .install_saved_plan(&profile, &optional_id, None)
+            .unwrap();
+        let next_id = next.generations.last().unwrap().id.clone();
+        assert_eq!(next.active_generation.as_deref(), Some(generation.as_str()));
+        let fp = lib
+            .prerequisite_requirements(&profile, &optional_id)
+            .unwrap()
+            .fingerprint;
+        let consent = lib
+            .confirm_prerequisites(&profile, &next_id, &fp, &["optional".into()], false)
+            .unwrap();
+        // Simulate a crash with a durably journaled Running attempt.
+        lib.conn
+            .execute(
+                "UPDATE prerequisite_consents SET state='Running' WHERE id=?1",
+                [&consent],
+            )
+            .unwrap();
+        lib.conn.execute("INSERT INTO prerequisite_attempts(id,consent_id,prerequisite_id,state) VALUES (?1,?2,'optional','Running')",params![id(),consent]).unwrap();
+        let progress = lib.prerequisite_progress(&profile, &next_id).unwrap();
+        assert_eq!(progress["consents"][0]["attempts"][0]["state"], "Ambiguous");
+        assert!(
+            lib.confirm_prerequisites(&profile, &next_id, &fp, &[], false)
+                .is_err()
+        );
+        assert!(
+            lib.process_prerequisites(&profile, &next_id, &consent, None, &mut mock)
+                .is_err()
+        );
+        let object = lib
+            .object(&format!(
+                "adfile:sha256:{}",
+                installer["sha256"].as_str().unwrap()
+            ))
+            .unwrap();
+        fs::remove_file(object).unwrap();
+        let consent = lib
+            .confirm_prerequisites(&profile, &next_id, &fp, &[], true)
+            .unwrap();
+        let result = lib
+            .process_prerequisites(&profile, &next_id, &consent, None, &mut mock)
+            .unwrap();
+        assert_eq!(result.active_generation.as_deref(), Some(next_id.as_str()));
+        assert!(mock.seen.is_empty());
+        assert_eq!(
+            lib.prerequisite_progress(&profile, &next_id).unwrap()["consents"][1]["attempts"][0]["state"],
+            "Declined"
+        );
+    }
+
     #[cfg(windows)]
     #[test]
     fn windows_shared_generation_activation_and_pending_prerequisites() {
@@ -830,7 +1387,7 @@ mod tests {
         blocked["prerequisites"] = json!([{"id":"required","name":"Inert prerequisite","file":t,"path":"original","arguments":[],"optional":false,"evidence":"fixture","successExitCodes":[0]}]);
         let blocked_id = save(&lib, &profile, &blocked);
         let next = lib.install_saved_plan(&profile, &blocked_id, None).unwrap();
-        assert_eq!(next.generations[0].state, "Retired");
+        assert_eq!(next.generations[0].state, "Ready");
         assert_eq!(next.generations[1].state, "PrerequisitesPending");
         lib.verify_release_installation(&profile, &release).unwrap();
         assert!(

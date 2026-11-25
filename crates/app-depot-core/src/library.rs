@@ -13,7 +13,7 @@ use std::{
 };
 use uuid::Uuid;
 
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
 const MARKER: &str = ".app-depot-library-id";
 
 #[derive(Debug)]
@@ -434,7 +434,7 @@ impl Library {
             conn.execute_batch(MIGRATE_V5)?;
         } else if version == 4 {
             conn.execute_batch(MIGRATE_V5)?;
-        } else if version != 5 && version != 6 && version != SCHEMA_VERSION {
+        } else if version != 5 && version != 6 && version != 7 && version != SCHEMA_VERSION {
             return Err(invalid("library schema migration is required"));
         }
         if version < 6 {
@@ -442,6 +442,9 @@ impl Library {
         }
         if version < 7 {
             conn.execute_batch(MIGRATE_V7)?;
+        }
+        if version < 8 {
+            conn.execute_batch(MIGRATE_V8)?;
         }
         #[cfg(windows)]
         conn.execute_batch(crate::windows_install::REMOVAL_SCHEMA)?;
@@ -1011,6 +1014,32 @@ PRAGMA user_version=7;
 COMMIT;
 "#;
 
+const MIGRATE_V8: &str = r#"
+BEGIN IMMEDIATE;
+CREATE TABLE prerequisite_consents (
+ id TEXT PRIMARY KEY,
+ generation_id TEXT NOT NULL REFERENCES installation_generations(id) ON DELETE CASCADE,
+ fingerprint TEXT NOT NULL,
+ selected_json TEXT NOT NULL,
+ retry_authorized INTEGER NOT NULL CHECK(retry_authorized IN (0,1)),
+ state TEXT NOT NULL CHECK(state IN ('Confirmed','Running','Finished','Superseded')),
+ created_at INTEGER NOT NULL DEFAULT (unixepoch())
+);
+CREATE TABLE prerequisite_attempts (
+ id TEXT PRIMARY KEY,
+ consent_id TEXT NOT NULL REFERENCES prerequisite_consents(id) ON DELETE CASCADE,
+ prerequisite_id TEXT NOT NULL,
+ state TEXT NOT NULL CHECK(state IN ('Running','Succeeded','Failed','Cancelled','Ambiguous','Declined','Reused')),
+ exit_code INTEGER,
+ detail TEXT,
+ started_at INTEGER NOT NULL DEFAULT (unixepoch()),
+ finished_at INTEGER,
+ UNIQUE(consent_id,prerequisite_id)
+);
+PRAGMA user_version=8;
+COMMIT;
+"#;
+
 const MIGRATE_V6: &str = r#"
 BEGIN IMMEDIATE;
 CREATE TABLE installation_plans (
@@ -1161,7 +1190,7 @@ mod tests {
             )
             .unwrap();
         lib.conn
-            .execute_batch("DROP TABLE installation_sources; DROP TABLE installation_generations; DROP TABLE release_installations; DROP TABLE installation_plans; PRAGMA user_version=5;")
+            .execute_batch("DROP TABLE prerequisite_attempts; DROP TABLE prerequisite_consents; DROP TABLE installation_sources; DROP TABLE installation_generations; DROP TABLE release_installations; DROP TABLE installation_plans; PRAGMA user_version=5;")
             .unwrap();
         drop(lib);
         let lib = Library::open(roots).unwrap();
@@ -1177,7 +1206,7 @@ mod tests {
             lib.conn
                 .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
-            7
+            8
         );
     }
 
@@ -1193,7 +1222,7 @@ mod tests {
         use sha2::{Digest, Sha256};
         let fingerprint = format!("{:x}", Sha256::digest(raw.as_bytes()));
         lib.conn.execute("INSERT INTO installation_plans(id,profile_id,plan_json,fingerprint) VALUES ('saved',?1,?2,?3)",params![profile.id.0,raw,fingerprint]).unwrap();
-        lib.conn.execute_batch("DROP TABLE installation_sources; DROP TABLE installation_generations; DROP TABLE release_installations; PRAGMA user_version=6;").unwrap();
+        lib.conn.execute_batch("DROP TABLE prerequisite_attempts; DROP TABLE prerequisite_consents; DROP TABLE installation_sources; DROP TABLE installation_generations; DROP TABLE release_installations; PRAGMA user_version=6;").unwrap();
         drop(lib);
         let lib = Library::open(roots).unwrap();
         assert_eq!(lib.profile(&profile.id).unwrap().name, "existing");
@@ -1243,7 +1272,7 @@ mod tests {
                         lib.conn
                             .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                             .unwrap(),
-                        7
+                        8
                     );
                 })
             })

@@ -36,7 +36,7 @@ fn usage() -> &'static str {
     "usage: app-depot [--server URL | --profile ID] [--json] [--allow-insecure-http] <command> [id]\n\
      read: capabilities | apps | app ID | releases APP_ID | release ID | artifacts RELEASE_ID | declarations RELEASE_ID\n\
      plans: --profile ID plan manifest RELEASE | list | inspect ID | resolve RELEASE PLATFORM REVISION|current SELECTIONS_JSON\n\
-     install (Linux): --profile ID install PLAN_ID | install status RELEASE_ID | install verify RELEASE_ID | install uninstall RELEASE_ID --confirm\n\
+     install (Linux): --profile ID install PLAN_ID | install status RELEASE_ID | install verify RELEASE_ID | install uninstall RELEASE_ID --confirm | install requirements PLAN_ID | install progress GENERATION_ID | install confirm|retry GENERATION_ID FINGERPRINT SELECTED_IDS_JSON --confirm | install process GENERATION_ID CONSENT_ID --confirm\n\
      local: profile add NAME URL | profile list [--all] | profile rename ID NAME | profile move ID URL | profile remove ID --confirm\n\
      credentials: profile token-set ID --token-stdin | profile token-remove ID\n\
      sync/offline: --profile ID sync | cached-apps | cached-releases APP_ID | cached-declarations RELEASE_ID\n\
@@ -1200,6 +1200,46 @@ fn run_install(options: &Options) -> Result<(), CliError> {
     let mut library = open_library(options)?;
     let profile = library.profile(profile_id)?;
     match options.positional.as_slice() {
+        [_, action, plan] if action == "requirements" => {
+            print_json(&library.prerequisite_requirements(profile_id, plan)?)?;
+        }
+        [_, action, generation] if action == "progress" => {
+            print_json(&library.prerequisite_progress(profile_id, generation)?)?;
+        }
+        [_, action, generation, fingerprint, selected]
+            if matches!(action.as_str(), "confirm" | "retry") && options.confirm =>
+        {
+            let selected: Vec<String> = serde_json::from_str(selected)
+                .map_err(|e| ApiError::Config(format!("invalid selected prerequisite IDs: {e}")))?;
+            let consent = library.confirm_prerequisites(
+                profile_id,
+                generation,
+                fingerprint,
+                &selected,
+                action == "retry",
+            )?;
+            print_json(&serde_json::json!({"consentId":consent}))?;
+        }
+        [_, action, generation, consent] if action == "process" && options.confirm => {
+            struct Unavailable;
+            impl app_depot_core::prerequisite::PrerequisiteExecutor for Unavailable {
+                fn execute(
+                    &mut self,
+                    _: &app_depot_core::prerequisite::PrerequisiteRequest<'_>,
+                ) -> app_depot_core::prerequisite::PrerequisiteOutcome {
+                    app_depot_core::prerequisite::PrerequisiteOutcome::Failed(
+                        "Native prerequisite execution is unavailable on Linux".into(),
+                    )
+                }
+            }
+            print_json(&library.process_prerequisites(
+                profile_id,
+                generation,
+                consent,
+                None,
+                &mut Unavailable,
+            )?)?;
+        }
         [_, action, release] if action == "status" => {
             print_json(&library.release_installation(profile_id, release)?)?
         }

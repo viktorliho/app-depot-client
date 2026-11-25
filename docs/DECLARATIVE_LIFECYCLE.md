@@ -20,7 +20,7 @@ Unknown methods, malformed declarations, platform mismatches, missing installed 
 
 ## Remaining contract gaps
 
-Release `runtime.name/version` is descriptive only. InstallationManifestV1 supports Standard payload composition; prerequisite execution, Derived installation, Wine/Proton, environment override and system package operations remain unsupported. Data-only Artifacts need no launch metadata. Any future executable method requires a separate optional shared Server contract and explicit client support; arbitrary shell commands are not part of this method.
+Release `runtime.name/version` is descriptive only. InstallationManifestV1 supports Standard payload composition; the shared Core journals prerequisite authorization and outcomes; native Linux prerequisite execution, Derived installation, Wine/Proton, environment override and system package operations remain unsupported. Data-only Artifacts need no launch metadata. Any future executable method requires a separate optional shared Server contract and explicit client support; arbitrary shell commands are not part of this method.
 
 The CLI installation plan reader uses `--profile ID plan manifest RELEASE`,
 `plan resolve RELEASE PLATFORM REVISION|current SELECTIONS_JSON`, `plan list`
@@ -37,7 +37,19 @@ ENTRY_POINT_ID` executes only that declared installed target using the existing
 no-follow NativePortableV1 process adapter. The choice preserves the Association
 revision and separately carries the generation UUID, which guards against a
 changed active generation before Play. Modified installed bytes are allowed;
-Verify is a separate operation. Required prerequisites block Play even if the
-files have been acquired and installed. Optional prerequisites remain inert.
+Verify is a separate operation. A new generation with prerequisites is not
+active until the lifecycle completes; a previous ready generation remains
+launchable. Inspect the exact plan with `install requirements PLAN_ID`, then
+use `install confirm GENERATION_ID FINGERPRINT SELECTED_IDS_JSON --confirm`
+after reviewing all required and optional installers. The JSON array explicitly
+selects IDs; omitted optional IDs are declined, and omitted required IDs are
+rejected. `install progress GENERATION_ID` displays the saved plan and durable
+rounds. `install retry GENERATION_ID FINGERPRINT SELECTED_IDS_JSON --confirm`
+authorizes a new processing round after review; normal confirmation cannot
+silently retry an attempted round. `install process GENERATION_ID CONSENT_ID
+--confirm` consumes the round. Linux has no native installer adapter: selected
+execution is unavailable and cannot produce success, while an optional-only
+plan can be explicitly declined and activated without launching anything.
+The shared executor interface is available for the native Windows integration.
 No launch selection means no Standard launch candidate. Windows Standard
 launch and removal await generation-specific integration.

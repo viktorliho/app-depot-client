@@ -236,3 +236,17 @@ local generation-bound selection. Required prerequisites remain pending;
 prerequisite execution and Derived installation are not implemented. Windows
 shares the destination layout and acquisition/activation coordinator; its
 Standard launch and removal integration remain separate from this milestone.
+
+## M5.3A — Shared prerequisite lifecycle
+
+Schema 8 persists generation-bound consent rounds and attempt outcomes.
+The Standard coordinator prepares payloads without replacing the previous
+active generation, processes selected prerequisites in plan order using a
+platform executor, assesses declared exit codes and records explicit optional
+declines. Failures, cancellation and ambiguous results require renewed
+authorization. Activation is a recoverable SQLite transaction after successful
+completion. The Linux CLI supports plan review, confirmation, retry and progress
+inspection, and reports native execution as unavailable. Controlled mock
+execution tests the shared lifecycle without running installer binaries.
+The Windows native executor and generation-specific lifecycle are separate
+work; Wine, Proton, MSI, Derived installation and Desktop UI are not included.

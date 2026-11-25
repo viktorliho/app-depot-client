@@ -112,3 +112,12 @@ using at least two Artifacts and a benign native launch fixture. It resolves
 and saves the plan, acquires both Artifacts, verifies and launches, uninstalls,
 then reinstalls offline without creating new jobs. Use the existing real-Server
 fixture environment variables; no production resources are accessed.
+
+### Shared prerequisite lifecycle (M5.3A)
+
+The shared `release_install::tests` mock uses predetermined exit codes,
+failure, cancellation and ambiguous results, verifies manifest ordering and
+explicit consent/retry, and tests durable outcomes after reopening a disposable
+library. An injected activation transaction failure leaves the old generation
+active and is recovered with a fresh authorization and verified prior
+completions. No native installer is executed by this test.
