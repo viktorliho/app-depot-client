@@ -11,6 +11,7 @@ pub mod managed;
 pub mod materialization;
 pub mod migration;
 pub mod models;
+pub mod prerequisite;
 pub mod release_install;
 pub mod secrets;
 pub mod transfer;
