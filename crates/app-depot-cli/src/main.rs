@@ -36,6 +36,7 @@ fn usage() -> &'static str {
     "usage: app-depot [--server URL | --profile ID] [--json] [--allow-insecure-http] <command> [id]\n\
      read: capabilities | apps | app ID | releases APP_ID | release ID | artifacts RELEASE_ID | declarations RELEASE_ID\n\
      plans: --profile ID plan manifest RELEASE | list | inspect ID | resolve RELEASE PLATFORM REVISION|current SELECTIONS_JSON\n\
+     install (Linux): --profile ID install PLAN_ID | install status RELEASE_ID | install verify RELEASE_ID | install uninstall RELEASE_ID --confirm\n\
      local: profile add NAME URL | profile list [--all] | profile rename ID NAME | profile move ID URL | profile remove ID --confirm\n\
      credentials: profile token-set ID --token-stdin | profile token-remove ID\n\
      sync/offline: --profile ID sync | cached-apps | cached-releases APP_ID | cached-declarations RELEASE_ID\n\
@@ -731,7 +732,7 @@ fn run_first_play(options: &Options, prepare_only: bool) -> Result<(), CliError>
         .ok_or_else(|| {
             LibraryError::Invalid("selected entry point is absent from cached Release".into())
         })?;
-    if revision.is_some_and(|revision| *revision != selected.declaration_revision) {
+    if revision.is_some_and(|revision| revision != selected.selection_revision()) {
         return Err(LibraryError::Invalid(
             "Launch declaration changed. Synchronize and choose again.".into(),
         )
@@ -848,7 +849,7 @@ fn play_selected(library: &mut Library, selected: &LaunchCandidate) -> Result<()
         &selected.release_id,
         &selected.association_id,
         &selected.entry_id,
-        &selected.declaration_revision,
+        selected.selection_revision(),
     )?;
     eprintln!("started process {}", child.id());
     let status = child.wait().map_err(LibraryError::Io)?;
@@ -1178,7 +1179,7 @@ fn run_plan(options: &Options) -> Result<(), CliError> {
             let saved = library.resolve_plan(profile_id, &client, release, &request)?;
             if options.json { print_json(&saved)?; } else {
                 let plan = Plan::parse(&saved.plan, release, &request)?;
-                println!("Saved {} revision {} platform {} (read-only; execution unsupported)", saved.id, plan.revision_id, plan.platform);
+                println!("Saved {} revision {} platform {} (validated metadata; install is a separate operation)", saved.id, plan.revision_id, plan.platform);
                 println!("{} files, {} directories; localization {:?}", plan.files.as_ref().map_or(0, |f|f.len()), plan.directories.as_ref().map_or(0, |d|d.len()), plan.localization);
                 for p in plan.prerequisites.iter().flatten() { println!("Prerequisite: {} [{}] {}", p.name, if p.optional {"optional"} else {"required"}, p.path); }
                 if let Some(l)=plan.launch {println!("Launch: {}",l.path);}
@@ -1190,11 +1191,59 @@ fn run_plan(options: &Options) -> Result<(), CliError> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+fn run_install(options: &Options) -> Result<(), CliError> {
+    let profile_id = options
+        .profile
+        .as_ref()
+        .ok_or_else(|| ApiError::Config("install requires --profile ID".into()))?;
+    let mut library = open_library(options)?;
+    let profile = library.profile(profile_id)?;
+    match options.positional.as_slice() {
+        [_, action, release] if action == "status" => {
+            print_json(&library.release_installation(profile_id, release)?)?
+        }
+        [_, action, release] if action == "verify" => {
+            library.verify_release_installation(profile_id, release)?;
+            println!("Installation verified");
+        }
+        [_, action, release] if action == "uninstall" && options.confirm => {
+            library.uninstall_release_installation(profile_id, release)?;
+            println!("Installation removed; verified downloads retained");
+        }
+        [_, plan_id] => {
+            let client = if profile.archived {
+                None
+            } else {
+                Some(ApiClient::new(
+                    &profile.origin,
+                    selected_token(&profile)?,
+                    options.allow_insecure_http,
+                )?)
+            };
+            print_json(&library.install_saved_plan(profile_id, plan_id, client.as_ref())?)?;
+        }
+        _ => return Err(ApiError::Config(usage().into()).into()),
+    }
+    Ok(())
+}
+
 fn run() -> Result<(), CliError> {
     let options = parse_args()?;
     #[cfg(all(feature = "decky", target_os = "linux"))]
     if options.positional[0] == "decky" {
         return decky::run_decky(&options);
+    }
+    #[cfg(target_os = "linux")]
+    if options.positional[0] == "install" {
+        return run_install(&options);
+    }
+    #[cfg(not(target_os = "linux"))]
+    if options.positional[0] == "install" {
+        return Err(LibraryError::Invalid(
+            "Standard installation CLI is currently available only on Linux".into(),
+        )
+        .into());
     }
     if options.positional[0] == "plan" {
         return run_plan(&options);

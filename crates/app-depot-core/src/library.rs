@@ -13,7 +13,7 @@ use std::{
 };
 use uuid::Uuid;
 
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 const MARKER: &str = ".app-depot-library-id";
 
 #[derive(Debug)]
@@ -434,11 +434,14 @@ impl Library {
             conn.execute_batch(MIGRATE_V5)?;
         } else if version == 4 {
             conn.execute_batch(MIGRATE_V5)?;
-        } else if version != 5 && version != SCHEMA_VERSION {
+        } else if version != 5 && version != 6 && version != SCHEMA_VERSION {
             return Err(invalid("library schema migration is required"));
         }
         if version < 6 {
             conn.execute_batch(MIGRATE_V6)?;
+        }
+        if version < 7 {
+            conn.execute_batch(MIGRATE_V7)?;
         }
         #[cfg(windows)]
         conn.execute_batch(crate::windows_install::REMOVAL_SCHEMA)?;
@@ -978,6 +981,36 @@ PRAGMA user_version=4;
 COMMIT;
 "#;
 
+const MIGRATE_V7: &str = r#"
+BEGIN IMMEDIATE;
+CREATE TABLE release_installations (
+ id TEXT PRIMARY KEY,
+ profile_id TEXT NOT NULL REFERENCES profiles(id),
+ app_id TEXT NOT NULL,
+ release_id TEXT NOT NULL,
+ active_generation TEXT,
+ UNIQUE(profile_id,release_id)
+);
+CREATE TABLE installation_generations (
+ id TEXT PRIMARY KEY,
+ installation_id TEXT NOT NULL REFERENCES release_installations(id),
+ plan_id TEXT NOT NULL REFERENCES installation_plans(id),
+ state TEXT NOT NULL CHECK(state IN ('Preparing','Ready','PrerequisitesPending','Retired','Removing')),
+ last_error TEXT,
+ process_id INTEGER,
+ process_start TEXT
+);
+CREATE UNIQUE INDEX one_preparing_generation ON installation_generations(installation_id) WHERE state='Preparing';
+CREATE TABLE installation_sources (
+ generation_id TEXT NOT NULL REFERENCES installation_generations(id),
+ association_id TEXT NOT NULL,
+ artifact_id TEXT NOT NULL,
+ PRIMARY KEY(generation_id,association_id,artifact_id)
+);
+PRAGMA user_version=7;
+COMMIT;
+"#;
+
 const MIGRATE_V6: &str = r#"
 BEGIN IMMEDIATE;
 CREATE TABLE installation_plans (
@@ -1128,7 +1161,7 @@ mod tests {
             )
             .unwrap();
         lib.conn
-            .execute_batch("DROP TABLE installation_plans; PRAGMA user_version=5;")
+            .execute_batch("DROP TABLE installation_sources; DROP TABLE installation_generations; DROP TABLE release_installations; DROP TABLE installation_plans; PRAGMA user_version=5;")
             .unwrap();
         drop(lib);
         let lib = Library::open(roots).unwrap();
@@ -1144,7 +1177,34 @@ mod tests {
             lib.conn
                 .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
-            6
+            7
+        );
+    }
+
+    #[test]
+    fn migration_from_v6_preserves_saved_plan_and_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let roots = paths(&dir);
+        let mut lib = Library::open(roots.clone()).unwrap();
+        let profile = lib
+            .add_profile("existing", "http://localhost:8787", false)
+            .unwrap();
+        let raw = "{\"unknown\":18446744073709551615}";
+        use sha2::{Digest, Sha256};
+        let fingerprint = format!("{:x}", Sha256::digest(raw.as_bytes()));
+        lib.conn.execute("INSERT INTO installation_plans(id,profile_id,plan_json,fingerprint) VALUES ('saved',?1,?2,?3)",params![profile.id.0,raw,fingerprint]).unwrap();
+        lib.conn.execute_batch("DROP TABLE installation_sources; DROP TABLE installation_generations; DROP TABLE release_installations; PRAGMA user_version=6;").unwrap();
+        drop(lib);
+        let lib = Library::open(roots).unwrap();
+        assert_eq!(lib.profile(&profile.id).unwrap().name, "existing");
+        let plans = lib.saved_plans(&profile.id).unwrap();
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].fingerprint, fingerprint);
+        assert_eq!(plans[0].plan["unknown"].as_u64(), Some(u64::MAX));
+        assert!(
+            lib.release_installation(&profile.id, "release")
+                .unwrap()
+                .is_none()
         );
     }
 
@@ -1183,7 +1243,7 @@ mod tests {
                         lib.conn
                             .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                             .unwrap(),
-                        6
+                        7
                     );
                 })
             })

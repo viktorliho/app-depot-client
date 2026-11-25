@@ -1007,7 +1007,7 @@ fn operation(
                         .into_iter()
                         .find(|c| c.association_id == association && c.entry_id == entry)
                         .ok_or("selected launch declaration is no longer cached")?;
-                    if candidate.declaration_revision != declaration_revision {
+                    if candidate.selection_revision() != declaration_revision {
                         return Err(
                             "Launch declaration changed; review the updated choice before playing"
                                 .into(),

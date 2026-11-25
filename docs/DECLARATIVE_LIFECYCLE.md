@@ -20,7 +20,7 @@ Unknown methods, malformed declarations, platform mismatches, missing installed 
 
 ## Remaining contract gaps
 
-Release `runtime.name/version` is descriptive only. There is no standardized installation, dependency preparation, Wine/Proton, environment override or system package operation. Data-only Artifacts need no launch metadata. Any future executable method requires a separate optional shared Server contract and explicit client support; arbitrary shell commands are not part of this method.
+Release `runtime.name/version` is descriptive only. InstallationManifestV1 supports Standard payload composition; prerequisite execution, Derived installation, Wine/Proton, environment override and system package operations remain unsupported. Data-only Artifacts need no launch metadata. Any future executable method requires a separate optional shared Server contract and explicit client support; arbitrary shell commands are not part of this method.
 
 The CLI installation plan reader uses `--profile ID plan manifest RELEASE`,
 `plan resolve RELEASE PLATFORM REVISION|current SELECTIONS_JSON`, `plan list`
@@ -28,3 +28,16 @@ and `plan inspect ID`. Inspection and listing read the local library without a
 Server connection. Resolution saves metadata only; prerequisites, launch and
 Derived recipe locks do not authorize any action. A Release explicitly declaring
 an installation manifest cannot use legacy NativePortableV1 preparation or Play.
+
+On Linux, `install PLAN_ID` explicitly acquires and installs the validated
+Standard payload (see [Local library](LOCAL_LIBRARY.md#standard-installation-materialization-boundary)).
+It never launches automatically. `launch list RELEASE_ID` projects the active
+generation's saved launch selection, and `launch play RELEASE_ID ASSOCIATION_ID
+ENTRY_POINT_ID` executes only that declared installed target using the existing
+no-follow NativePortableV1 process adapter. The choice preserves the Association
+revision and separately carries the generation UUID, which guards against a
+changed active generation before Play. Modified installed bytes are allowed;
+Verify is a separate operation. Required prerequisites block Play even if the
+files have been acquired and installed. Optional prerequisites remain inert.
+No launch selection means no Standard launch candidate. Windows Standard
+launch and removal await generation-specific integration.

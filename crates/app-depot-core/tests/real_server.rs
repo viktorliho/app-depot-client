@@ -357,3 +357,84 @@ fn downloads_and_resumes_real_tree_artifact() {
         );
     }
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires isolated loopback Dev/Test Server with a prerequisite-free published Standard manifest"]
+fn installs_real_standard_plan_and_reuses_downloads() {
+    use app_depot_core::installation::ResolveRequest;
+    let url = env::var("APP_DEPOT_TEST_SERVER_URL").expect("isolated Server URL required");
+    assert!(matches!(
+        url::Url::parse(&url).unwrap().host_str(),
+        Some("127.0.0.1" | "localhost" | "::1")
+    ));
+    let release = env::var("APP_DEPOT_TEST_RELEASE_ID").unwrap();
+    let client = ApiClient::new(&url, env::var("APP_DEPOT_TEST_TOKEN").ok(), false).unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let mut library = Library::open(LibraryPaths {
+        metadata: root.path().join("metadata"),
+        content: root.path().join("content"),
+    })
+    .unwrap();
+    let profile = library
+        .add_profile("synthetic Standard fixture", &url, false)
+        .unwrap()
+        .id;
+    let saved = library
+        .resolve_plan(
+            &profile,
+            &client,
+            &release,
+            &ResolveRequest {
+                platform: format!("linux/{}", std::env::consts::ARCH),
+                revision_id: None,
+                selections: Default::default(),
+            },
+        )
+        .unwrap();
+    let installation = library
+        .install_saved_plan(&profile, &saved.id, Some(&client))
+        .unwrap();
+    assert_eq!(installation.generations[0].state, "Ready");
+    library
+        .verify_release_installation(&profile, &release)
+        .unwrap();
+    let candidates = library.launch_candidates(&profile, &release).unwrap();
+    assert_eq!(candidates.len(), 1);
+    let candidate = &candidates[0];
+    assert_eq!(candidate.status, "Ready");
+    assert!(
+        library
+            .play_declared(
+                &profile,
+                &release,
+                &candidate.association_id,
+                &candidate.entry_id,
+                candidate.selection_revision()
+            )
+            .unwrap()
+            .wait()
+            .unwrap()
+            .success()
+    );
+    let jobs = library.jobs(Some(&profile)).unwrap();
+    assert!(jobs.len() >= 2 && jobs.iter().all(|j| j.state == "Completed"));
+    library
+        .uninstall_release_installation(&profile, &release)
+        .unwrap();
+    library
+        .install_saved_plan(&profile, &saved.id, None)
+        .unwrap();
+    library
+        .verify_release_installation(&profile, &release)
+        .unwrap();
+    assert_eq!(
+        library
+            .jobs(Some(&profile))
+            .unwrap()
+            .iter()
+            .map(|j| &j.id)
+            .collect::<Vec<_>>(),
+        jobs.iter().map(|j| &j.id).collect::<Vec<_>>()
+    );
+}

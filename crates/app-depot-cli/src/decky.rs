@@ -388,7 +388,7 @@ fn choice_key(choice: &LaunchCandidate) -> Vec<&str> {
         &choice.release_id,
         &choice.association_id,
         &choice.entry_id,
-        &choice.declaration_revision,
+        choice.selection_revision(),
     ]
 }
 
@@ -426,7 +426,7 @@ fn supervise(
         &choice.release_id,
         &choice.association_id,
         &choice.entry_id,
-        &choice.declaration_revision,
+        choice.selection_revision(),
     )?;
     let mut termination = None;
     loop {
@@ -599,7 +599,7 @@ impl PlayUi {
                 &choice.release_id,
                 &choice.association_id,
                 &choice.entry_id,
-                &choice.declaration_revision,
+                choice.selection_revision(),
             ])
             .env("APP_DEPOT_DECKY_RPC", "1")
             .stderr(Stdio::piped())

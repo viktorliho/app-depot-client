@@ -21,6 +21,8 @@ pub struct LaunchCandidate {
     pub artifact_id: String,
     pub entry_id: String,
     pub declaration_revision: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generation_id: Option<String>,
     pub label: Option<String>,
     pub target: Option<String>,
     pub working_directory: Option<String>,
@@ -28,7 +30,7 @@ pub struct LaunchCandidate {
     pub status: String,
     pub reason: String,
     #[serde(skip)]
-    local_root: Option<PathBuf>,
+    pub(crate) local_root: Option<PathBuf>,
 }
 fn invalid(message: &str) -> LibraryError {
     LibraryError::Invalid(message.into())
@@ -74,7 +76,7 @@ fn path_valid(path: &str) -> bool {
             !part.is_empty() && part != "." && part != ".." && !part.chars().any(char::is_control)
         })
 }
-fn host() -> Option<&'static str> {
+pub(crate) fn host() -> Option<&'static str> {
     match (std::env::consts::OS, std::env::consts::ARCH) {
         ("linux", "x86_64") => Some("linux/x86_64"),
         ("linux", "aarch64") => Some("linux/aarch64"),
@@ -130,6 +132,18 @@ impl Library {
         profile: &ServerProfileId,
         release: &str,
     ) -> Result<Vec<LaunchCandidate>, LibraryError> {
+        #[cfg(target_os = "linux")]
+        if self.release_installation(profile, release)?.is_some() {
+            return Ok(self
+                .manifest_launch_candidate(profile, release)?
+                .into_iter()
+                .collect());
+        }
+        #[cfg(windows)]
+        if self.release_installation(profile, release)?.is_some() {
+            // Standard generation launch supervision has not been integrated on Windows.
+            return Ok(Vec::new());
+        }
         let snapshot = self
             .cached_snapshot(profile, release)?
             .ok_or_else(|| invalid("cached Release declaration snapshot unavailable"))?
@@ -170,6 +184,7 @@ impl Library {
                     artifact_id: a.artifact_id.clone(),
                     entry_id: id.into(),
                     declaration_revision: doc.declaration.revision_id.clone(),
+                    generation_id: None,
                     label: entry
                         .get("label")
                         .and_then(Value::as_str)
@@ -527,6 +542,7 @@ pub(crate) fn open_nofollow(
         let flags = libc::O_RDONLY
             | libc::O_NOFOLLOW
             | libc::O_CLOEXEC
+            | libc::O_NONBLOCK
             | if i + 1 < components.len() || directory {
                 libc::O_DIRECTORY
             } else {
@@ -542,8 +558,15 @@ pub(crate) fn open_nofollow(
 }
 
 impl LaunchCandidate {
+    /// Local selection guard; a Standard plan binds Play to its exact active generation.
+    pub fn selection_revision(&self) -> &str {
+        self.generation_id
+            .as_deref()
+            .unwrap_or(&self.declaration_revision)
+    }
+
     #[cfg(target_os = "linux")]
-    fn local_readiness(&self) -> Result<(), String> {
+    pub(crate) fn local_readiness(&self) -> Result<(), String> {
         use std::os::unix::fs::PermissionsExt;
         let root = self
             .local_root
@@ -792,6 +815,7 @@ mod tests {
             artifact_id: "artifact".into(),
             entry_id: "entry".into(),
             declaration_revision: "test-revision".into(),
+            generation_id: None,
             label: None,
             target: Some("native-program".into()),
             working_directory: Some(String::new()),
@@ -849,6 +873,7 @@ mod tests {
             artifact_id: "tree".into(),
             entry_id: "game".into(),
             declaration_revision: "test-revision".into(),
+            generation_id: None,
             label: None,
             target: Some("System64/game".into()),
             working_directory: Some("System64".into()),

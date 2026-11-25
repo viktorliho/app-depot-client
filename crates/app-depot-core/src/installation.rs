@@ -795,7 +795,7 @@ impl Library {
             assessment: if plan.recipe.is_some() {
                 "Derived metadata only".into()
             } else {
-                "Validated Standard metadata; execution unsupported".into()
+                "Validated Standard metadata".into()
             },
             plan: raw,
         };
@@ -826,7 +826,7 @@ impl Library {
                 {
                     "Derived metadata only".into()
                 } else {
-                    "Validated Standard metadata; execution unsupported".into()
+                    "Validated Standard metadata".into()
                 },
                 plan: serde_json::from_str(&json)?,
             })

@@ -95,3 +95,20 @@ The desktop updater's deterministic tests cover numeric version ordering, malfor
 Before the v0.1.0 tag, disposable local AppImages built with 0.1.0 and 0.1.1 were exchanged through the real helper. The replacement acknowledged startup and the prior version remained recoverable. A deliberately truncated replacement failed startup and restored the prior version. A separately isolated Gear Lever Flatpak HOME integrated the AppImage, extracted its 256-pixel icon and embedded GitHub update source, displayed its version, and kept one desktop entry at the same installed path after replacement. X11 window metadata reported the stable application ID and a 64-pixel native icon; an actual window screenshot showed the titlebar icon. Native Wayland and X11 launches used disposable libraries. A disposable HTTP profile and test-only Secret Service credential confirmed that the packaged desktop read a token; the credential was removed afterward. These local fixtures do not prove the later public GitHub Release or compatibility on every Linux distribution.
 
 M2.4.1 adds a deterministic eight-direction resize-region test. With a disposable library, a native Wayland debug window changed from 1280×820 to 1650×1044 according to KWin window geometry; the owner confirmed interactive resizing in that window. An XWayland debug window responded to pointer drags at the east and south edges and northwest corner; reducing its width stopped at the configured 760-pixel minimum. These checks do not establish every edge and corner on every Wayland compositor. The owner's real Gear Lever installation and `~/.appdepot` were not used for automated resizing tests.
+
+### Standard transactional payload installation (M5.2A)
+
+`materialization::tests` checks destination projection with repeated source IDs
+and explicit empty directories. `release_install::tests` exercises a disposable
+Linux library with File and Tree sources, independent writable copies, exact
+layout verification, declared direct launch, retained downloads, failed
+preparation, a partial stage, failed activation after filesystem publication,
+retry after reopening the library, prerequisite gating, uninstall and offline
+reinstall. Migration tests cover existing schemas including saved version-6
+plans, with profile and exact JSON data preserved. The ignored
+`installs_real_standard_plan_and_reuses_downloads` integration test requires a
+loopback Dev/Test Server with a published prerequisite-free Standard manifest
+using at least two Artifacts and a benign native launch fixture. It resolves
+and saves the plan, acquires both Artifacts, verifies and launches, uninstalls,
+then reinstalls offline without creating new jobs. Use the existing real-Server
+fixture environment variables; no production resources are accessed.

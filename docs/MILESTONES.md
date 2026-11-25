@@ -220,3 +220,19 @@ Windows Server 2022 runner image `win22/20261116.370` reported sharing violation
 #### Windows MVP closure
 
 The owner accepted the unified stable Desktop v0.1.4 release on Linux and Windows on November 25, 2026. Windows MVP is complete and enters maintenance mode. Native File/Tree installation, verification, Play, process supervision, conservative working-copy Uninstall, Reinstall, Setup and in-app updates are supported within the documented contracts. Deferred Windows work consists of Repair, physical CAS garbage collection, extended Windows 10 lifecycle validation, Windows Server 2022 sharing diagnostics and automatic Desktop update rollback. These items are outside the accepted MVP and do not block v0.1.4. Future explicitly assigned Desktop release tasks use the autonomous publication procedure in [Distribution](DISTRIBUTION.md).
+
+## M5.2A — Standard transactional payload installation
+
+The shared Core projects a persisted, validated Standard plan to a final
+layout, acquires its payload Artifacts through existing verified jobs, and
+records Release-scoped installations and generations with schema version 7.
+Linux independently copies CAS objects, verifies the exact layout and activates
+one generation atomically after durable filesystem publication. Pending and
+retired generations retain their source references and the previous installation
+is never overwritten during preparation. CLI installs, inspects, verifies,
+uninstalls and reinstalls Standard payloads. A prerequisite-free declared
+launch uses the existing Linux NativePortableV1 execution adapter with a
+local generation-bound selection. Required prerequisites remain pending;
+prerequisite execution and Derived installation are not implemented. Windows
+shares the destination layout and acquisition/activation coordinator; its
+Standard launch and removal integration remain separate from this milestone.

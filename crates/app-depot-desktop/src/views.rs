@@ -1097,7 +1097,7 @@ impl Desktop {
                         release: candidate.release_id.clone(),
                         association: candidate.association_id.clone(),
                         entry: candidate.entry_id.clone(),
-                        declaration_revision: candidate.declaration_revision.clone(),
+                        declaration_revision: candidate.selection_revision().to_owned(),
                     });
                     self.launch_states.insert(
                         key.clone(),
@@ -1538,7 +1538,7 @@ impl Desktop {
             release: candidate.release_id.clone(),
             association: candidate.association_id.clone(),
             entry: candidate.entry_id.clone(),
-            declaration_revision: candidate.declaration_revision.clone(),
+            declaration_revision: candidate.selection_revision().to_owned(),
         });
         self.launch_states
             .insert(key, ("Starting".into(), "Starting application".into()));

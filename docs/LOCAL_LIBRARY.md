@@ -88,8 +88,57 @@ attributes on Linux. The adapter publishes a generation UUID directory under
 `apps/` without replacement, with a `payload/` directory and a sibling
 `.app-depot-installation-id` marker containing the UUID. Publication does not
 activate a generation; only the Core SQLite transaction does. Verification
-checks the marker and exact destination layout without mutation. Windows uses
+checks the marker and exact destination layout without mutation. The shared
+Core calls `publish_generation(content, id, entries, object)` and
+`verify_generation(root, id, entries)` in `materialization`. Windows uses
 `windows_fs::publish_tree_install(to, id, entries, object)` and
 `windows_fs::verify_tree_install(to, id, entries)`; the object callback maps a
 SHA-256 digest to an already authorized CAS path. No adapter may execute
 prerequisites or infer launch semantics.
+
+Schema version 7 adds `release_installations`, `installation_generations` and
+`installation_sources` in an additive transaction. The stable local installation
+identity is keyed by profile and Release, and each new generation references
+one saved plan ID. Legacy `installations`, verified downloads, jobs, saved
+plans and credentials remain unchanged. Older clients refuse schema 7; use a
+pre-upgrade backup to return to an older executable.
+
+An explicit Standard install journals a `Preparing` generation and all final
+payload source Association/Artifact pairs before acquisition. Existing completed
+jobs and verified references are reused; absent sources use the existing File
+or Tree jobs and normal authorization. Each saved source is checked against
+its completed File identity or Tree inventory and its CAS object is rehashed.
+Prerequisite source references remain inert metadata, not a request to download
+or execute a prerequisite. The final map is independently copied into a new
+writable `payload/` directory. On Linux its reproducible staging directory is
+`staging/manifest-<generation-id>`; retry of the same saved plan discards only
+that interrupted staging directory and rebuilds from verified sources. A
+published generation is reverified on retry, never overwritten. The SQLite
+activation transaction retires the former active generation, sets the new
+state and switches the active pointer together after filesystem synchronization.
+A required prerequisite produces `PrerequisitesPending`, not `Ready`.
+
+An error retains the previous active generation and the pending journal with
+its diagnostic. `install PLAN_ID` resumes that journal; another saved plan
+cannot replace an unfinished preparation. Retired generations and their user
+changes are preserved, including while a program is running. Each explicit
+successful reinstall creates a new generation. `install status RELEASE_ID`
+reports the active pointer, all retained generations and errors. `install
+verify RELEASE_ID` is read-only and checks the marker, SHA-256, file sizes,
+portable executable modes and exact layout of the active generation, independent
+of readiness. It never repairs or executes a file.
+
+`install uninstall RELEASE_ID --confirm` journals `Removing` for all owned
+generations before deleting their working copies and staging on Linux. Tracked
+or detected running programs block the operation. Retrying the same command
+reconciles interrupted removal. The saved plans, verified source downloads and
+CAS remain. Complete legacy Association/App removal is blocked while a Standard
+generation owns a source; uninstall the Standard Release first. The retained
+download references continue to protect CAS through normal collection. No data
+outside the managed generation directories is removed.
+
+Common installation acquisition, generation state, publication and verification
+coordination uses the Windows adapter as well as Linux. The Windows Standard CLI remains gated, including uninstall and Play, until the generation-specific ownership and
+supervision integration is verified. Windows may leave unpublished staging for
+manual inspection, as in its existing Tree installer; the Linux retry cleanup
+policy does not apply to those directories.

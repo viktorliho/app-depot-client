@@ -160,7 +160,7 @@ fn validate_owned_mounts(
 }
 
 #[cfg(target_os = "linux")]
-fn delete_owned(root: &Path, parent: &Path, name: &str) -> Result<(), LibraryError> {
+pub(crate) fn delete_owned(root: &Path, parent: &Path, name: &str) -> Result<(), LibraryError> {
     use std::ffi::OsStr;
     if name.contains('/') || name.is_empty() || name == "." || name == ".." {
         return Err(invalid("unsafe managed child name"));
@@ -186,7 +186,7 @@ fn delete_owned(root: &Path, parent: &Path, name: &str) -> Result<(), LibraryErr
 }
 
 #[cfg(target_os = "linux")]
-fn process_start(pid: u32) -> Result<Option<String>, LibraryError> {
+pub(crate) fn process_start(pid: u32) -> Result<Option<String>, LibraryError> {
     let stat = match fs::read_to_string(format!("/proc/{pid}/stat")) {
         Ok(v) => v,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -204,7 +204,11 @@ fn process_start(pid: u32) -> Result<Option<String>, LibraryError> {
 }
 
 #[cfg(target_os = "linux")]
-fn runtime_busy(path: &Path, pid: Option<i64>, start: Option<&str>) -> Result<bool, LibraryError> {
+pub(crate) fn runtime_busy(
+    path: &Path,
+    pid: Option<i64>,
+    start: Option<&str>,
+) -> Result<bool, LibraryError> {
     use std::os::unix::fs::MetadataExt;
     if let (Some(pid), Some(start)) = (pid, start) {
         if pid <= 0 || pid > u32::MAX as i64 {
@@ -287,7 +291,7 @@ impl InstallationIntegrity {
 }
 
 #[cfg(target_os = "linux")]
-fn hash_open(mut file: File) -> Result<String, LibraryError> {
+pub(crate) fn hash_open(mut file: File) -> Result<String, LibraryError> {
     let mut digest = Sha256::new();
     let mut buffer = [0_u8; 64 * 1024];
     loop {
@@ -301,7 +305,7 @@ fn hash_open(mut file: File) -> Result<String, LibraryError> {
 }
 
 #[cfg(target_os = "linux")]
-fn runtime_paths(root: &Path) -> Result<BTreeSet<String>, LibraryError> {
+pub(crate) fn runtime_paths(root: &Path) -> Result<BTreeSet<String>, LibraryError> {
     fn visit(
         root: &Path,
         relative: &str,
@@ -427,7 +431,7 @@ pub struct LocalUninstall {
 }
 
 #[cfg(target_os = "linux")]
-fn copy_independent(
+pub(crate) fn copy_independent(
     source: &Path,
     destination: &mut File,
     destination_path: &Path,
@@ -526,6 +530,7 @@ impl Library {
         let mut local = false;
         for (association, artifact, release, id) in targets {
             revision.update(serde_json::to_vec(&(association, artifact, release, id))?);
+            blocked |= self.source_in_use(profile, association, artifact)?;
             if let Some(id) = id {
                 let item = self.installation(id)?;
                 let (updated, pid, start): (i64, Option<i64>, Option<String>) =
@@ -691,8 +696,15 @@ impl Library {
         association: &str,
     ) -> Result<(), LibraryError> {
         let (release,app,artifact):(String,String,String)=self.conn.query_row("SELECT a.release_id,r.app_id,a.artifact_id FROM associations a JOIN releases r ON r.profile_id=a.profile_id AND r.id=a.release_id WHERE a.profile_id=?1 AND a.id=?2",params![profile.0,association],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
+        let _lifecycle = self.lifecycle_lock()?;
+        let _download = self.lock_download_slot()?;
+        if self.source_in_use(profile, association, &artifact)? {
+            return Err(invalid(
+                "source is retained by a Release installation; uninstall it first",
+            ));
+        }
         if let Some(item) = self.installation_for(profile, association, &artifact)? {
-            return self.remove_installation(&item.id, true);
+            return self.remove_installation_locked(&item.id, true, true, &mut |_| {});
         }
         let active:i64=self.conn.query_row("SELECT count(*) FROM download_jobs WHERE profile_id=?1 AND association_id=?2 AND state IN ('Queued','FetchingInventory','Downloading','Verifying','Committing')",params![profile.0,association],|r|r.get(0))?;
         if active != 0 {
@@ -702,7 +714,7 @@ impl Library {
         }
         let id = Uuid::new_v4().to_string();
         self.conn.execute("INSERT INTO installations(id,profile_id,app_id,release_id,association_id,artifact_id,state,created_at,updated_at,remove_complete) VALUES (?1,?2,?3,?4,?5,?6,'Removing',?7,?7,1)",params![id,profile.0,app,release,association,artifact,now()?])?;
-        self.remove_installation(&id, true)
+        self.remove_installation_locked(&id, true, true, &mut |_| {})
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -736,6 +748,15 @@ impl Library {
         complete: bool,
         observer: &mut dyn FnMut(usize, usize),
     ) -> Result<usize, LibraryError> {
+        if self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM release_installations WHERE profile_id=?1 AND app_id=?2)",
+            params![profile.0, app],
+            |r| r.get::<_, bool>(0),
+        )? {
+            return Err(invalid(
+                "uninstall Standard Release installations separately first",
+            ));
+        }
         let associations: Vec<(String, String)> = {
             let mut stmt=self.conn.prepare("SELECT a.id,a.artifact_id FROM associations a JOIN releases r ON r.profile_id=a.profile_id AND r.id=a.release_id WHERE r.profile_id=?1 AND r.app_id=?2 ORDER BY a.id")?;
             stmt.query_map(params![profile.0, app], |r| Ok((r.get(0)?, r.get(1)?)))?
@@ -791,7 +812,7 @@ impl Library {
     }
 
     #[cfg(target_os = "linux")]
-    fn lifecycle_lock(&self) -> Result<File, LibraryError> {
+    pub(crate) fn lifecycle_lock(&self) -> Result<File, LibraryError> {
         use std::os::unix::fs::OpenOptionsExt;
         let path = self.paths.content.join(".app-depot-lifecycle.lock");
         let file = fs::OpenOptions::new()
@@ -821,6 +842,9 @@ impl Library {
         revision: &str,
     ) -> Result<std::process::Child, LibraryError> {
         let _lock = self.lifecycle_lock()?;
+        if self.release_installation(profile, release)?.is_some() {
+            return self.play_manifest(profile, release, association, entry, revision);
+        }
         let candidate = self
             .launch_candidates(profile, release)?
             .into_iter()
@@ -1057,6 +1081,13 @@ impl Library {
     ) -> Result<(), LibraryError> {
         observer("Checking active processes");
         let item = self.installation(id)?;
+        if complete
+            && self.source_in_use(&item.profile_id, &item.association_id, &item.artifact_id)?
+        {
+            return Err(invalid(
+                "source is retained by a Release installation; uninstall it first",
+            ));
+        }
         let tracked: (Option<i64>, Option<String>) = self.conn.query_row(
             "SELECT process_id,process_start FROM installations WHERE id=?1",
             [id],
@@ -1457,6 +1488,11 @@ impl Library {
             "SELECT a.release_id,r.app_id,a.artifact_id FROM associations a JOIN releases r ON r.profile_id=a.profile_id AND r.id=a.release_id WHERE a.profile_id=?1 AND a.id=?2",
             params![profile.0,association], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))
         )?;
+        if self.release_installation(profile, &release)?.is_some() {
+            return Err(invalid(
+                "Release has a Standard installation; use its saved plan",
+            ));
+        }
         if !self
             .launch_candidates(profile, &release)?
             .iter()
