@@ -1608,6 +1608,105 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_prerequisite_consent_and_signed_exit_codes_fail_closed() {
+        use crate::prerequisite::{PrerequisiteExecutor, PrerequisiteOutcome, PrerequisiteRequest};
+        struct Outcome(i32, usize);
+        impl PrerequisiteExecutor for Outcome {
+            fn execute(&mut self, request: &PrerequisiteRequest<'_>) -> PrerequisiteOutcome {
+                assert_eq!(fs::read(&request.source.file).unwrap(), b"inert fixture");
+                self.1 += 1;
+                PrerequisiteOutcome::Exited(self.0)
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let paths = LibraryPaths {
+            metadata: temp.path().join("metadata"),
+            content: temp.path().join("content"),
+        };
+        let mut lib = Library::open(paths.clone()).unwrap();
+        let profile = lib
+            .add_profile("fixture", "http://localhost:8787", false)
+            .unwrap()
+            .id;
+        let other = lib
+            .add_profile("other", "http://localhost:8788", false)
+            .unwrap()
+            .id;
+        let (app, release, revision) = (id(), id(), id());
+        lib.conn
+            .execute(
+                "INSERT INTO apps(profile_id,id,metadata_json,last_seen) VALUES (?1,?2,'{}',0)",
+                params![profile.0, app],
+            )
+            .unwrap();
+        lib.conn.execute("INSERT INTO releases(profile_id,id,app_id,metadata_json,last_seen) VALUES (?1,?2,?3,'{}',0)", params![profile.0,release,app]).unwrap();
+        let payload = source(&lib, &profile, &release, b"payload", false);
+        let installer = source(&lib, &profile, &release, b"inert fixture", false);
+        let plan = json!({"version":1,"appId":app,"releaseId":release,"revisionId":revision,"platform":"windows/x86_64","selections":{},"unresolved":[],"files":{"payload.bin":payload},"directories":[],"prerequisites":[{"id":"required","name":"Inert fixture","file":installer,"path":"","arguments":[],"optional":false,"evidence":"fixture","successExitCodes":[-1]}],"launch":null});
+        let plan_id = save(&lib, &profile, &plan);
+        let pending = lib.install_saved_plan(&profile, &plan_id, None).unwrap();
+        let generation = &pending.generations[0];
+        let fp = lib
+            .prerequisite_requirements(&profile, &plan_id)
+            .unwrap()
+            .fingerprint;
+        let selected = ["required".into()];
+        let stale = lib
+            .confirm_prerequisites(&profile, &generation.id, &fp, &selected, false)
+            .unwrap();
+        let consent = lib
+            .confirm_prerequisites(&profile, &generation.id, &fp, &selected, false)
+            .unwrap();
+        let mut outcome = Outcome(3010, 0);
+        assert!(
+            lib.process_prerequisites(&profile, &generation.id, &stale, None, &mut outcome)
+                .is_err()
+        );
+        assert!(
+            lib.process_prerequisites(&other, &generation.id, &consent, None, &mut outcome)
+                .is_err()
+        );
+        let installed = generation.path.join("payload.bin");
+        fs::write(&installed, b"changed").unwrap();
+        assert!(
+            lib.process_prerequisites(&profile, &generation.id, &consent, None, &mut outcome)
+                .is_err()
+        );
+        assert_eq!(outcome.1, 0);
+        fs::write(&installed, b"payload").unwrap();
+        let rejected = lib
+            .process_prerequisites(&profile, &generation.id, &consent, None, &mut outcome)
+            .unwrap();
+        assert!(rejected.active_generation.is_none());
+        assert_eq!(outcome.1, 1);
+        drop(lib);
+        let mut lib = Library::open(paths).unwrap();
+        let progress = lib.prerequisite_progress(&profile, &generation.id).unwrap();
+        assert_eq!(progress["consents"][1]["attempts"][0]["exitCode"], 3010);
+        assert_eq!(progress["consents"][1]["attempts"][0]["state"], "Failed");
+        for code in [1641, 0, -1] {
+            let round = lib
+                .confirm_prerequisites(&profile, &generation.id, &fp, &selected, true)
+                .unwrap();
+            let mut outcome = Outcome(code, 0);
+            let state = lib
+                .process_prerequisites(&profile, &generation.id, &round, None, &mut outcome)
+                .unwrap();
+            assert_eq!(outcome.1, 1);
+            assert_eq!(state.active_generation.is_some(), code == -1);
+            let progress = lib.prerequisite_progress(&profile, &generation.id).unwrap();
+            let last = progress["consents"].as_array().unwrap().last().unwrap();
+            assert_eq!(last["attempts"][0]["exitCode"], code);
+            assert_eq!(
+                last["attempts"][0]["state"],
+                if code == -1 { "Succeeded" } else { "Failed" }
+            );
+        }
+        lib.verify_release_installation(&profile, &release).unwrap();
+    }
+
     #[test]
     fn prerequisite_source_layout_preserves_neighbors_and_recovers() {
         use crate::prerequisite::{PrerequisiteExecutor, PrerequisiteOutcome, PrerequisiteRequest};

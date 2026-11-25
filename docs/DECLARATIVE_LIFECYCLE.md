@@ -29,8 +29,8 @@ Server connection. Resolution saves metadata only; prerequisites, launch and
 Derived recipe locks do not authorize any action. A Release explicitly declaring
 an installation manifest cannot use legacy NativePortableV1 preparation or Play.
 
-On Linux, `install PLAN_ID` explicitly acquires and installs the validated
-Standard payload (see [Local library](LOCAL_LIBRARY.md#standard-installation-materialization-boundary)).
+On Linux and Windows, `install PLAN_ID` explicitly acquires and installs the
+validated Standard payload (see [Local library](LOCAL_LIBRARY.md#standard-installation-materialization-boundary)).
 It never launches automatically. `launch list RELEASE_ID` projects the active
 generation's saved launch selection, and `launch play RELEASE_ID ASSOCIATION_ID
 ENTRY_POINT_ID` executes only that declared installed target using the existing
@@ -47,8 +47,8 @@ rejected. `install progress GENERATION_ID` displays the saved plan and durable
 rounds. `install retry GENERATION_ID FINGERPRINT SELECTED_IDS_JSON --confirm`
 authorizes a new processing round after review; normal confirmation cannot
 silently retry an attempted round. `install process GENERATION_ID CONSENT_ID
---confirm` consumes the round. Linux has no native installer adapter: selected
-execution is unavailable and cannot produce success, while an optional-only
+--confirm` consumes the round. Neither Linux nor Windows currently has a
+connected native prerequisite executor: selected execution is unavailable and cannot produce success, while an optional-only
 plan can be explicitly declined and activated without launching anything.
 The shared executor interface is available for the native Windows integration.
 No launch selection means no Standard launch candidate. Windows projects the

@@ -36,7 +36,7 @@ fn usage() -> &'static str {
     "usage: app-depot [--server URL | --profile ID] [--json] [--allow-insecure-http] <command> [id]\n\
      read: capabilities | apps | app ID | releases APP_ID | release ID | artifacts RELEASE_ID | declarations RELEASE_ID\n\
      plans: --profile ID plan manifest RELEASE | list | inspect ID | resolve RELEASE PLATFORM REVISION|current SELECTIONS_JSON\n\
-     install (Linux): --profile ID install PLAN_ID | install status RELEASE_ID | install verify RELEASE_ID | install uninstall RELEASE_ID --confirm | install requirements PLAN_ID | install progress GENERATION_ID | install confirm|retry GENERATION_ID FINGERPRINT SELECTED_IDS_JSON --confirm | install process GENERATION_ID CONSENT_ID --confirm\n\
+     install (Linux/Windows): --profile ID install PLAN_ID | install status RELEASE_ID | install verify RELEASE_ID | install uninstall RELEASE_ID --confirm | install requirements PLAN_ID | install progress GENERATION_ID | install confirm|retry GENERATION_ID FINGERPRINT SELECTED_IDS_JSON --confirm | install process GENERATION_ID CONSENT_ID --confirm\n\
      local: profile add NAME URL | profile list [--all] | profile rename ID NAME | profile move ID URL | profile remove ID --confirm\n\
      credentials: profile token-set ID --token-stdin | profile token-remove ID\n\
      sync/offline: --profile ID sync | cached-apps | cached-releases APP_ID | cached-declarations RELEASE_ID\n\
