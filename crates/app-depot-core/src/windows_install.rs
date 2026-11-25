@@ -21,6 +21,13 @@ CREATE TABLE IF NOT EXISTS windows_removals (
 CREATE TABLE IF NOT EXISTS windows_removal_cleanup (
     installation_id TEXT PRIMARY KEY REFERENCES windows_removals(installation_id) ON DELETE CASCADE,
     started INTEGER NOT NULL DEFAULT 0 CHECK(started IN (0, 1))
+);
+CREATE TABLE IF NOT EXISTS windows_generation_removals (
+    generation_id TEXT PRIMARY KEY REFERENCES installation_generations(id) ON DELETE RESTRICT,
+    transaction_id TEXT NOT NULL UNIQUE,
+    identities TEXT NOT NULL,
+    phase TEXT NOT NULL CHECK(phase IN ('Intent', 'Quarantined', 'Cleaning')),
+    last_error TEXT
 );";
 
 fn present(path: &Path) -> io::Result<bool> {
@@ -36,6 +43,16 @@ fn pause_removal(item: &Installation, boundary: &str) {
     if std::env::var("APP_DEPOT_REMOVAL_BOUNDARY").as_deref() == Ok(boundary) {
         let signal = item.path.with_file_name(".removal-test-ready");
         File::create_new(signal).unwrap();
+        loop {
+            std::thread::park();
+        }
+    }
+}
+
+#[cfg(test)]
+fn pause_generation_removal(root: &Path, boundary: &str) {
+    if std::env::var("APP_DEPOT_GENERATION_REMOVAL_BOUNDARY").as_deref() == Ok(boundary) {
+        File::create_new(root.with_file_name(".generation-removal-test-ready")).unwrap();
         loop {
             std::thread::park();
         }
@@ -438,6 +455,201 @@ impl Library {
             }
         }
         self.record_windows_quarantine(&item, &name, identities)
+    }
+
+    /// Remove every verified generation of a Standard Release. The Windows
+    /// journal keeps the original NTFS identities until cleanup commits.
+    pub fn uninstall_release_installation(
+        &mut self,
+        profile: &crate::ServerProfileId,
+        release: &str,
+    ) -> Result<(), LibraryError> {
+        let _lifecycle = self.manifest_lifecycle_lock()?;
+        let _slot = self.lock_download_slot()?;
+        let Some(installation) = self.release_installation(profile, release)? else {
+            return Ok(());
+        };
+        let mut intents = Vec::new();
+        for generation in &installation.generations {
+            let id = &generation.id;
+            self.check_generation_removal_occupancy(id)?;
+            if generation.state == "Removing" {
+                let recorded: bool = self.conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM windows_generation_removals WHERE generation_id=?1)",
+                    [id], |row| row.get(0),
+                )?;
+                if !recorded {
+                    return Err(invalid("generation removal lacks its ownership journal"));
+                }
+                continue;
+            }
+            let root = self.generation_removal_root(id)?;
+            let plan = self.load_install_plan(profile, &generation.plan_id)?;
+            let entries = crate::materialization::destination_layout(&plan)?;
+            let inspection =
+                windows_fs::inspect_removal_layout(&root, id, |_| Ok(()), Some(&entries))?;
+            intents.push((
+                id,
+                Uuid::new_v4().to_string(),
+                serde_json::to_string(&inspection.identities).map_err(io::Error::other)?,
+            ));
+        }
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "UPDATE release_installations SET active_generation=NULL WHERE id=?1",
+            [&installation.id],
+        )?;
+        for (id, nonce, identities) in intents {
+            tx.execute(
+                "UPDATE installation_generations SET state='Removing' WHERE id=?1",
+                [id],
+            )?;
+            tx.execute("INSERT INTO windows_generation_removals(generation_id,transaction_id,identities,phase) VALUES (?1,?2,?3,'Intent')", params![id,nonce,identities])?;
+        }
+        tx.commit()?;
+        for generation in &installation.generations {
+            self.continue_generation_removal(&generation.id)?;
+        }
+        Ok(())
+    }
+
+    fn generation_removal_root(&self, id: &str) -> Result<std::path::PathBuf, LibraryError> {
+        if Uuid::parse_str(id).map_or(true, |value| value.to_string() != id) {
+            return Err(invalid("invalid generation identity"));
+        }
+        Ok(self.paths.content.join("apps").join(id))
+    }
+
+    fn check_generation_removal_occupancy(&self, id: &str) -> Result<(), LibraryError> {
+        if self.windows_generation_occupancy(id)? != crate::windows_process::ProcessState::Idle {
+            return Err(invalid(
+                "generation process occupancy is not confirmed idle",
+            ));
+        }
+        let ambiguous: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM prerequisite_attempts a JOIN prerequisite_consents c ON c.id=a.consent_id WHERE c.generation_id=?1 AND a.state IN ('Running','Ambiguous'))",
+            [id], |row| row.get(0),
+        )?;
+        if ambiguous {
+            return Err(invalid("generation prerequisite occupancy is uncertain"));
+        }
+        Ok(())
+    }
+
+    fn continue_generation_removal(&mut self, id: &str) -> Result<(), LibraryError> {
+        self.check_generation_removal_occupancy(id)?;
+        let root = self.generation_removal_root(id)?;
+        let (nonce, identities, mut phase, installation, profile, plan): (String,String,String,String,String,String) =
+            self.conn.query_row(
+                "SELECT r.transaction_id,r.identities,r.phase,g.installation_id,i.profile_id,g.plan_id
+                 FROM windows_generation_removals r JOIN installation_generations g ON g.id=r.generation_id
+                 JOIN release_installations i ON i.id=g.installation_id
+                 WHERE g.id=?1 AND g.state='Removing' AND i.active_generation IS NULL",
+                [id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?)),
+            )?;
+        let nonce = Uuid::parse_str(&nonce).map_err(io::Error::other)?;
+        let name = format!(".app-depot-removal-{nonce}");
+        let quarantine = root.with_file_name(&name);
+        let expected: windows_fs::RemovalIdentities =
+            serde_json::from_str(&identities).map_err(io::Error::other)?;
+        if phase != "Cleaning" {
+            let plan = self.load_install_plan(&crate::ServerProfileId(profile), &plan)?;
+            let entries = crate::materialization::destination_layout(&plan)?;
+            if phase == "Intent" {
+                #[cfg(test)]
+                pause_generation_removal(&root, "after-intent");
+                match (present(&root)?, present(&quarantine)?) {
+                    (true, false) => {
+                        let inspection = windows_fs::inspect_removal_layout(
+                            &root,
+                            id,
+                            |_| Ok(()),
+                            Some(&entries),
+                        )?;
+                        if inspection.identities != expected {
+                            return Err(invalid("generation removal identity mismatch"));
+                        }
+                        inspection.quarantine(OsStr::new(&name))?;
+                    }
+                    (false, true) => {}
+                    _ => return Err(invalid("generation removal locations conflict")),
+                }
+                #[cfg(test)]
+                pause_generation_removal(&root, "after-rename");
+                if present(&root)? {
+                    return Err(invalid("generation removal source still exists"));
+                }
+                if windows_fs::inspect_removal_layout(&quarantine, id, |_| Ok(()), Some(&entries))?
+                    .identities
+                    != expected
+                {
+                    return Err(invalid("generation removal identity mismatch"));
+                }
+                windows_fs::sync_directory(root.parent().unwrap())?;
+                self.conn.execute("UPDATE windows_generation_removals SET phase='Quarantined',last_error=NULL WHERE generation_id=?1 AND phase='Intent'", [id])?;
+                phase = "Quarantined".into();
+            }
+            if phase != "Quarantined"
+                || present(&root)?
+                || windows_fs::inspect_removal_layout(&quarantine, id, |_| Ok(()), Some(&entries))?
+                    .identities
+                    != expected
+            {
+                return Err(invalid("generation quarantine is not verified"));
+            }
+            self.conn.execute("UPDATE windows_generation_removals SET phase='Cleaning' WHERE generation_id=?1 AND phase='Quarantined'", [id])?;
+        }
+        if present(&root)? {
+            return Err(invalid("generation removal source still exists"));
+        }
+        windows_fs::cleanup_removal(&quarantine, &expected)?;
+        windows_fs::sync_directory(root.parent().unwrap())?;
+        #[cfg(test)]
+        pause_generation_removal(&root, "after-cleanup");
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "DELETE FROM installation_sources WHERE generation_id=?1",
+            [id],
+        )?;
+        tx.execute(
+            "DELETE FROM windows_generation_removals WHERE generation_id=?1 AND phase='Cleaning'",
+            [id],
+        )?;
+        tx.execute(
+            "DELETE FROM installation_generations WHERE id=?1 AND state='Removing'",
+            [id],
+        )?;
+        tx.execute("DELETE FROM release_installations WHERE id=?1 AND NOT EXISTS(SELECT 1 FROM installation_generations WHERE installation_id=?1)", [&installation])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn recover_windows_generation_removals(&mut self) -> Result<(), LibraryError> {
+        let ids = {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT generation_id FROM windows_generation_removals")?;
+            stmt.query_map([], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let Ok(_lifecycle) = self.manifest_lifecycle_lock() else {
+            return Ok(());
+        };
+        let Ok(_slot) = self.lock_download_slot() else {
+            return Ok(());
+        };
+        for id in ids {
+            if let Err(error) = self.continue_generation_removal(&id) {
+                self.conn.execute(
+                    "UPDATE windows_generation_removals SET last_error=?2 WHERE generation_id=?1",
+                    params![id, error.to_string()],
+                )?;
+            }
+        }
+        Ok(())
     }
 
     fn verified_windows_payload<'a>(

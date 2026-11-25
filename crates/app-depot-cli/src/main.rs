@@ -1191,7 +1191,7 @@ fn run_plan(options: &Options) -> Result<(), CliError> {
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 fn run_install(options: &Options) -> Result<(), CliError> {
     let profile_id = options
         .profile
@@ -1228,7 +1228,7 @@ fn run_install(options: &Options) -> Result<(), CliError> {
                     _: &app_depot_core::prerequisite::PrerequisiteRequest<'_>,
                 ) -> app_depot_core::prerequisite::PrerequisiteOutcome {
                     app_depot_core::prerequisite::PrerequisiteOutcome::Failed(
-                        "Native prerequisite execution is unavailable on Linux".into(),
+                        "Native prerequisite execution is unavailable on this platform".into(),
                     )
                 }
             }
@@ -1274,14 +1274,14 @@ fn run() -> Result<(), CliError> {
     if options.positional[0] == "decky" {
         return decky::run_decky(&options);
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     if options.positional[0] == "install" {
         return run_install(&options);
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", windows)))]
     if options.positional[0] == "install" {
         return Err(LibraryError::Invalid(
-            "Standard installation CLI is currently available only on Linux".into(),
+            "Standard installation CLI is unavailable on this platform".into(),
         )
         .into());
     }

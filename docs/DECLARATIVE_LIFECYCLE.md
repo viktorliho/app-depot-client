@@ -55,4 +55,7 @@ No launch selection means no Standard launch candidate. Windows projects the
 active generation and binds its declared installed target to the existing NTFS
 launch checks. Play records generation-specific supervision before resuming the
 process. Running or uncertain occupancy blocks another Play of that generation.
-Windows Standard removal remains unavailable pending a durable generation removal journal.
+Windows Standard removal uses the same ownership inspection and no-replace
+quarantine as legacy Windows runtime removal, with durable generation-specific
+intent, quarantine and cleanup records. It refuses modified or unexpected
+content and uncertain process or prerequisite occupancy.

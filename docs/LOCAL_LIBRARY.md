@@ -180,8 +180,15 @@ coordination uses the Windows adapter as well as Linux. Windows Play uses the
 active generation UUID as its selection guard and records Job Object supervision
 in the generation row before resuming the pinned executable. The watcher
 retains occupancy after the Desktop closes and records completion after observed
-job descendants exit. Windows Standard installation commands and removal remain
-gated; the existing Windows removal journal references legacy installation IDs.
-Windows may leave unpublished staging for
+job descendants exit. Windows Standard CLI installation, verification and
+runtime-only removal use the shared generation state. The Windows-specific
+`windows_generation_removals` journal references generation IDs and records
+NTFS identities through Intent, Quarantined and Cleaning, with startup
+reconciliation. Legacy removal tables retain their existing foreign keys.
+Removal requires a complete verified owned layout and confirmed idle occupancy.
+If the layout is incomplete, modified or contains unrecognized content, the
+operation refuses removal and preserves it. Interrupted cleanup retains its
+journal and source references until final SQLite deletion. Native prerequisite
+execution remains unavailable in the CLI. Windows may leave unpublished staging for
 manual inspection, as in its existing Tree installer; the Linux retry cleanup
 policy does not apply to those directories.

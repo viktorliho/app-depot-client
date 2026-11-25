@@ -37,7 +37,11 @@ pub struct ReleaseInstallation {
 }
 impl Library {
     #[cfg(any(target_os = "linux", windows))]
-    fn load_install_plan(&self, profile: &ServerProfileId, id: &str) -> Result<Plan, LibraryError> {
+    pub(crate) fn load_install_plan(
+        &self,
+        profile: &ServerProfileId,
+        id: &str,
+    ) -> Result<Plan, LibraryError> {
         let saved = self
             .saved_plans(profile)?
             .into_iter()
@@ -1862,6 +1866,10 @@ mod tests {
             lib.play_declared(&profile, &release, &association, "fixture", &first_id)
                 .is_err()
         );
+        assert!(
+            lib.uninstall_release_installation(&profile, &release)
+                .is_err()
+        );
         lib.conn
             .execute(
                 "UPDATE installation_generations SET process_start=NULL WHERE id=?1",
@@ -1878,5 +1886,128 @@ mod tests {
         let candidate = lib.launch_candidates(&profile, &release).unwrap().remove(0);
         assert_eq!(candidate.status, "Ready");
         assert_eq!(candidate.selection_revision(), first_id);
+        let extra = next.generations[0].path.join("foreign.txt");
+        fs::write(&extra, "preserve").unwrap();
+        assert!(
+            lib.uninstall_release_installation(&profile, &release)
+                .is_err()
+        );
+        assert_eq!(fs::read_to_string(&extra).unwrap(), "preserve");
+        fs::remove_file(&extra).unwrap();
+        lib.uninstall_release_installation(&profile, &release)
+            .unwrap();
+        assert!(
+            lib.release_installation(&profile, &release)
+                .unwrap()
+                .is_none()
+        );
+        for generation in &next.generations {
+            assert!(!generation.path.parent().unwrap().exists());
+        }
+        lib.install_saved_plan(&profile, &plan_id, None).unwrap();
+        lib.verify_release_installation(&profile, &release).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_generation_removal_recovers_after_process_interruption() {
+        const ROOT: &str = "APP_DEPOT_GENERATION_REMOVAL_TEST_ROOT";
+        if let Some(root) = std::env::var_os(ROOT) {
+            let root = std::path::PathBuf::from(root);
+            let mut lib = Library::open(LibraryPaths {
+                metadata: root.join("metadata"),
+                content: root.join("content"),
+            })
+            .unwrap();
+            let profile =
+                ServerProfileId(std::env::var("APP_DEPOT_GENERATION_TEST_PROFILE").unwrap());
+            let release = std::env::var("APP_DEPOT_GENERATION_TEST_RELEASE").unwrap();
+            lib.uninstall_release_installation(&profile, &release)
+                .unwrap();
+            panic!("expected interruption boundary");
+        }
+        for boundary in ["after-intent", "after-rename", "after-cleanup"] {
+            let temp = tempfile::tempdir().unwrap();
+            let paths = LibraryPaths {
+                metadata: temp.path().join("metadata"),
+                content: temp.path().join("content"),
+            };
+            let mut lib = Library::open(paths.clone()).unwrap();
+            let profile = lib
+                .add_profile("fixture", "http://localhost:8787", false)
+                .unwrap()
+                .id;
+            let app = id();
+            let release = id();
+            let revision = id();
+            lib.conn
+                .execute(
+                    "INSERT INTO apps(profile_id,id,metadata_json,last_seen) VALUES (?1,?2,'{}',0)",
+                    params![profile.0, app],
+                )
+                .unwrap();
+            lib.conn.execute("INSERT INTO releases(profile_id,id,app_id,metadata_json,last_seen) VALUES (?1,?2,?3,'{}',0)",params![profile.0,release,app]).unwrap();
+            let f = source(&lib, &profile, &release, b"file", false);
+            let t = source(&lib, &profile, &release, b"tree", true);
+            let plan = json!({"version":1,"appId":app,"releaseId":release,"revisionId":revision,"platform":"windows/x86_64","selections":{},"unresolved":[],"files":{"data/file":f,"tree":t},"directories":["data","empty"],"prerequisites":[],"launch":null});
+            let plan_id = save(&lib, &profile, &plan);
+            let installed = lib.install_saved_plan(&profile, &plan_id, None).unwrap();
+            let root = installed.generations[0].path.parent().unwrap().to_owned();
+            let unrelated = paths.content.join("apps").join("unrelated.txt");
+            fs::write(&unrelated, "preserve").unwrap();
+            drop(lib);
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact","release_install::tests::windows_generation_removal_recovers_after_process_interruption"])
+                .env(ROOT,temp.path())
+                .env("APP_DEPOT_GENERATION_TEST_PROFILE",&profile.0)
+                .env("APP_DEPOT_GENERATION_TEST_RELEASE",&release)
+                .env("APP_DEPOT_GENERATION_REMOVAL_BOUNDARY",boundary)
+                .spawn().unwrap();
+            let marker = paths
+                .content
+                .join("apps")
+                .join(".generation-removal-test-ready");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            while !marker.exists() {
+                assert!(
+                    child.try_wait().unwrap().is_none(),
+                    "child exited before {boundary}"
+                );
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "timeout at {boundary}"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            child.kill().unwrap();
+            child.wait().unwrap();
+            fs::remove_file(&marker).unwrap();
+            let mut recovered = Library::open(paths.clone()).unwrap();
+            assert!(
+                recovered
+                    .release_installation(&profile, &release)
+                    .unwrap()
+                    .is_none(),
+                "{boundary}"
+            );
+            assert!(!root.exists());
+            assert_eq!(fs::read_to_string(&unrelated).unwrap(), "preserve");
+            for data in [b"file".as_slice(), b"tree".as_slice()] {
+                let hash = format!("{:x}", Sha256::digest(data));
+                assert_eq!(
+                    fs::read(recovered.object(&format!("adfile:sha256:{hash}")).unwrap()).unwrap(),
+                    data
+                );
+            }
+            recovered
+                .uninstall_release_installation(&profile, &release)
+                .unwrap();
+            recovered
+                .install_saved_plan(&profile, &plan_id, None)
+                .unwrap();
+            recovered
+                .verify_release_installation(&profile, &release)
+                .unwrap();
+        }
     }
 }

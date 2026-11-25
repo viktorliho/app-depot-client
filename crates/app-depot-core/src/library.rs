@@ -481,6 +481,8 @@ impl Library {
         library.recover_removals()?;
         #[cfg(windows)]
         library.recover_windows_quarantines()?;
+        #[cfg(windows)]
+        library.recover_windows_generation_removals()?;
         Ok(library)
     }
 
