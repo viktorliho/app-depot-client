@@ -277,7 +277,7 @@ impl Desktop {
                             for pre in prereqs {
                                 let mut selected=d.selected.contains(&pre.id);
                                 if ui.add_enabled(pre.optional && !d.busy && (crate::worker::native_prerequisites_available() || selected),egui::Checkbox::new(&mut selected,format!("{}{}",pre.name,if pre.optional{" (optional)"}else{" (required)"}))).changed(){if selected {d.selected.push(pre.id.clone());}else{d.selected.retain(|id|id!=&pre.id);}}
-                                ui.collapsing("Installer information",|ui|{ui.label(&pre.evidence);ui.label(format!("Arguments: {:?}",pre.arguments));ui.label(format!("Expected exit codes: {:?}",pre.success_exit_codes));});
+                                egui::CollapsingHeader::new("Installer information").id_salt(&pre.id).show(ui,|ui|{ui.label(&pre.evidence);ui.label(format!("Arguments: {:?}",pre.arguments));ui.label(format!("Expected exit codes: {:?}",pre.success_exit_codes));});
                             }
                         }
                         if !crate::worker::native_prerequisites_available() && p.prerequisites.as_ref().is_some_and(|p|!p.is_empty()){ui.label(if d.selected.is_empty(){"Native prerequisite execution is unavailable. Optional installers will be skipped."}else{"Native prerequisite execution is unavailable. Files can be prepared, but required prerequisites keep the installation pending."});}
@@ -336,7 +336,8 @@ impl Desktop {
                 }
             }
         }
-        let entries = self.snapshot.standard.clone();
+        let mut entries: Vec<_> = self.snapshot.standard.clone().into_iter().collect();
+        entries.sort_by(|a, b| a.1.app_id.cmp(&b.1.app_id).then(a.0.cmp(&b.0)));
         for (release, installation) in entries {
             let title = self
                 .snapshot
@@ -357,6 +358,16 @@ impl Desktop {
             });
             design::surface(ui).show(ui, |ui| {
                 ui.heading(&title);
+                if let Some(version) = self
+                    .snapshot
+                    .apps
+                    .iter()
+                    .flat_map(|a| &a.releases)
+                    .find(|r| r.release.id == release)
+                    .and_then(|r| r.release.version.as_deref())
+                {
+                    ui.label(format!("Version {version}"));
+                }
                 let busy = self
                     .local_operations
                     .get(&crate::worker::standard_operation_key(
@@ -427,9 +438,25 @@ impl Desktop {
                         ui.label("No declared Play target available");
                     }
                     for c in candidates {
-                        if c.status == "Ready" && ui.button("Play").clicked() {
-                            self.start_candidate(&c);
-                        } else if c.status != "Ready" {
+                        let key = format!("{}:{}", c.association_id, c.entry_id);
+                        let running = self.launch_states.get(&key).is_some_and(|(state, _)| {
+                            matches!(state.as_str(), "Starting" | "Preparing" | "Running")
+                        });
+                        if c.status == "Ready" {
+                            if ui
+                                .add_enabled(
+                                    !running,
+                                    egui::Button::new(if running {
+                                        "Running / starting"
+                                    } else {
+                                        "Play"
+                                    }),
+                                )
+                                .clicked()
+                            {
+                                self.start_candidate(&c);
+                            }
+                        } else {
                             ui.label(&c.reason);
                         }
                     }
@@ -497,6 +524,25 @@ impl Desktop {
                         ui.label("Native prerequisite execution is unavailable on this device.");
                     }
                     let progress = self.snapshot.prerequisites.get(&g.id);
+                    if g.state == "PrerequisitesPending"
+                        && progress
+                            .is_none_or(|p| p["consents"].as_array().is_none_or(|r| r.is_empty()))
+                        && let Some(plan) = self.snapshot.plans.get(&g.plan_id)
+                        && let Ok(p) =
+                            serde_json::from_value::<installation::Plan>(plan.plan.clone())
+                    {
+                        for pre in p.prerequisites.iter().flatten() {
+                            ui.label(format!(
+                                "{} — {}",
+                                pre.name,
+                                if pre.optional {
+                                    "Optional, awaiting review"
+                                } else {
+                                    "Required, awaiting authorization"
+                                }
+                            ));
+                        }
+                    }
                     if let Some(progress) = progress
                         && let Some(rounds) = progress["consents"].as_array()
                     {
