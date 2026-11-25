@@ -35,6 +35,7 @@ struct Options {
 fn usage() -> &'static str {
     "usage: app-depot [--server URL | --profile ID] [--json] [--allow-insecure-http] <command> [id]\n\
      read: capabilities | apps | app ID | releases APP_ID | release ID | artifacts RELEASE_ID | declarations RELEASE_ID\n\
+     plans: --profile ID plan manifest RELEASE | list | inspect ID | resolve RELEASE PLATFORM REVISION|current SELECTIONS_JSON\n\
      local: profile add NAME URL | profile list [--all] | profile rename ID NAME | profile move ID URL | profile remove ID --confirm\n\
      credentials: profile token-set ID --token-stdin | profile token-remove ID\n\
      sync/offline: --profile ID sync | cached-apps | cached-releases APP_ID | cached-declarations RELEASE_ID\n\
@@ -1137,11 +1138,66 @@ fn run_library(options: &Options) -> Result<(), CliError> {
     Ok(())
 }
 
+fn run_plan(options: &Options) -> Result<(), CliError> {
+    use app_depot_core::installation::{Plan, ResolveRequest};
+    let profile_id = options
+        .profile
+        .as_ref()
+        .ok_or_else(|| ApiError::Config("plan requires --profile ID".into()))?;
+    let library = open_library(options)?;
+    let profile = library.profile(profile_id)?;
+    let args = &options.positional;
+    match args.as_slice() {
+        [_, action] if action == "list" => {
+            for p in library.saved_plans(profile_id)? {
+                if options.json { print_json(&p)?; } else { println!("{} {} {} {}", p.id, p.plan["releaseId"], p.plan["revisionId"], p.plan["platform"]); }
+            }
+        }
+        [_, action, id] if action == "inspect" => {
+            let p = library.saved_plans(profile_id)?.into_iter().find(|p| &p.id==id).ok_or_else(|| LibraryError::Invalid("plan not found".into()))?;
+            print_json(&p)?;
+        }
+        [_, action, release] if action == "manifest" => {
+            if profile.archived { return Err(LibraryError::Invalid("archived profile is offline-only".into()).into()); }
+            let client = ApiClient::new(&profile.origin, selected_token(&profile)?, options.allow_insecure_http)?;
+            let doc = client.declarations(release)?.release;
+            let raw = doc.app_depot().and_then(|v| v.get("installation"));
+            if options.json { print_json(&raw)?; } else {
+                println!("Revision {}", doc.revision_id);
+                match app_depot_core::installation::manifest(&doc) {
+                    Ok(Some(m)) => println!("{m:#?}"),
+                    Ok(None) => println!("No installation manifest"),
+                    Err(e) => println!("Inert manifest: {e}"),
+                }
+            }
+        }
+        [_, action, release, platform, revision, selections] if action == "resolve" => {
+            if profile.archived { return Err(LibraryError::Invalid("archived profile is offline-only".into()).into()); }
+            let client = ApiClient::new(&profile.origin, selected_token(&profile)?, options.allow_insecure_http)?;
+            let request = ResolveRequest { platform: platform.clone(), revision_id: if revision=="current" {None} else {Some(revision.clone())}, selections: serde_json::from_str(selections).map_err(|e| ApiError::Config(format!("invalid selections JSON: {e}")))? };
+            let saved = library.resolve_plan(profile_id, &client, release, &request)?;
+            if options.json { print_json(&saved)?; } else {
+                let plan = Plan::parse(&saved.plan, release, &request)?;
+                println!("Saved {} revision {} platform {} (read-only; execution unsupported)", saved.id, plan.revision_id, plan.platform);
+                println!("{} files, {} directories; localization {:?}", plan.files.as_ref().map_or(0, |f|f.len()), plan.directories.as_ref().map_or(0, |d|d.len()), plan.localization);
+                for p in plan.prerequisites.iter().flatten() { println!("Prerequisite: {} [{}] {}", p.name, if p.optional {"optional"} else {"required"}, p.path); }
+                if let Some(l)=plan.launch {println!("Launch: {}",l.path);}
+                if plan.recipe.is_some() { println!("Derived recipe: metadata only"); }
+            }
+        }
+        _ => return Err(ApiError::Config("plan manifest RELEASE | plan list | plan inspect ID | plan resolve RELEASE PLATFORM REVISION|current SELECTIONS_JSON".into()).into()),
+    }
+    Ok(())
+}
+
 fn run() -> Result<(), CliError> {
     let options = parse_args()?;
     #[cfg(all(feature = "decky", target_os = "linux"))]
     if options.positional[0] == "decky" {
         return decky::run_decky(&options);
+    }
+    if options.positional[0] == "plan" {
+        return run_plan(&options);
     }
     if options.positional[0] == "profile" {
         return run_profile(&options);

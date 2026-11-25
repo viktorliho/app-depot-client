@@ -21,3 +21,10 @@ Unknown methods, malformed declarations, platform mismatches, missing installed 
 ## Remaining contract gaps
 
 Release `runtime.name/version` is descriptive only. There is no standardized installation, dependency preparation, Wine/Proton, environment override or system package operation. Data-only Artifacts need no launch metadata. Any future executable method requires a separate optional shared Server contract and explicit client support; arbitrary shell commands are not part of this method.
+
+The CLI installation plan reader uses `--profile ID plan manifest RELEASE`,
+`plan resolve RELEASE PLATFORM REVISION|current SELECTIONS_JSON`, `plan list`
+and `plan inspect ID`. Inspection and listing read the local library without a
+Server connection. Resolution saves metadata only; prerequisites, launch and
+Derived recipe locks do not authorize any action. A Release explicitly declaring
+an installation manifest cannot use legacy NativePortableV1 preparation or Play.

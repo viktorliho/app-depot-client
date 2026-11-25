@@ -11,6 +11,8 @@ use std::{collections::HashSet, fmt, io::Read, time::Duration};
 use url::{Host, Url};
 
 const MAX_JSON_BYTES: u64 = 8 * 1024 * 1024;
+// 50,000 entries with 1,024-byte paths, JSON escaping and source records.
+const MAX_INSTALLATION_JSON_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_ERROR_BYTES: u64 = 64 * 1024;
 const MAX_PAGES: usize = 10_000;
 const MAX_ITEMS: usize = 100_000;
@@ -268,7 +270,14 @@ impl ApiClient {
         if let Some(token) = &self.token {
             request = request.set("Authorization", &format!("Bearer {token}"));
         }
-        let response = match request.call() {
+        Self::json_response(request.call(), MAX_JSON_BYTES)
+    }
+
+    fn json_response<T: DeserializeOwned>(
+        result: Result<ureq::Response, ureq::Error>,
+        limit: u64,
+    ) -> Result<(T, Option<String>), ApiError> {
+        let response = match result {
             Ok(response) => response,
             Err(ureq::Error::Status(_, response)) => response,
             Err(ureq::Error::Transport(error)) => {
@@ -304,10 +313,76 @@ impl ApiClient {
             )));
         }
         let etag = response.header("ETag").map(str::to_owned);
-        let body = read_bounded(response, MAX_JSON_BYTES)?;
+        let body = read_bounded(response, limit)?;
         serde_json::from_slice(&body)
             .map(|value| (value, etag))
             .map_err(|error| ApiError::Protocol(format!("malformed JSON response: {error}")))
+    }
+
+    /// Read-only resolver, with a separate bound for up to 50,000 long paths.
+    pub fn release_declaration_revision(
+        &self,
+        release: &str,
+        revision: &str,
+    ) -> Result<crate::models::DeclarationDocument, ApiError> {
+        let raw: Value = self.get_json(
+            &["releases", release, "declarations", "revisions", revision],
+            None,
+            None,
+        )?;
+        if raw["id"].as_str() != Some(revision) || raw.get("data").is_none() {
+            return Err(ApiError::Protocol("declaration revision mismatch".into()));
+        }
+        Ok(crate::models::DeclarationDocument {
+            revision_id: revision.into(),
+            data: raw["data"].clone(),
+            unknown: Default::default(),
+        })
+    }
+
+    pub fn association_declaration_revision(
+        &self,
+        association: &str,
+        revision: &str,
+    ) -> Result<Value, ApiError> {
+        let raw: Value = self.get_json(
+            &[
+                "associations",
+                association,
+                "declarations",
+                "revisions",
+                revision,
+            ],
+            None,
+            None,
+        )?;
+        if raw["id"].as_str() != Some(revision) || raw.get("data").is_none() {
+            return Err(ApiError::Protocol("declaration revision mismatch".into()));
+        }
+        Ok(raw["data"].clone())
+    }
+
+    pub fn resolve_installation(
+        &self,
+        release: &str,
+        request: &crate::installation::ResolveRequest,
+    ) -> Result<Value, ApiError> {
+        let url = self.url(
+            &["releases", release, "installation", "resolve"],
+            None,
+            None,
+        )?;
+        let mut post = self
+            .agent
+            .post(url.as_str())
+            .set("Accept", "application/json")
+            .set("Content-Type", "application/json");
+        if let Some(token) = &self.token {
+            post = post.set("Authorization", &format!("Bearer {token}"));
+        }
+        let body = serde_json::to_string(request).map_err(|e| ApiError::Config(e.to_string()))?;
+        Self::json_response(post.send_string(&body), MAX_INSTALLATION_JSON_BYTES)
+            .map(|(value, _)| value)
     }
 
     pub fn capabilities(&self) -> Result<Capabilities, ApiError> {
@@ -800,6 +875,79 @@ mod tests {
             }
         });
         (address, requests, handle)
+    }
+
+    #[test]
+    fn installation_plan_resolve_persist_and_reopen_fixture() {
+        use crate::{
+            installation::ResolveRequest,
+            library::{Library, LibraryPaths},
+        };
+        use serde_json::json as j;
+        let release = "11111111-1111-4111-8111-111111111111";
+        let revision = "22222222-2222-4222-8222-222222222222";
+        let app = "33333333-3333-4333-8333-333333333333";
+        let a = "44444444-4444-4444-8444-444444444444";
+        let b = "55555555-5555-4555-8555-555555555555";
+        let hash = "a".repeat(64);
+        let artifact = format!("adfile:sha256:{hash}");
+        let source = |id| j!({"associationId":id,"artifactId":artifact,"fileId":null,"sha256":hash,"size":42,"executable":false});
+        let plan = j!({"version":1,"appId":app,"releaseId":release,"revisionId":revision,"platform":"windows/x86_64","selections":{"components":[]},"unresolved":[],"files":{"one":source(a),"two":source(b)},"directories":[],"prerequisites":[],"launch":null});
+        let manifest = j!({"version":1,"payload":[{"associationId":a,"destination":"one"},{"associationId":b,"destination":"two"}],"options":[{"id":"components","name":"Components","defaults":["extra"],"choices":[{"id":"extra","name":"Extra","payload":[]}]}]});
+        let replies=vec![json(CAPS),json(&plan.to_string()),json(&j!({"id":release,"appId":app,"state":"Published","version":"1"}).to_string()),json(&j!({"id":revision,"data":{"appDepot":{"installation":manifest}}}).to_string()),json(&j!({"items":[{"id":a,"releaseId":release,"artifactId":artifact},{"id":b,"releaseId":release,"artifactId":artifact}],"nextCursor":null}).to_string()),json(&j!({"id":artifact,"kind":"File","size":42}).to_string())];
+        let (address, _, handle) = server(replies);
+        let root = tempfile::tempdir().unwrap();
+        let paths = LibraryPaths {
+            metadata: root.path().join("meta"),
+            content: root.path().join("content"),
+        };
+        let mut lib = Library::open(paths.clone()).unwrap();
+        let profile = lib.add_profile("fixture", &address, false).unwrap();
+        let client = ApiClient::new(&address, None, false).unwrap();
+        let request = ResolveRequest {
+            platform: "windows/x86_64".into(),
+            revision_id: Some(revision.into()),
+            selections: [("components".into(), vec![])].into(),
+        };
+        let saved = lib
+            .resolve_plan(&profile.id, &client, release, &request)
+            .unwrap();
+        assert_eq!(saved.plan, plan);
+        handle.join().unwrap();
+        drop(lib);
+        let reopened = Library::open(paths).unwrap();
+        let offline = reopened.saved_plans(&profile.id).unwrap();
+        assert_eq!(offline.len(), 1);
+        assert_eq!(offline[0].id, saved.id);
+        assert_eq!(offline[0].fingerprint, saved.fingerprint);
+        assert_eq!(offline[0].plan, plan);
+    }
+
+    #[test]
+    fn installation_resolver_post_uses_bearer_and_structured_errors() {
+        use crate::installation::ResolveRequest;
+        let request = ResolveRequest {
+            platform: "windows/x86_64".into(),
+            revision_id: Some("rev".into()),
+            selections: [("language".into(), vec![])].into(),
+        };
+        let (address, requests, handle)=server(vec![Reply{status:400,content_type:"application/problem+json",body:r#"{"status":400,"type":"urn:app-depot:problem:installation_selection","code":"installation_selection","title":"Choose valid installation options"}"#.into(),extra_header:None}]);
+        let err = ApiClient::new(&address, Some("fixture".into()), false)
+            .unwrap()
+            .resolve_installation("release", &request)
+            .unwrap_err();
+        assert!(
+            matches!(err,ApiError::Http{status:400,problem:Some(Problem{code,..})} if code=="installation_selection")
+        );
+        handle.join().unwrap();
+        let sent = requests.lock().unwrap()[0].to_ascii_lowercase();
+        assert!(sent.starts_with("post /api/v1/releases/release/installation/resolve http/"));
+        assert!(sent.contains("authorization: bearer fixture"));
+        assert!(sent.contains("content-type: application/json"));
+        assert_eq!(
+            serde_json::to_value(request).unwrap()["selections"]["language"],
+            serde_json::json!([])
+        );
     }
 
     #[test]

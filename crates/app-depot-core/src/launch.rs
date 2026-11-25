@@ -181,6 +181,20 @@ impl Library {
                     reason: String::new(),
                     local_root: None,
                 };
+                if snapshot
+                    .release
+                    .app_depot()
+                    .and_then(|v| v.get("installation"))
+                    .is_some()
+                {
+                    issue(
+                        &mut c,
+                        "UnsupportedInstallation",
+                        "Explicit installation manifest requires plan execution (not supported)",
+                    );
+                    out.push(c);
+                    continue;
+                }
                 if id.is_empty()
                     || id.len() > 80
                     || !id
@@ -742,6 +756,26 @@ mod tests {
                 .to_string()
                 .contains("18446744073709551615")
         );
+        for manifest in [
+            serde_json::json!(null),
+            serde_json::json!({"version": 2}),
+            serde_json::json!({"version": 1}),
+        ] {
+            let mut blocked = snapshot.clone();
+            blocked["release"]["data"]["appDepot"]["installation"] = manifest;
+            lib.conn
+                .execute(
+                    "UPDATE snapshots SET snapshot_json=?2 WHERE profile_id=?1",
+                    params![profile, blocked.to_string()],
+                )
+                .unwrap();
+            assert!(
+                lib.launch_candidates(&ServerProfileId(profile.into()), "release")
+                    .unwrap()
+                    .iter()
+                    .all(|c| c.status == "UnsupportedInstallation")
+            );
+        }
     }
     #[cfg(target_os = "linux")]
     #[test]

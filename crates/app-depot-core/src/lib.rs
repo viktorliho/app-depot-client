@@ -4,6 +4,7 @@
 
 pub mod api;
 pub mod discovery;
+pub mod installation;
 pub mod launch;
 pub mod library;
 pub mod managed;

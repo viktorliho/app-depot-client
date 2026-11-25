@@ -13,7 +13,7 @@ use std::{
 };
 use uuid::Uuid;
 
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 const MARKER: &str = ".app-depot-library-id";
 
 #[derive(Debug)]
@@ -434,8 +434,11 @@ impl Library {
             conn.execute_batch(MIGRATE_V5)?;
         } else if version == 4 {
             conn.execute_batch(MIGRATE_V5)?;
-        } else if version != SCHEMA_VERSION {
+        } else if version != 5 && version != SCHEMA_VERSION {
             return Err(invalid("library schema migration is required"));
+        }
+        if version < 6 {
+            conn.execute_batch(MIGRATE_V6)?;
         }
         #[cfg(windows)]
         conn.execute_batch(crate::windows_install::REMOVAL_SCHEMA)?;
@@ -975,6 +978,18 @@ PRAGMA user_version=4;
 COMMIT;
 "#;
 
+const MIGRATE_V6: &str = r#"
+BEGIN IMMEDIATE;
+CREATE TABLE installation_plans (
+ id TEXT PRIMARY KEY,
+ profile_id TEXT NOT NULL REFERENCES profiles(id),
+ plan_json TEXT NOT NULL,
+ fingerprint TEXT NOT NULL
+);
+PRAGMA user_version=6;
+COMMIT;
+"#;
+
 const MIGRATE_V5: &str = r#"
 BEGIN IMMEDIATE;
 ALTER TABLE download_jobs ADD COLUMN queue_rank INTEGER NOT NULL DEFAULT 0;
@@ -1099,6 +1114,41 @@ mod tests {
     }
 
     #[test]
+    fn schema_five_migration_preserves_profile_and_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let roots = paths(&dir);
+        let mut lib = Library::open(roots.clone()).unwrap();
+        let profile = lib
+            .add_profile("existing", "http://localhost:8787", false)
+            .unwrap();
+        lib.conn
+            .execute(
+                "INSERT INTO apps(profile_id,id,metadata_json,last_seen) VALUES (?1,'app','{}',1)",
+                [&profile.id.0],
+            )
+            .unwrap();
+        lib.conn
+            .execute_batch("DROP TABLE installation_plans; PRAGMA user_version=5;")
+            .unwrap();
+        drop(lib);
+        let lib = Library::open(roots).unwrap();
+        assert_eq!(lib.profile(&profile.id).unwrap().name, "existing");
+        assert_eq!(
+            lib.conn
+                .query_row("SELECT count(*) FROM apps", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert!(lib.saved_plans(&profile.id).unwrap().is_empty());
+        assert_eq!(
+            lib.conn
+                .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            6
+        );
+    }
+
+    #[test]
     fn concurrent_open_migrates_version_four_once() {
         let dir = tempfile::tempdir().unwrap();
         let roots = paths(&dir);
@@ -1133,7 +1183,7 @@ mod tests {
                         lib.conn
                             .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                             .unwrap(),
-                        5
+                        6
                     );
                 })
             })
