@@ -8,6 +8,7 @@ pub mod installation;
 pub mod launch;
 pub mod library;
 pub mod managed;
+pub mod materialization;
 pub mod migration;
 pub mod models;
 pub mod secrets;

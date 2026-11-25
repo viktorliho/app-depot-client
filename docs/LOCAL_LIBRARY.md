@@ -74,3 +74,22 @@ SHA-256 fingerprint of the locally serialized JSON. This fingerprint is not a
 Server identity. No installation state or verified content is changed by saving
 a plan. Clients limited to schema 5 reject the newer library; use a pre-upgrade
 backup if returning to an older client. The reader never executes plan metadata.
+
+### Standard installation materialization boundary
+
+The shared `materialization::destination_layout(&Plan)` projects a previously
+validated Standard plan to destination `InventoryEntry` values. These are not
+a Tree Identity inventory: source file IDs and digests can repeat. Paths are
+relative to the payload root, with explicit parent and empty directories.
+Core authorizes each source against its completed Artifact reference before
+calling the filesystem adapter. The adapter independently checks size and
+SHA-256 and copies writable independent files, preserving portable executable
+attributes on Linux. The adapter publishes a generation UUID directory under
+`apps/` without replacement, with a `payload/` directory and a sibling
+`.app-depot-installation-id` marker containing the UUID. Publication does not
+activate a generation; only the Core SQLite transaction does. Verification
+checks the marker and exact destination layout without mutation. Windows uses
+`windows_fs::publish_tree_install(to, id, entries, object)` and
+`windows_fs::verify_tree_install(to, id, entries)`; the object callback maps a
+SHA-256 digest to an already authorized CAS path. No adapter may execute
+prerequisites or infer launch semantics.
