@@ -121,3 +121,14 @@ explicit consent/retry, and tests durable outcomes after reopening a disposable
 library. An injected activation transaction failure leaves the old generation
 active and is recovered with a fresh authorization and verified prior
 completions. No native installer is executed by this test.
+
+### Prerequisite source layouts (M5.3A.1)
+
+The shared mock executor receives independent File and Tree source layouts,
+including a nested installer, its neighboring support file and an empty
+directory absent from the final application payload. Tests exercise reordered
+inventory entries, supporting CAS corruption before execution, source-copy
+mutation without CAS mutation, retained ambiguous workspaces, fresh copies
+after explicit retry and cleanup of an owned partial workspace after reopening.
+Linux also verifies CAS retention and source-workspace cleanup on uninstall.
+No native installer is executed.

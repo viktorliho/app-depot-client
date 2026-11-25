@@ -250,3 +250,14 @@ inspection, and reports native execution as unavailable. Controlled mock
 execution tests the shared lifecycle without running installer binaries.
 The Windows native executor and generation-specific lifecycle are separate
 work; Wine, Proton, MSI, Derived installation and Desktop UI are not included.
+
+## M5.3A.1 — Prerequisite source layout integration
+
+The shared executor receives a verified independent Artifact source root,
+declared file and containing directory rather than a CAS object. Full Tree
+inventories preserve original paths, supporting files and empty directories;
+File Artifacts use a single opaque local filename. The existing materialization
+backend copies and verifies all source bytes. Attempt-owned temporary layouts
+are independent from application generations and retained for ambiguous
+execution; definite outcomes permit recoverable cleanup. Existing generation
+source references retain CAS ownership. No schema change is needed.

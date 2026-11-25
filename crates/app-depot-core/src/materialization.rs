@@ -68,7 +68,10 @@ fn publish_layout(
     private_dir(stage)?;
     let root = open_dir_nofollow(stage)?;
     let payload = dir_beneath(&root, "payload", true)?;
-    for entry in entries {
+    // Original Tree inventories need not arrive in parent-before-child order.
+    let mut ordered: Vec<_> = entries.iter().collect();
+    ordered.sort_unstable_by(|left, right| left.path().cmp(right.path()));
+    for entry in &ordered {
         match entry {
             InventoryEntry::Directory { path } => {
                 dir_beneath(&payload, path, true)?;
@@ -92,7 +95,7 @@ fn publish_layout(
             }
         }
     }
-    for entry in entries.iter().rev() {
+    for entry in ordered.into_iter().rev() {
         if let InventoryEntry::Directory { path } = entry {
             dir_beneath(&payload, path, false)?.sync_all()?;
         }
@@ -244,14 +247,22 @@ pub(crate) fn publish_prerequisite_source(
     // Exclusive creation, with a durable owner marker before materialization.
     #[cfg(target_os = "linux")]
     {
-        use std::{io::Write, os::unix::fs::DirBuilderExt};
-        std::fs::DirBuilder::new().mode(0o700).create(&workspace)?;
+        use std::{ffi::CString, io::Write, os::fd::AsRawFd};
+        let parent = crate::launch::open_nofollow(content, "staging", true)?;
+        let name = format!("prerequisite-{attempt}");
+        let c_name = CString::new(name.as_str())
+            .map_err(|_| LibraryError::Invalid("invalid workspace name".into()))?;
+        // SAFETY: parent is a live, no-follow directory handle and c_name is NUL terminated.
+        if unsafe { libc::mkdirat(parent.as_raw_fd(), c_name.as_ptr(), 0o700) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let owned = crate::tree_download::dir_beneath(&parent, &name, false)?;
         let mut marker =
-            crate::transfer::create_content_file(&workspace.join(".app-depot-prerequisite-id"))?;
+            crate::tree_download::create_file_beneath(&owned, ".app-depot-prerequisite-id")?;
         marker.write_all(attempt.as_bytes())?;
         marker.sync_all()?;
-        crate::transfer::sync_dir(&workspace)?;
-        crate::transfer::sync_dir(&content.join("staging"))?;
+        owned.sync_all()?;
+        parent.sync_all()?;
     }
     #[cfg(windows)]
     crate::windows_fs::create_prerequisite_workspace(&workspace, attempt)?;
@@ -301,12 +312,28 @@ pub(crate) fn cleanup_prerequisite_workspace(
     {
         use std::io::Read;
         let marker = crate::launch::open_nofollow(&workspace, ".app-depot-prerequisite-id", false)?;
+        let metadata = marker.metadata()?;
+        if !metadata.is_file() || metadata.len() != 36 {
+            return Err(LibraryError::Invalid(
+                "invalid prerequisite workspace ownership marker".into(),
+            ));
+        }
         let mut owner = String::new();
         marker.take(37).read_to_string(&mut owner)?;
         if owner != attempt {
             return Err(LibraryError::Invalid(
                 "prerequisite workspace ownership marker mismatch".into(),
             ));
+        }
+        for entry in std::fs::read_dir(&workspace)? {
+            let name = entry?.file_name();
+            if name == ".app-depot-prerequisite-id" {
+                continue;
+            }
+            let name = name.to_str().ok_or_else(|| {
+                LibraryError::Invalid("non-Unicode prerequisite workspace entry".into())
+            })?;
+            crate::managed::delete_owned(content, &workspace, name)?;
         }
         crate::managed::delete_owned(
             content,

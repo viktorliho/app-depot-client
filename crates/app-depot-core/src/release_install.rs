@@ -317,6 +317,12 @@ mod coordinator {
                     "prerequisite source has no durable generation reference",
                 ));
             }
+            let registered: bool = self.conn.query_row("SELECT EXISTS(SELECT 1 FROM download_jobs j JOIN verified_content v ON (j.profile_id,j.association_id,j.artifact_id)=(v.profile_id,v.association_id,v.artifact_id) WHERE j.id=?1 AND j.state='Completed')",[&job.id],|r|r.get(0))?;
+            if !registered {
+                return Err(invalid(
+                    "completed prerequisite Artifact reference disappeared",
+                ));
+            }
             self.authorize_plan_files(job, &[&p.file])?;
             self.authorize_prerequisite_path(job, p)?;
             let (entries, relative_file) = if p.file.file_id.is_some() {
@@ -1071,17 +1077,65 @@ mod tests {
         bytes: &[u8],
         tree: bool,
     ) -> Value {
+        source_layout(
+            lib,
+            profile,
+            release,
+            bytes,
+            tree.then_some("original"),
+            None,
+        )
+    }
+
+    fn source_layout(
+        lib: &Library,
+        profile: &ServerProfileId,
+        release: &str,
+        bytes: &[u8],
+        tree_path: Option<&str>,
+        support: Option<(&str, &[u8])>,
+    ) -> Value {
         let association = id();
         let job = id();
         let file_id = id();
         let hash = format!("{:x}", Sha256::digest(bytes));
-        let entries = vec![InventoryEntry::File {
-            path: "original".into(),
+        let tree = tree_path.is_some();
+        let path = tree_path.unwrap_or("original");
+        let mut entries = vec![InventoryEntry::File {
+            path: path.into(),
             file_id: file_id.clone(),
             size: bytes.len() as u64,
             sha256: hash.clone(),
             executable: false,
         }];
+        let mut objects = vec![(hash.clone(), bytes)];
+        if let Some((support_path, support_bytes)) = support {
+            let support_hash = format!("{:x}", Sha256::digest(support_bytes));
+            entries.push(InventoryEntry::File {
+                path: support_path.into(),
+                file_id: id(),
+                size: support_bytes.len() as u64,
+                sha256: support_hash.clone(),
+                executable: false,
+            });
+            objects.push((support_hash, support_bytes));
+            entries.push(InventoryEntry::Directory {
+                path: "empty".into(),
+            });
+        }
+        let mut dirs = std::collections::BTreeSet::new();
+        for entry in &entries {
+            let mut relative = entry.path();
+            while let Some((parent, _)) = relative.rsplit_once('/') {
+                dirs.insert(parent.to_owned());
+                relative = parent;
+            }
+        }
+        entries.extend(
+            dirs.into_iter()
+                .map(|path| InventoryEntry::Directory { path }),
+        );
+        let size: usize = objects.iter().map(|(_, bytes)| bytes.len()).sum();
         let artifact = if tree {
             crate::tree::identity(&entries).unwrap()
         } else {
@@ -1093,20 +1147,33 @@ mod tests {
                 params![
                     profile.0,
                     artifact,
-                    json!({"id":artifact,"kind":if tree{"Tree"}else{"File"},"size":bytes.len()})
+                    json!({"id":artifact,"kind":if tree{"Tree"}else{"File"},"size":size})
                         .to_string()
                 ],
             )
             .unwrap();
         lib.conn.execute("INSERT INTO associations(profile_id,id,release_id,artifact_id,metadata_json,last_seen) VALUES (?1,?2,?3,?4,?5,0)",params![profile.0,association,release,artifact,json!({"id":association,"releaseId":release,"artifactId":artifact}).to_string()]).unwrap();
-        lib.conn.execute("INSERT INTO download_jobs(id,profile_id,artifact_id,state,created_at,association_id,expected_size,updated_at,inventory_json) VALUES (?1,?2,?3,'Completed',0,?4,?5,0,?6)",params![job,profile.0,artifact,association,bytes.len(),if tree{Some(serde_json::to_string(&entries).unwrap())}else{None}]).unwrap();
+        lib.conn.execute("INSERT INTO download_jobs(id,profile_id,artifact_id,state,created_at,association_id,expected_size,updated_at,inventory_json) VALUES (?1,?2,?3,'Completed',0,?4,?5,0,?6)",params![job,profile.0,artifact,association,size,if tree{Some(serde_json::to_string(&entries).unwrap())}else{None}]).unwrap();
         if tree {
-            lib.conn.execute("INSERT INTO tree_files(job_id,path,file_id,size,sha256,executable,verified) VALUES (?1,'original',?2,?3,?4,0,1)",params![job,file_id,bytes.len(),hash]).unwrap();
+            for entry in &entries {
+                if let InventoryEntry::File {
+                    path,
+                    file_id,
+                    size,
+                    sha256,
+                    executable,
+                } = entry
+                {
+                    lib.conn.execute("INSERT INTO tree_files(job_id,path,file_id,size,sha256,executable,progress,verified) VALUES (?1,?2,?3,?4,?5,?6,?4,1)",params![job,path,file_id,size,sha256,executable]).unwrap();
+                }
+            }
         }
         lib.conn.execute("INSERT INTO verified_content(profile_id,artifact_id,local_ref,verified_at,association_id) VALUES (?1,?2,?3,0,?4)",params![profile.0,artifact,format!("artifacts/{}/{}/{}",profile.0,association,hash),association]).unwrap();
-        let object = lib.object(&format!("adfile:sha256:{hash}")).unwrap();
-        fs::create_dir_all(object.parent().unwrap()).unwrap();
-        fs::write(&object, bytes).unwrap();
+        for (digest, bytes) in objects {
+            let object = lib.object(&format!("adfile:sha256:{digest}")).unwrap();
+            fs::create_dir_all(object.parent().unwrap()).unwrap();
+            fs::write(&object, bytes).unwrap();
+        }
         json!({"associationId":association,"artifactId":artifact,"fileId":if tree{Some(file_id)}else{None},"sha256":hash,"size":bytes.len(),"executable":!tree})
     }
     #[cfg(target_os = "linux")]
@@ -1535,6 +1602,202 @@ mod tests {
             lib.prerequisite_progress(&profile, &next_id).unwrap()["consents"][1]["attempts"][0]["state"],
             "Declined"
         );
+    }
+
+    #[test]
+    fn prerequisite_source_layout_preserves_neighbors_and_recovers() {
+        use crate::prerequisite::{PrerequisiteExecutor, PrerequisiteOutcome, PrerequisiteRequest};
+        struct Mock {
+            tree_outcome: PrerequisiteOutcome,
+            seen: Vec<String>,
+            roots: Vec<PathBuf>,
+        }
+        impl PrerequisiteExecutor for Mock {
+            fn execute(&mut self, request: &PrerequisiteRequest<'_>) -> PrerequisiteOutcome {
+                let source = request.source;
+                assert_eq!(source.file.parent(), Some(source.directory.as_path()));
+                assert!(source.file.starts_with(&source.root));
+                assert!(!source.root.starts_with(request.payload));
+                assert!(!request.payload.join("setup").exists());
+                self.seen.push(request.prerequisite.id.clone());
+                self.roots.push(source.root.clone());
+                if request.prerequisite.id == "file" {
+                    assert_eq!(source.directory, source.root);
+                    assert_eq!(source.file, source.root.join("prerequisite"));
+                    assert_eq!(fs::read(&source.file).unwrap(), b"standalone");
+                    fs::write(&source.file, b"modified independent File").unwrap();
+                    PrerequisiteOutcome::Exited(0)
+                } else {
+                    assert_eq!(source.file, source.root.join("setup/installer.exe"));
+                    assert_eq!(source.directory, source.root.join("setup"));
+                    assert_eq!(fs::read(&source.file).unwrap(), b"installer");
+                    assert_eq!(
+                        fs::read(source.directory.join("support.dat")).unwrap(),
+                        b"neighbor"
+                    );
+                    assert!(source.root.join("empty").is_dir());
+                    fs::write(source.directory.join("support.dat"), b"changed neighbor").unwrap();
+                    fs::write(source.directory.join("generated.log"), b"mock output").unwrap();
+                    self.tree_outcome.clone()
+                }
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let paths = LibraryPaths {
+            metadata: temp.path().join("metadata"),
+            content: temp.path().join("content"),
+        };
+        let mut lib = Library::open(paths.clone()).unwrap();
+        let profile = lib
+            .add_profile("fixture", "http://localhost:8787", false)
+            .unwrap()
+            .id;
+        let (app, release, revision) = (id(), id(), id());
+        lib.conn
+            .execute(
+                "INSERT INTO apps(profile_id,id,metadata_json,last_seen) VALUES (?1,?2,'{}',0)",
+                params![profile.0, app],
+            )
+            .unwrap();
+        lib.conn.execute("INSERT INTO releases(profile_id,id,app_id,metadata_json,last_seen) VALUES (?1,?2,?3,'{}',0)",params![profile.0,release,app]).unwrap();
+        let payload = source(&lib, &profile, &release, b"application", false);
+        let file = source(&lib, &profile, &release, b"standalone", false);
+        let tree = source_layout(
+            &lib,
+            &profile,
+            &release,
+            b"installer",
+            Some("setup/installer.exe"),
+            Some(("setup/support.dat", b"neighbor")),
+        );
+        let mut plan = json!({"version":1,"appId":app,"releaseId":release,"revisionId":revision,"platform":crate::launch::host().unwrap(),"selections":{},"unresolved":[],"files":{"app":payload},"directories":[],"prerequisites":[],"launch":null});
+        let old_plan = save(&lib, &profile, &plan);
+        let old = lib
+            .install_saved_plan(&profile, &old_plan, None)
+            .unwrap()
+            .active_generation
+            .unwrap();
+        plan["prerequisites"] = json!([
+            {"id":"file","name":"Standalone","file":file,"path":"","arguments":[],"optional":false,"evidence":"fixture","successExitCodes":[0]},
+            {"id":"tree","name":"Tree installer","file":tree,"path":"setup/installer.exe","arguments":[],"optional":false,"evidence":"fixture","successExitCodes":[0]}
+        ]);
+        let plan_id = save(&lib, &profile, &plan);
+        let pending = lib.install_saved_plan(&profile, &plan_id, None).unwrap();
+        let generation = pending.generations.last().unwrap().id.clone();
+        let fp = lib
+            .prerequisite_requirements(&profile, &plan_id)
+            .unwrap()
+            .fingerprint;
+        let selection = vec!["file".into(), "tree".into()];
+        let neighbor_digest = format!("{:x}", Sha256::digest(b"neighbor"));
+        let neighbor = lib
+            .object(&format!("adfile:sha256:{neighbor_digest}"))
+            .unwrap();
+        let standalone = lib.object(file["artifactId"].as_str().unwrap()).unwrap();
+        let mut mock = Mock {
+            tree_outcome: PrerequisiteOutcome::Ambiguous("mock interrupted".into()),
+            seen: vec![],
+            roots: vec![],
+        };
+        // Supporting file corruption must fail before that executor is called.
+        fs::write(&neighbor, b"corrupt!").unwrap();
+        let consent = lib
+            .confirm_prerequisites(&profile, &generation, &fp, &selection, false)
+            .unwrap();
+        let result = lib
+            .process_prerequisites(&profile, &generation, &consent, None, &mut mock)
+            .unwrap();
+        assert_eq!(result.active_generation.as_deref(), Some(old.as_str()));
+        assert_eq!(mock.seen, ["file"]);
+        assert!(!mock.roots[0].exists());
+        assert_eq!(fs::read(&standalone).unwrap(), b"standalone");
+        let progress = lib.prerequisite_progress(&profile, &generation).unwrap();
+        assert_eq!(progress["consents"][0]["attempts"][1]["state"], "Failed");
+        assert!(progress["consents"][0]["attempts"][1]["sourceWorkspace"].is_null());
+        fs::write(&neighbor, b"neighbor").unwrap();
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(lib.collect_unreferenced_objects().unwrap(), 0);
+            assert!(
+                lib.remove_local_artifact(&profile, tree["associationId"].as_str().unwrap())
+                    .is_err()
+            );
+        }
+
+        let consent = lib
+            .confirm_prerequisites(&profile, &generation, &fp, &selection, true)
+            .unwrap();
+        let result = lib
+            .process_prerequisites(&profile, &generation, &consent, None, &mut mock)
+            .unwrap();
+        assert_eq!(result.active_generation.as_deref(), Some(old.as_str()));
+        assert_eq!(
+            mock.seen,
+            ["file", "file", "tree"],
+            "{:?}",
+            result.generations.last().unwrap().last_error
+        );
+        let ambiguous_root = mock.roots.last().unwrap().clone();
+        assert_eq!(
+            fs::read(ambiguous_root.join("setup/support.dat")).unwrap(),
+            b"changed neighbor"
+        );
+        assert_eq!(fs::read(&neighbor).unwrap(), b"neighbor");
+        let progress = lib.prerequisite_progress(&profile, &generation).unwrap();
+        assert_eq!(progress["consents"][1]["attempts"][1]["state"], "Ambiguous");
+        assert!(progress["consents"][1]["attempts"][1]["sourceWorkspace"].is_string());
+
+        // Reopening and explicitly retrying uses a new unmodified source.
+        drop(lib);
+        let mut lib = Library::open(paths).unwrap();
+        mock.tree_outcome = PrerequisiteOutcome::Exited(0);
+        let consent = lib
+            .confirm_prerequisites(&profile, &generation, &fp, &selection, true)
+            .unwrap();
+        let result = lib
+            .process_prerequisites(&profile, &generation, &consent, None, &mut mock)
+            .unwrap();
+        assert_eq!(
+            result.active_generation.as_deref(),
+            Some(generation.as_str())
+        );
+        assert_ne!(mock.roots.last().unwrap(), &ambiguous_root);
+        assert!(!mock.roots.last().unwrap().exists());
+        assert!(ambiguous_root.exists());
+        assert_eq!(fs::read(&neighbor).unwrap(), b"neighbor");
+        assert_eq!(fs::read(&standalone).unwrap(), b"standalone");
+        lib.verify_release_installation(&profile, &release).unwrap();
+        // Simulate a crash after preparation but before a definite outcome's
+        // workspace was cleaned. Progress must recover its owned partial tree.
+        let progress = lib.prerequisite_progress(&profile, &generation).unwrap();
+        let attempt = progress["consents"][2]["attempts"][1]["id"]
+            .as_str()
+            .unwrap();
+        let workspace =
+            crate::materialization::prerequisite_workspace(&lib.paths.content, attempt).unwrap();
+        fs::create_dir(&workspace).unwrap();
+        fs::write(workspace.join(".app-depot-prerequisite-id"), attempt).unwrap();
+        fs::create_dir(workspace.join("partial")).unwrap();
+        fs::write(workspace.join("partial/file"), b"interrupted copy").unwrap();
+        let progress = lib.prerequisite_progress(&profile, &generation).unwrap();
+        assert!(progress["consents"][2]["attempts"][1]["sourceCleanupError"].is_null());
+        assert!(!workspace.exists());
+        // A foreign directory at an attempt-derived path must not be erased.
+        fs::create_dir(&workspace).unwrap();
+        fs::write(workspace.join(".app-depot-prerequisite-id"), id()).unwrap();
+        fs::write(workspace.join("foreign"), b"preserve").unwrap();
+        let progress = lib.prerequisite_progress(&profile, &generation).unwrap();
+        assert!(progress["consents"][2]["attempts"][1]["sourceCleanupError"].is_string());
+        assert_eq!(fs::read(workspace.join("foreign")).unwrap(), b"preserve");
+        // Dispose of the synthetic foreign data only within this test fixture.
+        fs::remove_dir_all(&workspace).unwrap();
+        #[cfg(target_os = "linux")]
+        {
+            lib.uninstall_release_installation(&profile, &release)
+                .unwrap();
+            assert!(!ambiguous_root.exists());
+            assert_eq!(fs::read(&neighbor).unwrap(), b"neighbor");
+        }
     }
 
     #[cfg(windows)]
