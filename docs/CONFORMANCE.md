@@ -132,3 +132,12 @@ mutation without CAS mutation, retained ambiguous workspaces, fresh copies
 after explicit retry and cleanup of an owned partial workspace after reopening.
 Linux also verifies CAS retention and source-workspace cleanup on uninstall.
 No native installer is executed.
+
+### Desktop Standard manifest workflow (M5.4A)
+
+Desktop tests render the option and resolved-plan dialogs with a synthetic
+application and exercise localization and required selection presentation. A
+disposable SQLite/CAS fixture exercises the worker's pinned-plan confirmation,
+prerequisite failure with a previous generation intact, explicit retry using a
+mock executor, optional decline, activation, verification, uninstall and
+reinstall. Native prerequisite binaries are not executed by Desktop tests.

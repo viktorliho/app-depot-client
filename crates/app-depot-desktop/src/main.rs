@@ -1,5 +1,6 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 mod design;
+mod manifest_ui;
 mod preferences;
 mod telemetry;
 #[cfg(any(target_os = "linux", windows))]
@@ -80,6 +81,9 @@ struct Desktop {
     #[cfg(any(target_os = "linux", windows))]
     updater: updater::Updater,
     worker: Worker,
+    install_dialog: Option<manifest_ui::InstallDialog>,
+    manifest_request: u64,
+    standard_remove: Option<(ServerProfileId, String, String)>,
     snapshot: Snapshot,
     storage_usage: Option<StorageUsage>,
     active: Option<ServerProfileId>,
@@ -153,6 +157,9 @@ impl Desktop {
             #[cfg(any(target_os = "linux", windows))]
             updater: updater::Updater::new(ctx),
             worker: Worker::start(paths, ctx.clone()),
+            install_dialog: None,
+            manifest_request: 0,
+            standard_remove: None,
             snapshot: Snapshot::default(),
             storage_usage: None,
             active: None,
@@ -253,6 +260,11 @@ impl Desktop {
         self.snapshot.trees.clear();
         self.snapshot.local_issues.clear();
         self.snapshot.installations.clear();
+        self.snapshot.standard.clear();
+        self.snapshot.plans.clear();
+        self.snapshot.prerequisites.clear();
+        self.install_dialog = None;
+        self.standard_remove = None;
         self.snapshot.jobs.clear();
         self.snapshot.launches.clear();
         self.launch_states.clear();
@@ -298,7 +310,25 @@ impl Desktop {
                         self.snapshot.trees = s.trees;
                         self.snapshot.local_issues = s.local_issues;
                         self.snapshot.installations = s.installations;
+                        self.snapshot.standard = s.standard;
+                        self.snapshot.plans = s.plans;
+                        self.snapshot.prerequisites = s.prerequisites;
                         self.snapshot.launches = s.launches;
+                    }
+                }
+                Event::ManifestResolved { request, result } => {
+                    if let Some(dialog) = self
+                        .install_dialog
+                        .as_mut()
+                        .filter(|d| d.request == request)
+                    {
+                        match result {
+                            Ok(plan) => dialog.set_plan(plan),
+                            Err(error) => {
+                                dialog.busy = false;
+                                dialog.error = Some(error);
+                            }
+                        }
                     }
                 }
                 Event::StorageUsage(usage) => self.storage_usage = Some(usage),

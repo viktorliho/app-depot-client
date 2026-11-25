@@ -874,6 +874,13 @@ impl Desktop {
         interaction
             .widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, &view.app.name));
         interaction.context_menu(|ui| {
+            for release in view
+                .releases
+                .iter()
+                .filter(|r| crate::manifest_ui::declared(r))
+            {
+                self.manifest_action(ui, release, &view.app.name);
+            }
             if ui.button("View details").clicked() {
                 self.selected_app = Some(view.app.id.clone());
                 ui.close();
@@ -893,6 +900,7 @@ impl Desktop {
         {
             self.selected_app = Some(view.app.id.clone());
         }
+        self.manifest_browse_action(ui, view);
     }
     fn app_row(&mut self, ui: &mut egui::Ui, view: &AppView, row_width: f32) {
         let p = design::palette(ui);
@@ -901,7 +909,9 @@ impl Desktop {
             .iter()
             .flat_map(|release| &release.associations)
             .any(|item| self.is_verified(&item.association.id));
-        let status = if verified {
+        let status = if view.releases.iter().any(crate::manifest_ui::declared) {
+            "Installation available"
+        } else if verified {
             "In your library"
         } else if view.stale {
             "Saved catalog"
@@ -991,6 +1001,14 @@ impl Desktop {
             );
         }
         interaction.context_menu(|ui| {
+            for release in view
+                .releases
+                .iter()
+                .filter(|r| crate::manifest_ui::declared(r))
+            {
+                self.manifest_action(ui, release, &view.app.name);
+            }
+
             if ui.button("View details").clicked() {
                 self.selected_app = Some(view.app.id.clone());
                 ui.close();
@@ -1002,6 +1020,7 @@ impl Desktop {
         {
             self.selected_app = Some(view.app.id.clone());
         }
+        self.manifest_browse_action(ui, view);
         ui.add_space(4.0);
     }
     fn is_verified(&self, id: &str) -> bool {
@@ -1203,6 +1222,8 @@ impl Desktop {
                             ui.menu_button("Choose Play", |ui| self.play_options_menu(ui, &ready));
                         } else if let Some(process) = candidates.find(|c| matches!(c.status.as_str(), "Running" | "ProcessUnknown")) {
                             ui.label(&process.reason);
+                        } else if let Some(release)=view.releases.first().filter(|r|view.releases.len()==1 && crate::manifest_ui::declared(r)) {
+                            self.manifest_action(ui,release,&view.app.name);
                         } else if let Some(release)=view.releases.first().filter(|_|view.releases.len()==1)
                             && let Some(item)=release.associations.first().filter(|_|release.associations.len()==1)
                             && let Some(artifact)=&item.artifact
@@ -1277,6 +1298,10 @@ impl Desktop {
                                 if let Some(platforms)=info.platforms { ui.label(format!("Declared platforms: {}",platforms.join(", "))); }
                                 if let Some(runtime)=info.runtime { ui.label(format!("Declared runtime: {} {} · preparation unavailable",runtime.name.unwrap_or_else(||"Unspecified".into()),runtime.version.unwrap_or_default())); }
                         }
+                        if crate::manifest_ui::declared(release) {
+                            self.manifest_action(ui,release,&view.app.name);
+                            if let Some(d)=&release.declaration && let Ok(Some(m))=app_depot_core::installation::manifest(&d.release) {ui.label(crate::manifest_ui::localization(m.localization.as_ref()));}
+                        }
                         if release.associations.is_empty() { ui.label("No artifacts in this release."); }
                         for (a_index,item) in release.associations.iter().enumerate() {
                             let convention=release.declaration.as_ref().and_then(|s|s.associations.iter().find(|a|a.association_id==item.association.id)).and_then(|a|a.declaration.convention::<AssociationConvention>().ok().flatten());
@@ -1300,7 +1325,7 @@ impl Desktop {
                                     }
                                 });
                                 #[cfg(windows)]
-                                if matches!(kind, "File" | "Tree") {
+                                if !crate::manifest_ui::declared(release) && matches!(kind, "File" | "Tree") {
                                     self.windows_install_actions(ui, &item.association.id, &item.association.artifact_id);
                                 }
                                 self.play_controls(ui,&item.association.id);
@@ -1382,6 +1407,10 @@ impl Desktop {
             "My library",
             "Your applications and saved downloads. Available offline.",
         );
+        egui::ScrollArea::vertical()
+            .id_salt("standard-library")
+            .max_height((ui.available_height() * 0.55).max(140.0))
+            .show(ui, |ui| self.manifest_library(ui));
         if worker::WINDOWS_INSTALL_ONLY {
             ui.label(worker::WINDOWS_INSTALL_NOTICE);
             ui.label("Install or verify a downloaded Artifact from its release details in Browse.");
@@ -1401,6 +1430,7 @@ impl Desktop {
             && self.snapshot.trees.is_empty()
             && self.snapshot.local_issues.is_empty()
             && self.snapshot.installations.is_empty()
+            && self.snapshot.standard.is_empty()
         {
             self.empty_panel(
                 ui,
@@ -1436,6 +1466,19 @@ impl Desktop {
                 Some(t.file_count),
             )
         }));
+        items.retain(|item| {
+            !self
+                .snapshot
+                .apps
+                .iter()
+                .flat_map(|a| &a.releases)
+                .any(|r| {
+                    self.snapshot.standard.contains_key(&r.release.id)
+                        && r.associations.iter().any(|a| {
+                            a.association.id == item.1 && a.association.artifact_id == item.2
+                        })
+                })
+        });
         ui.horizontal(|ui| {
             ui.label(design::eyebrow("YOUR COLLECTION", design::palette(ui)));
             ui.add_space(12.0);
@@ -1526,7 +1569,7 @@ impl Desktop {
             .collect()
     }
 
-    fn start_candidate(&mut self, candidate: &LaunchCandidate) {
+    pub(crate) fn start_candidate(&mut self, candidate: &LaunchCandidate) {
         let key = format!("{}:{}", candidate.association_id, candidate.entry_id);
         if self.launch_states.get(&key).is_some_and(|(state, _)| {
             matches!(state.as_str(), "Starting" | "Preparing" | "Running")
@@ -2804,7 +2847,7 @@ pub(super) fn format_time(value: Option<i64>) -> String {
         format!("{} d ago", age / 86400)
     }
 }
-fn format_bytes(bytes: u64) -> String {
+pub(crate) fn format_bytes(bytes: u64) -> String {
     let mut amount = bytes as f64;
     let mut unit = "B";
     for next in ["KiB", "MiB", "GiB", "TiB"] {
@@ -3123,6 +3166,7 @@ impl eframe::App for Desktop {
         }
         self.setup_dialog(ui.ctx());
         self.confirmation(ui.ctx());
+        self.installation_dialog(ui.ctx());
         #[cfg(target_os = "linux")]
         if self.update_ack.is_some() && !self.update_ack_armed {
             self.update_ack_armed = true;

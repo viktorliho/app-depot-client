@@ -76,7 +76,8 @@ fn path_valid(path: &str) -> bool {
             !part.is_empty() && part != "." && part != ".." && !part.chars().any(char::is_control)
         })
 }
-pub(crate) fn host() -> Option<&'static str> {
+/// Supported native installation and launch platform token for this client.
+pub fn host() -> Option<&'static str> {
     match (std::env::consts::OS, std::env::consts::ARCH) {
         ("linux", "x86_64") => Some("linux/x86_64"),
         ("linux", "aarch64") => Some("linux/aarch64"),

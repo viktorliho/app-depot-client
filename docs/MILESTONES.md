@@ -261,3 +261,16 @@ backend copies and verifies all source bytes. Attempt-owned temporary layouts
 are independent from application generations and retained for ambiguous
 execution; definite outcomes permit recoverable cleanup. Existing generation
 source references retain CAS ownership. No schema change is needed.
+
+## M5.4A — Installation Manifest Desktop UX
+
+Browse and release details offer a Standard manifest install workflow. Desktop
+reviews required and optional components, localization, resolved payload/source
+sizes and prerequisite choices before dispatching the pinned plan to the
+existing worker. My Library projects release generations and durable
+prerequisite outcomes, including an existing ready generation during recovery.
+Verify, Play, uninstall and reinstall use Core operations. The worker polls
+download and generation state while preparation runs; no installer logic is
+implemented in egui. A platform without a native prerequisite executor can
+prepare files but cannot mark required prerequisites complete. Optional-only
+plans can explicitly skip installers. Derived manifests remain unsupported.

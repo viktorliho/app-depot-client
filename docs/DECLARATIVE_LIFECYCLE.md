@@ -59,3 +59,12 @@ Windows Standard removal uses the same ownership inspection and no-replace
 quarantine as legacy Windows runtime removal, with durable generation-specific
 intent, quarantine and cleanup records. It refuses modified or unexpected
 content and uncertain process or prerequisite occupancy.
+
+The shared Desktop exposes Standard installation in Browse and Release Details.
+It resolves the selected host platform and declaration revision only after
+component selection, then requires explicit review of the saved plan and
+prerequisite selection before preparation. My Library displays active and
+pending generations, live source-download progress and persisted prerequisite
+results, with explicit recovery, Play, Verify, Uninstall and Reinstall actions.
+Without a native prerequisite adapter, preparation remains pending when
+required installers cannot run; no execution result is fabricated.

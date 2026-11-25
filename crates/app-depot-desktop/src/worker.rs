@@ -3,10 +3,13 @@
 use app_depot_core::{
     ServerProfileId,
     api::ApiClient,
+    installation::{ResolveRequest, SavedPlan, Selections},
     launch::LaunchCandidate,
     library::{Library, LibraryPaths, LocalIssue, Profile},
     managed::{Installation, StorageUsage},
     models::{App, Artifact, Association, DeclarationSnapshot, Release},
+    prerequisite::{PrerequisiteExecutor, PrerequisiteOutcome, PrerequisiteRequest},
+    release_install::ReleaseInstallation,
     secrets::{NativeSecrets, SecretStore},
     transfer::{DownloadJob, TransferObservation, TransferPhase, VerifiedFile},
     tree_download::{TreeFileProgress, VerifiedTree},
@@ -19,7 +22,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, Mutex, OnceLock,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, Receiver, Sender},
     },
     thread,
@@ -63,6 +66,9 @@ pub struct Snapshot {
     pub trees: Vec<VerifiedTree>,
     pub local_issues: Vec<LocalIssue>,
     pub installations: Vec<Installation>,
+    pub standard: HashMap<String, Arc<ReleaseInstallation>>,
+    pub plans: HashMap<String, Arc<SavedPlan>>,
+    pub prerequisites: HashMap<String, serde_json::Value>,
     pub launches: Vec<LaunchCandidate>,
     #[cfg(windows)]
     pub update_occupancy_clear: Option<bool>,
@@ -72,6 +78,30 @@ pub struct Snapshot {
 
 #[derive(Clone)]
 pub enum Command {
+    ResolveManifest {
+        request: u64,
+        profile: ServerProfileId,
+        release: String,
+        revision: String,
+        selections: Selections,
+    },
+    InstallManifest {
+        profile: ServerProfileId,
+        release: String,
+        plan: String,
+        fingerprint: String,
+        selected: Vec<String>,
+        generation: Option<String>,
+        retry: bool,
+    },
+    StandardVerify {
+        profile: ServerProfileId,
+        release: String,
+    },
+    StandardUninstall {
+        profile: ServerProfileId,
+        release: String,
+    },
     Refresh(Option<ServerProfileId>),
     Sync(ServerProfileId),
     Connect {
@@ -148,6 +178,96 @@ pub enum Command {
     },
 }
 
+static MANIFEST_BUSY: AtomicBool = AtomicBool::new(false);
+pub(crate) fn manifest_platform() -> Option<&'static str> {
+    app_depot_core::launch::host()
+}
+// Windows native adapter is being integrated separately. No fake success.
+fn native_prerequisite_executor() -> Option<Box<dyn PrerequisiteExecutor>> {
+    None
+}
+pub(crate) fn native_prerequisites_available() -> bool {
+    native_prerequisite_executor().is_some()
+}
+pub(crate) fn standard_operation_key(profile: &ServerProfileId, release: &str) -> String {
+    format!("standard:{}:{release}", profile.0)
+}
+struct UnavailableExecutor;
+impl PrerequisiteExecutor for UnavailableExecutor {
+    fn execute(&mut self, _: &PrerequisiteRequest<'_>) -> PrerequisiteOutcome {
+        PrerequisiteOutcome::Failed("Native prerequisite execution is unavailable".into())
+    }
+}
+#[expect(
+    clippy::too_many_arguments,
+    reason = "bind the exact reviewed plan and consent"
+)]
+fn run_standard(
+    lib: &mut Library,
+    profile: &ServerProfileId,
+    release: &str,
+    plan: &str,
+    fingerprint: &str,
+    selected: &[String],
+    generation: Option<&str>,
+    retry: bool,
+    api: Option<&ApiClient>,
+    executor: Option<&mut dyn PrerequisiteExecutor>,
+) -> Result<(), String> {
+    let saved = lib
+        .prerequisite_requirements(profile, plan)
+        .map_err(|e| e.to_string())?;
+    if saved.fingerprint != fingerprint || saved.plan["releaseId"] != release {
+        return Err("Reviewed installation plan changed".into());
+    }
+    let generation = if let Some(g) = generation {
+        let state = lib
+            .release_installation(profile, release)
+            .map_err(|e| e.to_string())?
+            .ok_or("Installation no longer exists")?;
+        if !state.generations.iter().any(|entry| {
+            entry.id == g && entry.plan_id == plan && entry.state == "PrerequisitesPending"
+        }) {
+            return Err("Reviewed generation changed".into());
+        }
+        g.to_owned()
+    } else {
+        let state = lib
+            .install_saved_plan(profile, plan, api)
+            .map_err(|e| e.to_string())?;
+        if let Some(g) = state
+            .generations
+            .iter()
+            .rev()
+            .find(|g| g.plan_id == plan && g.state == "PrerequisitesPending")
+        {
+            g.id.clone()
+        } else {
+            return Ok(());
+        }
+    };
+    if !selected.is_empty() && executor.is_none() {
+        return Ok(());
+    }
+    let consent = lib
+        .confirm_prerequisites(profile, &generation, fingerprint, selected, retry)
+        .map_err(|e| e.to_string())?;
+    struct Adapter<'a>(&'a mut dyn PrerequisiteExecutor);
+    impl PrerequisiteExecutor for Adapter<'_> {
+        fn execute(&mut self, r: &PrerequisiteRequest<'_>) -> PrerequisiteOutcome {
+            self.0.execute(r)
+        }
+        fn verify_completion(&mut self, r: &PrerequisiteRequest<'_>) -> bool {
+            self.0.verify_completion(r)
+        }
+    }
+    let mut unavailable = UnavailableExecutor;
+    let mut adapter = Adapter(executor.unwrap_or(&mut unavailable));
+    lib.process_prerequisites(profile, &generation, &consent, api, &mut adapter)
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 pub(crate) const WINDOWS_INSTALL_ONLY: bool = cfg!(windows);
 pub(crate) const WINDOWS_INSTALL_NOTICE: &str = "Windows supports File and Tree installation, native Play and removal of verified working copies. Repair is unavailable.";
 
@@ -169,6 +289,10 @@ impl Command {
 
 pub enum Event {
     Snapshot(Box<Snapshot>),
+    ManifestResolved {
+        request: u64,
+        result: Result<Arc<SavedPlan>, String>,
+    },
     StorageUsage(StorageUsage),
     Jobs {
         profile: ServerProfileId,
@@ -470,9 +594,50 @@ pub(crate) fn snapshot(
         result.trees = trees;
         result.local_issues.extend(tree_issues);
 
+        for plan in lib.saved_plans(id).map_err(|e| e.to_string())? {
+            result.plans.insert(plan.id.clone(), Arc::new(plan));
+        }
+        let releases: HashSet<_> = result
+            .plans
+            .values()
+            .filter_map(|p| p.plan["releaseId"].as_str())
+            .collect();
+        for release in releases {
+            if let Some(installation) = lib
+                .release_installation(id, release)
+                .map_err(|e| e.to_string())?
+            {
+                for generation in &installation.generations {
+                    if (generation.state == "PrerequisitesPending"
+                        || (generation.state == "Ready"
+                            && result.plans.get(&generation.plan_id).is_some_and(|p| {
+                                p.plan["prerequisites"]
+                                    .as_array()
+                                    .is_some_and(|p| !p.is_empty())
+                            })))
+                        && let Ok(progress) = lib.prerequisite_progress(id, &generation.id)
+                    {
+                        result.prerequisites.insert(generation.id.clone(), progress);
+                    }
+                }
+                result
+                    .standard
+                    .insert(release.to_owned(), Arc::new(installation));
+            }
+        }
+        // Installed Standard generations use their pinned plans even if the
+        // current catalog declaration has disappeared.
+        for release in result.standard.keys() {
+            result.launches.extend(
+                lib.launch_candidates(id, release)
+                    .map_err(|e| e.to_string())?,
+            );
+        }
         for app in &result.apps {
             for release in &app.releases {
-                if release.declaration.is_some() {
+                if release.declaration.is_some()
+                    && !result.standard.contains_key(&release.release.id)
+                {
                     result.launches.extend(
                         lib.launch_candidates(id, &release.release.id)
                             .map_err(|e| e.to_string())?,
@@ -517,7 +682,190 @@ fn operation(
             | Command::MoveToTop(_)
             | Command::Cancel(_)
     );
+    let standard_remove = matches!(&cmd, Command::StandardUninstall { .. });
     match cmd {
+        Command::ResolveManifest {
+            request,
+            profile,
+            release,
+            revision,
+            selections,
+        } => {
+            let api = lib
+                .profile(&profile)
+                .map_err(|e| e.to_string())
+                .and_then(|p| client(&p, memory));
+            let paths = paths.clone();
+            let tx = tx.clone();
+            let ctx = ctx.clone();
+            thread::spawn(move || {
+                let result = (|| {
+                    let api = api?;
+                    let lib = Library::open(paths).map_err(|e| e.to_string())?;
+                    let platform =
+                        manifest_platform().ok_or("Installation unavailable on this platform")?;
+                    lib.resolve_plan(
+                        &profile,
+                        &api,
+                        &release,
+                        &ResolveRequest {
+                            platform: platform.into(),
+                            revision_id: Some(revision),
+                            selections,
+                        },
+                    )
+                    .map(Arc::new)
+                    .map_err(|e| e.to_string())
+                })();
+                send(&tx, &ctx, Event::ManifestResolved { request, result });
+            });
+            return Ok(false);
+        }
+        Command::InstallManifest {
+            profile,
+            release,
+            plan,
+            fingerprint,
+            selected: choices,
+            generation,
+            retry,
+        } => {
+            let key = standard_operation_key(&profile, &release);
+            let p = match lib.profile(&profile) {
+                Ok(p) => p,
+                Err(e) => {
+                    send(
+                        tx,
+                        ctx,
+                        Event::LocalOperation {
+                            id: key,
+                            phase: None,
+                        },
+                    );
+                    return Err(e.to_string());
+                }
+            };
+            let api = if p.archived {
+                None
+            } else {
+                client(&p, memory).ok()
+            };
+            if MANIFEST_BUSY.swap(true, Ordering::SeqCst) {
+                send(
+                    tx,
+                    ctx,
+                    Event::LocalOperation {
+                        id: key,
+                        phase: None,
+                    },
+                );
+                return Err("Another installation is active".into());
+            }
+            let paths = paths.clone();
+            let tx = tx.clone();
+            let ctx = ctx.clone();
+            thread::spawn(move || {
+                send(
+                    &tx,
+                    &ctx,
+                    Event::LocalOperation {
+                        id: key.clone(),
+                        phase: Some("Downloading and preparing installation".into()),
+                    },
+                );
+                let mut executor = native_prerequisite_executor();
+                let result = Library::open(paths)
+                    .map_err(|e| e.to_string())
+                    .and_then(|mut lib| {
+                        run_standard(
+                            &mut lib,
+                            &profile,
+                            &release,
+                            &plan,
+                            &fingerprint,
+                            &choices,
+                            generation.as_deref(),
+                            retry,
+                            api.as_ref(),
+                            executor
+                                .as_mut()
+                                .map(|e| e.as_mut() as &mut dyn PrerequisiteExecutor),
+                        )
+                    });
+                if let Err(e) = result {
+                    send(&tx, &ctx, Event::Error(e));
+                }
+                MANIFEST_BUSY.store(false, Ordering::SeqCst);
+                send(
+                    &tx,
+                    &ctx,
+                    Event::LocalOperation {
+                        id: key,
+                        phase: None,
+                    },
+                );
+                send(&tx, &ctx, Event::JobChanged);
+            });
+            return Ok(false);
+        }
+        Command::StandardVerify { profile, release }
+        | Command::StandardUninstall { profile, release } => {
+            let remove = standard_remove;
+            let key = standard_operation_key(&profile, &release);
+            let paths = paths.clone();
+            let tx = tx.clone();
+            let ctx = ctx.clone();
+            thread::spawn(move || {
+                send(
+                    &tx,
+                    &ctx,
+                    Event::LocalOperation {
+                        id: key.clone(),
+                        phase: Some(
+                            if remove {
+                                "Removing installation"
+                            } else {
+                                "Verifying installation"
+                            }
+                            .into(),
+                        ),
+                    },
+                );
+                let result = Library::open(paths).and_then(|mut lib| {
+                    if remove {
+                        lib.uninstall_release_installation(&profile, &release)
+                    } else {
+                        lib.verify_release_installation(&profile, &release)
+                    }
+                });
+                match result {
+                    Ok(()) => send(
+                        &tx,
+                        &ctx,
+                        Event::Notice(
+                            if remove {
+                                "Application uninstalled; verified downloads retained"
+                            } else {
+                                "Installation verified"
+                            }
+                            .into(),
+                        ),
+                    ),
+                    Err(e) => send(&tx, &ctx, Event::Error(e.to_string())),
+                }
+                send(
+                    &tx,
+                    &ctx,
+                    Event::LocalOperation {
+                        id: key,
+                        phase: None,
+                    },
+                );
+                send(&tx, &ctx, Event::JobChanged);
+            });
+            return Ok(false);
+        }
+
         Command::Refresh(id) => {
             *selected = id;
         }
@@ -1318,6 +1666,7 @@ fn run(
     let mut pending_connect: Option<u64> = None;
     let mut active_download: Option<String> = None;
     let mut next_download_try = Instant::now();
+    let mut next_manifest_poll = Instant::now();
     if let Ok(value) = snapshot(&lib, None) {
         send(&tx, &ctx, Event::Snapshot(Box::new(value)));
     }
@@ -1326,6 +1675,12 @@ fn run(
     #[cfg(windows)]
     let mut next_process_poll = Instant::now();
     loop {
+        if MANIFEST_BUSY.load(Ordering::SeqCst) && Instant::now() >= next_manifest_poll {
+            next_manifest_poll = Instant::now() + Duration::from_secs(1);
+            if let Ok(value) = snapshot(&lib, selected.as_ref()) {
+                send(&tx, &ctx, Event::Snapshot(Box::new(value)));
+            }
+        }
         #[cfg(windows)]
         if Instant::now() >= next_process_poll {
             next_process_poll = Instant::now() + Duration::from_secs(1);
@@ -1545,7 +1900,10 @@ fn run(
         {
             let _ = lib.preempt_job(current);
         }
-        if active_download.is_none() && Instant::now() >= next_download_try {
+        if !MANIFEST_BUSY.load(Ordering::SeqCst)
+            && active_download.is_none()
+            && Instant::now() >= next_download_try
+        {
             if let Err(error) = lib.restore_preempted_jobs() {
                 send(&tx, &ctx, Event::Error(error.to_string()));
             }
@@ -1617,6 +1975,23 @@ fn run(
                     &background_tx,
                     &tx,
                     &ctx,
+                );
+            }
+            Ok(Command::InstallManifest {
+                profile, release, ..
+            }) if active_download.is_some() => {
+                send(
+                    &tx,
+                    &ctx,
+                    Event::LocalOperation {
+                        id: standard_operation_key(&profile, &release),
+                        phase: None,
+                    },
+                );
+                send(
+                    &tx,
+                    &ctx,
+                    Event::Error("Wait for the active download before installing".into()),
                 );
             }
             Ok(cmd) => {
@@ -1827,6 +2202,276 @@ fn connection_guidance(error: &app_depot_core::api::ApiError) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn standard_desktop_worker_flow_with_mock_prerequisites() {
+        use rusqlite::{Connection, params};
+        use serde_json::{Value, json};
+        use sha2::{Digest, Sha256};
+        use std::fs;
+        fn id() -> String {
+            uuid::Uuid::new_v4().to_string()
+        }
+        fn source(
+            db: &Connection,
+            paths: &LibraryPaths,
+            profile: &ServerProfileId,
+            release: &str,
+            bytes: &[u8],
+        ) -> Value {
+            let association = id();
+            let job = id();
+            let hash = format!("{:x}", Sha256::digest(bytes));
+            let artifact = format!("adfile:sha256:{hash}");
+            db.execute(
+                "INSERT INTO artifacts(profile_id,id,metadata_json,last_seen) VALUES (?1,?2,?3,0)",
+                params![
+                    profile.0,
+                    artifact,
+                    json!({"id":artifact,"kind":"File","size":bytes.len()}).to_string()
+                ],
+            )
+            .unwrap();
+            db.execute("INSERT INTO associations(profile_id,id,release_id,artifact_id,metadata_json,last_seen) VALUES (?1,?2,?3,?4,?5,0)",params![profile.0,association,release,artifact,json!({"id":association,"releaseId":release,"artifactId":artifact}).to_string()]).unwrap();
+            db.execute("INSERT INTO download_jobs(id,profile_id,artifact_id,state,created_at,association_id,expected_size,updated_at) VALUES (?1,?2,?3,'Completed',0,?4,?5,0)",params![job,profile.0,artifact,association,bytes.len()]).unwrap();
+            let relative = format!("artifacts/{}/{}/{}", profile.0, association, hash);
+            db.execute("INSERT INTO verified_content(profile_id,artifact_id,local_ref,verified_at,association_id) VALUES (?1,?2,?3,0,?4)",params![profile.0,artifact,relative,association]).unwrap();
+            let object = paths.content.join("objects").join(&hash[..2]).join(&hash);
+            fs::create_dir_all(object.parent().unwrap()).unwrap();
+            fs::write(&object, bytes).unwrap();
+            let visible = paths.content.join(relative);
+            fs::create_dir_all(visible.parent().unwrap()).unwrap();
+            fs::write(visible, bytes).unwrap();
+            json!({"associationId":association,"artifactId":artifact,"fileId":null,"sha256":hash,"size":bytes.len(),"executable":false})
+        }
+        fn save(db: &Connection, profile: &ServerProfileId, plan: &Value) -> (String, String) {
+            let id = id();
+            let raw = plan.to_string();
+            let fp = format!("{:x}", Sha256::digest(raw.as_bytes()));
+            db.execute("INSERT INTO installation_plans(id,profile_id,plan_json,fingerprint) VALUES (?1,?2,?3,?4)",params![id,profile.0,raw,fp]).unwrap();
+            (id, fp)
+        }
+        struct Mock {
+            code: i32,
+            calls: usize,
+        }
+        impl PrerequisiteExecutor for Mock {
+            fn execute(&mut self, r: &PrerequisiteRequest<'_>) -> PrerequisiteOutcome {
+                self.calls += 1;
+                assert_eq!(fs::read(&r.source.file).unwrap(), b"synthetic prerequisite");
+                PrerequisiteOutcome::Exited(self.code)
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let paths = LibraryPaths {
+            metadata: temp.path().join("metadata"),
+            content: temp.path().join("content"),
+        };
+        let mut lib = Library::open(paths.clone()).unwrap();
+        let profile = lib
+            .add_profile("fixture", "http://localhost:8787", false)
+            .unwrap()
+            .id;
+        let db = Connection::open(paths.metadata.join("library.sqlite")).unwrap();
+        let (app, release, revision) = (id(), id(), id());
+        db.execute(
+            "INSERT INTO apps(profile_id,id,metadata_json,last_seen) VALUES (?1,?2,?3,0)",
+            params![
+                profile.0,
+                app,
+                json!({"id":app,"name":"Fixture","slug":"fixture","ownerId":app,"visibility":"Public","state":"Published"}).to_string()
+            ],
+        )
+        .unwrap();
+        db.execute("INSERT INTO releases(profile_id,id,app_id,metadata_json,last_seen) VALUES (?1,?2,?3,?4,0)",params![profile.0,release,app,json!({"id":release,"appId":app,"state":"Published","version":"1"}).to_string()]).unwrap();
+        let payload = source(&db, &paths, &profile, &release, b"payload");
+        let prereq = source(&db, &paths, &profile, &release, b"synthetic prerequisite");
+        let mut plan = json!({"version":1,"appId":app,"releaseId":release,"revisionId":revision,"platform":manifest_platform().unwrap(),"selections":{},"unresolved":[],"files":{"app":payload},"directories":[],"prerequisites":[],"launch":null});
+        let (base, fp) = save(&db, &profile, &plan);
+        run_standard(
+            &mut lib,
+            &profile,
+            &release,
+            &base,
+            &fp,
+            &[],
+            None,
+            false,
+            None,
+            None,
+        )
+        .unwrap();
+        let old = lib
+            .release_installation(&profile, &release)
+            .unwrap()
+            .unwrap()
+            .active_generation
+            .unwrap();
+        plan["prerequisites"] = json!([{"id":"required","name":"Required component","file":prereq,"path":"","arguments":[],"optional":false,"evidence":"fixture","successExitCodes":[7]},{"id":"optional","name":"Optional component","file":prereq,"path":"","arguments":[],"optional":true,"evidence":"fixture","successExitCodes":[0]}]);
+        let (saved, fp) = save(&db, &profile, &plan);
+        let selection = vec!["required".to_owned()];
+        let mut mock = Mock { code: 9, calls: 0 };
+        assert!(
+            run_standard(
+                &mut lib,
+                &profile,
+                &release,
+                &saved,
+                "wrong",
+                &selection,
+                None,
+                false,
+                None,
+                Some(&mut mock)
+            )
+            .is_err()
+        );
+        assert_eq!(mock.calls, 0);
+        run_standard(
+            &mut lib, &profile, &release, &saved, &fp, &selection, None, false, None, None,
+        )
+        .unwrap();
+        let pending = lib
+            .release_installation(&profile, &release)
+            .unwrap()
+            .unwrap();
+        assert_eq!(pending.active_generation.as_deref(), Some(old.as_str()));
+        let prepared = pending.generations.last().unwrap().id.clone();
+        assert_eq!(
+            lib.prerequisite_progress(&profile, &prepared).unwrap()["consents"],
+            json!([])
+        );
+        run_standard(
+            &mut lib,
+            &profile,
+            &release,
+            &saved,
+            &fp,
+            &selection,
+            Some(&prepared),
+            false,
+            None,
+            Some(&mut mock),
+        )
+        .unwrap();
+        let state = lib
+            .release_installation(&profile, &release)
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.active_generation.as_deref(), Some(old.as_str()));
+        let generation = state.generations.last().unwrap().id.clone();
+        let snap = snapshot(&lib, Some(&profile)).unwrap();
+        assert_eq!(
+            snap.standard[&release].generations.last().unwrap().state,
+            "PrerequisitesPending"
+        );
+        assert_eq!(
+            snap.prerequisites[&generation]["consents"][0]["attempts"][0]["state"],
+            "Failed"
+        );
+        // Render the actual My Library projection without a native window or
+        // touching a real user library.
+        let ctx = egui::Context::default();
+        let mut desktop = crate::Desktop::new(
+            &ctx,
+            LibraryPaths {
+                metadata: temp.path().join("ui-meta"),
+                content: temp.path().join("ui-content"),
+            },
+        );
+        desktop.active = Some(profile.clone());
+        desktop.snapshot = snap;
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| desktop.manifest_library(ui));
+        output.textures_delta.clear();
+        assert!(!output.shapes.is_empty());
+        mock.code = 7;
+        run_standard(
+            &mut lib,
+            &profile,
+            &release,
+            &saved,
+            &fp,
+            &selection,
+            Some(&generation),
+            true,
+            None,
+            Some(&mut mock),
+        )
+        .unwrap();
+        assert_eq!(mock.calls, 2);
+        let state = lib
+            .release_installation(&profile, &release)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            state.active_generation.as_deref(),
+            Some(generation.as_str())
+        );
+        lib.verify_release_installation(&profile, &release).unwrap();
+        desktop.snapshot = snapshot(&lib, Some(&profile)).unwrap();
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| desktop.manifest_library(ui));
+        output.textures_delta.clear();
+        assert!(!output.shapes.is_empty());
+        let progress = lib.prerequisite_progress(&profile, &generation).unwrap();
+        assert_eq!(progress["consents"][1]["attempts"][1]["state"], "Declined");
+        lib.uninstall_release_installation(&profile, &release)
+            .unwrap();
+        assert!(
+            lib.release_installation(&profile, &release)
+                .unwrap()
+                .is_none()
+        );
+        run_standard(
+            &mut lib,
+            &profile,
+            &release,
+            &saved,
+            &fp,
+            &selection,
+            None,
+            false,
+            None,
+            Some(&mut mock),
+        )
+        .unwrap();
+        assert_eq!(mock.calls, 3);
+        assert_eq!(
+            lib.release_installation(&profile, &release)
+                .unwrap()
+                .unwrap()
+                .generations
+                .last()
+                .unwrap()
+                .state,
+            "Ready"
+        );
+        plan["prerequisites"] = json!([{"id":"optional","name":"Optional component","file":prereq,"path":"","arguments":[],"optional":true,"evidence":"fixture","successExitCodes":[0]}]);
+        let (optional, fp) = save(&db, &profile, &plan);
+        run_standard(
+            &mut lib,
+            &profile,
+            &release,
+            &optional,
+            &fp,
+            &[],
+            None,
+            false,
+            None,
+            None,
+        )
+        .unwrap();
+        let state = lib
+            .release_installation(&profile, &release)
+            .unwrap()
+            .unwrap();
+        let active = state.active_generation.unwrap();
+        assert_eq!(state.generations.last().unwrap().state, "Ready");
+        assert_eq!(
+            lib.prerequisite_progress(&profile, &active).unwrap()["consents"][0]["attempts"][0]["state"],
+            "Declined"
+        );
+        assert_eq!(mock.calls, 3);
+    }
+
     #[test]
     fn refresh_policy_deduplicates_and_backs_off() {
         let mut state = RefreshState::new();
