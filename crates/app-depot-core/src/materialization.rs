@@ -34,6 +34,20 @@ pub(crate) fn publish_generation(
     entries: &[InventoryEntry],
     object: impl Fn(&str) -> Result<std::path::PathBuf, LibraryError>,
 ) -> Result<(), LibraryError> {
+    let stage = content.join("staging").join(format!("manifest-{id}"));
+    let target = content.join("apps").join(id);
+    publish_layout(content, &stage, &target, id, entries, object)
+}
+
+#[cfg(target_os = "linux")]
+fn publish_layout(
+    content: &std::path::Path,
+    stage: &std::path::Path,
+    target: &std::path::Path,
+    id: &str,
+    entries: &[InventoryEntry],
+    object: impl Fn(&str) -> Result<std::path::PathBuf, LibraryError>,
+) -> Result<(), LibraryError> {
     use crate::{
         managed::copy_independent,
         transfer::{private_dir, sync_dir},
@@ -42,12 +56,17 @@ pub(crate) fn publish_generation(
         },
     };
     use std::io::Write;
-    let stage = content.join("staging").join(format!("manifest-{id}"));
-    let target = content.join("apps").join(id);
-    // Stage belongs to a durable generation; incomplete work is reproducible.
-    crate::managed::delete_owned(content, &content.join("staging"), &format!("manifest-{id}"))?;
-    private_dir(&stage)?;
-    let root = open_dir_nofollow(&stage)?;
+    // Stage belongs to a durable generation or attempt; incomplete work is reproducible.
+    let parent = stage
+        .parent()
+        .ok_or_else(|| LibraryError::Invalid("layout stage has no parent".into()))?;
+    let name = stage
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| LibraryError::Invalid("invalid layout stage name".into()))?;
+    crate::managed::delete_owned(content, parent, name)?;
+    private_dir(stage)?;
+    let root = open_dir_nofollow(stage)?;
     let payload = dir_beneath(&root, "payload", true)?;
     for entry in entries {
         match entry {
@@ -83,10 +102,14 @@ pub(crate) fn publish_generation(
     marker.write_all(id.as_bytes())?;
     marker.sync_all()?;
     root.sync_all()?;
-    verify_generation(&stage, id, entries)?;
-    rename_tree_noreplace(&stage, &target)?;
-    sync_dir(&content.join("apps"))?;
-    sync_dir(&content.join("staging"))?;
+    verify_generation(stage, id, entries)?;
+    rename_tree_noreplace(stage, target)?;
+    sync_dir(
+        target
+            .parent()
+            .ok_or_else(|| LibraryError::Invalid("layout target has no parent".into()))?,
+    )?;
+    sync_dir(parent)?;
     Ok(())
 }
 
@@ -181,6 +204,118 @@ pub(crate) fn verify_generation(
     entries: &[InventoryEntry],
 ) -> Result<(), LibraryError> {
     crate::windows_fs::verify_tree_install(root, id, entries)?;
+    Ok(())
+}
+
+/// Durable owner is the prerequisite attempt row, not the generation payload.
+#[cfg(any(target_os = "linux", windows))]
+pub(crate) fn prerequisite_workspace(
+    content: &std::path::Path,
+    attempt: &str,
+) -> Result<std::path::PathBuf, LibraryError> {
+    if !uuid::Uuid::parse_str(attempt).is_ok_and(|id| id.to_string() == attempt) {
+        return Err(LibraryError::Invalid(
+            "invalid prerequisite attempt identity".into(),
+        ));
+    }
+    Ok(content
+        .join("staging")
+        .join(format!("prerequisite-{attempt}")))
+}
+
+#[cfg(any(target_os = "linux", windows))]
+pub(crate) fn publish_prerequisite_source(
+    content: &std::path::Path,
+    attempt: &str,
+    entries: &[InventoryEntry],
+    relative_file: &str,
+    object: impl Fn(&str) -> Result<std::path::PathBuf, LibraryError>,
+) -> Result<crate::prerequisite::PreparedPrerequisiteSource, LibraryError> {
+    crate::tree::validate_destination(entries)?;
+    if !entries
+        .iter()
+        .any(|e| matches!(e, InventoryEntry::File { path, .. } if path == relative_file))
+    {
+        return Err(LibraryError::Invalid(
+            "declared prerequisite file missing from source layout".into(),
+        ));
+    }
+    let workspace = prerequisite_workspace(content, attempt)?;
+    // Exclusive creation, with a durable owner marker before materialization.
+    #[cfg(target_os = "linux")]
+    {
+        use std::{io::Write, os::unix::fs::DirBuilderExt};
+        std::fs::DirBuilder::new().mode(0o700).create(&workspace)?;
+        let mut marker =
+            crate::transfer::create_content_file(&workspace.join(".app-depot-prerequisite-id"))?;
+        marker.write_all(attempt.as_bytes())?;
+        marker.sync_all()?;
+        crate::transfer::sync_dir(&workspace)?;
+        crate::transfer::sync_dir(&content.join("staging"))?;
+    }
+    #[cfg(windows)]
+    crate::windows_fs::create_prerequisite_workspace(&workspace, attempt)?;
+    let owned = workspace.join(attempt);
+    #[cfg(target_os = "linux")]
+    publish_layout(
+        content,
+        &workspace.join("partial"),
+        &owned,
+        attempt,
+        entries,
+        object,
+    )?;
+    #[cfg(windows)]
+    crate::windows_fs::publish_tree_install(&owned, attempt, entries, |digest| {
+        object(digest).map_err(std::io::Error::other)
+    })?;
+    verify_generation(&owned, attempt, entries)?;
+    let root = owned.join("payload");
+    let file = root.join(relative_file);
+    let directory = file
+        .parent()
+        .ok_or_else(|| LibraryError::Invalid("prerequisite file has no directory".into()))?
+        .to_path_buf();
+    Ok(crate::prerequisite::PreparedPrerequisiteSource {
+        root,
+        file,
+        directory,
+    })
+}
+
+/// Remove only a journal-owned workspace whose executor is known to be idle.
+/// An interrupted or ambiguous execution must be retained until explicitly
+/// reconciled by the platform lifecycle.
+#[cfg(any(target_os = "linux", windows))]
+pub(crate) fn cleanup_prerequisite_workspace(
+    content: &std::path::Path,
+    attempt: &str,
+) -> Result<(), LibraryError> {
+    let workspace = prerequisite_workspace(content, attempt)?;
+    match std::fs::symlink_metadata(&workspace) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+        Ok(_) => {}
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::io::Read;
+        let marker = crate::launch::open_nofollow(&workspace, ".app-depot-prerequisite-id", false)?;
+        let mut owner = String::new();
+        marker.take(37).read_to_string(&mut owner)?;
+        if owner != attempt {
+            return Err(LibraryError::Invalid(
+                "prerequisite workspace ownership marker mismatch".into(),
+            ));
+        }
+        crate::managed::delete_owned(
+            content,
+            &content.join("staging"),
+            &format!("prerequisite-{attempt}"),
+        )?;
+    }
+    #[cfg(windows)]
+    crate::windows_fs::cleanup_prerequisite_workspace(&workspace, attempt)?;
     Ok(())
 }
 

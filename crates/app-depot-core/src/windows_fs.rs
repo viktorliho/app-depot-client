@@ -945,6 +945,85 @@ fn open_removal_directory(parent: &File, name: &OsStr) -> io::Result<File> {
     Ok(dir)
 }
 
+/// Exclusive temporary source owner; all publication staging stays beneath it.
+pub(crate) fn create_prerequisite_workspace(path: &Path, attempt: &str) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| invalid("missing prerequisite workspace parent"))?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| invalid("missing prerequisite workspace name"))?;
+    let chain = directory_chain(parent, false)?;
+    let root = directory_child(
+        chain.last().unwrap(),
+        name,
+        true,
+        DIRECTORY_ACCESS | GENERIC_WRITE,
+    )?;
+    let mut marker = open_child(
+        &root,
+        OsStr::new(".app-depot-prerequisite-id"),
+        GENERIC_WRITE | SYNCHRONIZE,
+        FILE_CREATE,
+        FILE_NON_DIRECTORY_FILE,
+        0,
+    )?;
+    marker.write_all(attempt.as_bytes())?;
+    marker.sync_all()?;
+    root.sync_all()?;
+    sync_directory(parent)
+}
+
+/// Ephemeral workspace cleanup, not removal of a user installation. Pin the
+/// entire owned tree before deletion, refusing reparse points, extra streams
+/// and multiply-linked files. Keep the ownership marker until the end.
+pub(crate) fn cleanup_prerequisite_workspace(path: &Path, attempt: &str) -> io::Result<()> {
+    fn scan(path: &Path, directory: &File, handles: &mut Vec<File>, root: bool) -> io::Result<()> {
+        require_case_insensitive(directory)?;
+        for entry in std::fs::read_dir(path)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            if root && name == ".app-depot-prerequisite-id" {
+                continue;
+            }
+            if entry.file_type()?.is_dir() {
+                let child = open_removal_directory(directory, &name)?;
+                scan(&entry.path(), &child, handles, false)?;
+                handles.push(child);
+            } else {
+                handles.push(open_removal_file(directory, &name)?);
+            }
+        }
+        Ok(())
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| invalid("missing prerequisite workspace parent"))?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| invalid("missing prerequisite workspace name"))?;
+    let chain = directory_chain(parent, false)?;
+    let root = match open_removal_directory(chain.last().unwrap(), name) {
+        Ok(root) => root,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    let marker = open_removal_file(&root, OsStr::new(".app-depot-prerequisite-id"))?;
+    let mut owner = String::new();
+    (&marker).take(37).read_to_string(&mut owner)?;
+    if owner != attempt {
+        return Err(invalid("prerequisite workspace ownership marker mismatch"));
+    }
+    let mut handles = Vec::new();
+    scan(path, &root, &mut handles, true)?;
+    for file in handles {
+        delete_open_file(file)?;
+    }
+    delete_open_file(marker)?;
+    delete_open_file(root)?;
+    sync_directory(parent)
+}
+
 /// Constructs a new tree under an exclusive directory handle and publishes it by that handle.
 pub(crate) fn publish_tree(
     destination: &Path,

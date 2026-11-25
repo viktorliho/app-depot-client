@@ -111,6 +111,22 @@ or Tree jobs and normal authorization. Each saved source is checked against
 its completed File identity or Tree inventory and its CAS object is rehashed.
 Prerequisite source pairs are retained with the generation but downloads are
 acquired and verified only for explicitly selected prerequisites during processing.
+Each selected attempt is journaled before source preparation. It receives an
+independent verified copy of the entire source Artifact under
+`staging/prerequisite-<attempt-id>/<attempt-id>/payload`. Tree paths and empty
+directories are preserved, including supporting files absent from the final
+application layout. A File Artifact has no declared relative path, so its
+single local filename is `prerequisite`. The executor receives the source root,
+declared file and containing directory, not a CAS path. Source ownership is
+recorded by the existing attempt ID and an exclusive workspace marker; partial
+publication stays within that workspace. Definite outcomes permit cleanup;
+interrupted or ambiguous attempts retain their source workspace for review.
+Progress reports remaining workspaces and retries cleanup of definite
+outcomes. A retry always uses a new independent layout. Linux uninstall checks
+attempt workspaces for running processes and removes them before deleting their
+journal. Windows Standard removal integration must consume the same attempt
+IDs and establish process quiescence before removing any retained workspace.
+No additional schema migration is needed.
 The final map is independently copied into a new
 writable `payload/` directory. On Linux its reproducible staging directory is
 `staging/manifest-<generation-id>`; retry of the same saved plan discards only
