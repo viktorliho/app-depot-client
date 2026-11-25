@@ -849,8 +849,19 @@ mod tests {
                         break;
                     }
                     bytes.extend_from_slice(&buf[..n]);
-                    if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
-                        break;
+                    if let Some(end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                        let head = std::str::from_utf8(&bytes[..end]).unwrap();
+                        let length = head
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().unwrap())
+                            })
+                            .unwrap_or(0);
+                        if bytes.len() >= end + 4 + length {
+                            break;
+                        }
                     }
                 }
                 received
@@ -875,6 +886,36 @@ mod tests {
             }
         });
         (address, requests, handle)
+    }
+
+    #[test]
+    fn http_fixture_waits_for_split_post_body() {
+        let (address, requests, handle) = server(vec![json("{}")]);
+        let address = Url::parse(&address).unwrap();
+        let mut stream =
+            std::net::TcpStream::connect((address.host_str().unwrap(), address.port().unwrap()))
+                .unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+        stream
+            .write_all(b"POST /fixture HTTP/1.1\r\nHost: localhost\r\nContent-Length: 7\r\n\r\n{")
+            .unwrap();
+        let mut byte = [0];
+        let error = stream.read(&mut byte).unwrap_err();
+        assert!(matches!(
+            error.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        ));
+        stream.write_all(b"\"x\":1}").unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"));
+        handle.join().unwrap();
+        assert!(requests.lock().unwrap()[0].ends_with("{\"x\":1}"));
     }
 
     #[test]
