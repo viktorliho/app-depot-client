@@ -677,6 +677,8 @@ impl Library {
             files_done,
             files_total,
         });
+        // Hard links publish this inode. Windows verifies its private copy instead.
+        #[cfg(not(windows))]
         if hash_file(&stage, *size)? != *sha256 {
             return Err(invalid("staging identity mismatch"));
         }

@@ -237,10 +237,10 @@ pub(crate) fn copy_verified(
     digest: &str,
 ) -> std::io::Result<()> {
     let mut hash = Sha256::new();
-    let mut buffer = [0; CHUNK];
+    let mut buffer = vec![0; size.clamp(1, 1024 * 1024) as usize];
     let mut remaining = size;
     while remaining > 0 {
-        let bound = remaining.min(CHUNK as u64) as usize;
+        let bound = remaining.min(buffer.len() as u64) as usize;
         let n = input.read(&mut buffer[..bound])?;
         if n == 0 {
             return Err(std::io::Error::new(
@@ -764,6 +764,8 @@ impl Library {
             }
             false
         } else {
+            // Windows verifies the independent destination before its atomic publication.
+            #[cfg(not(windows))]
             if hash_file(&stage, job.expected_size)? != digest(&job.artifact_id)? {
                 return Err(invalid("staging identity mismatch during commit"));
             }
