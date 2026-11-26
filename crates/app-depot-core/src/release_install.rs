@@ -131,6 +131,11 @@ mod coordinator {
             Err(invalid("invalid local generation identity"))
         }
     }
+    enum PreparedAttempt {
+        Reused(String),
+        Execute(crate::prerequisite::PreparedPrerequisiteSource),
+    }
+
     impl Library {
         #[cfg(target_os = "linux")]
         pub(crate) fn manifest_lifecycle_lock(&self) -> Result<std::fs::File, LibraryError> {
@@ -314,7 +319,9 @@ mod coordinator {
             job: &DownloadJob,
             p: &crate::installation::Prerequisite,
             attempt: &str,
-        ) -> Result<crate::prerequisite::PreparedPrerequisiteSource, LibraryError> {
+            prior_success: Option<String>,
+            progress: &mut dyn FnMut(&str),
+        ) -> Result<PreparedAttempt, LibraryError> {
             let _download = self.lock_download_slot()?;
             if !self.source_in_use(&job.profile_id, &job.association_id, &job.artifact_id)? {
                 return Err(invalid(
@@ -396,13 +403,34 @@ mod coordinator {
                     "prerequisite",
                 )
             };
+            if let Some(origin) = prior_success {
+                // Reuse still requires intact source bytes, including supporting
+                // files. No executor will consume a writable copy this time.
+                crate::tree::validate_destination(&entries)?;
+                progress("Revalidating cached prerequisite source for reuse");
+                let mut checked = std::collections::HashSet::new();
+                for entry in &entries {
+                    if let InventoryEntry::File { size, sha256, .. } = entry
+                        && checked.insert((sha256, size))
+                        && crate::transfer::hash_file(
+                            &self.object(&format!("adfile:sha256:{sha256}"))?,
+                            *size,
+                        )? != *sha256
+                    {
+                        return Err(invalid("Cached prerequisite source hash mismatch"));
+                    }
+                }
+                return Ok(PreparedAttempt::Reused(origin));
+            }
             crate::materialization::publish_prerequisite_source(
                 &self.paths.content,
                 attempt,
                 &entries,
                 relative_file,
                 |digest| self.object(&format!("adfile:sha256:{digest}")),
+                progress,
             )
+            .map(PreparedAttempt::Execute)
         }
 
         fn pending_prerequisite_generation(
@@ -557,6 +585,25 @@ mod coordinator {
             client: Option<&ApiClient>,
             executor: &mut impl crate::prerequisite::PrerequisiteExecutor,
         ) -> Result<ReleaseInstallation, LibraryError> {
+            self.process_prerequisites_with_progress(
+                profile,
+                generation,
+                consent,
+                client,
+                executor,
+                &mut |_| {},
+            )
+        }
+
+        pub fn process_prerequisites_with_progress(
+            &mut self,
+            profile: &ServerProfileId,
+            generation: &str,
+            consent: &str,
+            client: Option<&ApiClient>,
+            executor: &mut impl crate::prerequisite::PrerequisiteExecutor,
+            progress: &mut dyn FnMut(&str),
+        ) -> Result<ReleaseInstallation, LibraryError> {
             use crate::prerequisite::{PrerequisiteOutcome, PrerequisiteRequest};
             let _lock = self.manifest_lifecycle_lock()?;
             let (installation, _, fingerprint, plan) =
@@ -566,6 +613,7 @@ mod coordinator {
             Self::validate_prerequisite_selection(&plan, &selected)?;
             // Validate every durable attempt identity before any new source publication.
             self.prerequisite_attempt_ids(generation)?;
+            progress("Verifying installed application files before prerequisites");
             let root = self.paths.content.join("apps").join(generation);
             let payload = root.join("payload");
             verify_generation(&root, generation, &destination_layout(&plan)?)?;
@@ -585,7 +633,23 @@ mod coordinator {
                     continue;
                 }
                 self.conn.execute("INSERT INTO prerequisite_attempts(id,consent_id,prerequisite_id,state) VALUES (?1,?2,?3,'Running')",params![attempt,consent,p.id])?;
-                let source = (|| -> Result<crate::prerequisite::PreparedPrerequisiteSource, LibraryError> {
+                let previous: Option<(String, i32)> = self.conn.query_row(
+                    "WITH latest AS (
+                        SELECT CASE a.state WHEN 'Succeeded' THEN a.id WHEN 'Reused' THEN a.detail END AS origin
+                        FROM prerequisite_attempts a JOIN prerequisite_consents c ON c.id=a.consent_id
+                        WHERE c.generation_id=?1 AND c.fingerprint=?2 AND a.prerequisite_id=?3 AND a.id<>?4
+                        ORDER BY a.rowid DESC LIMIT 1
+                    )
+                    SELECT a.id,a.exit_code FROM latest JOIN prerequisite_attempts a ON a.id=latest.origin
+                    JOIN prerequisite_consents c ON c.id=a.consent_id
+                    WHERE c.generation_id=?1 AND c.fingerprint=?2 AND a.prerequisite_id=?3
+                    AND a.state='Succeeded' AND a.finished_at IS NOT NULL AND a.exit_code IS NOT NULL",
+                    params![generation,fingerprint,p.id,attempt], |r| Ok((r.get(0)?,r.get(1)?))
+                ).optional()?;
+                let prior_success = previous
+                    .filter(|(_, code)| p.success_exit_codes.contains(code))
+                    .map(|(id, _)| id);
+                let source = (|| -> Result<PreparedAttempt, LibraryError> {
                     let job = self.acquire_plan_source(
                         profile,
                         &plan.release_id,
@@ -593,10 +657,20 @@ mod coordinator {
                         &p.file.artifact_id,
                         client,
                     )?;
-                    self.prepare_prerequisite_source(&job, p, &attempt)
+                    self.prepare_prerequisite_source(
+                        &job,
+                        p,
+                        &attempt,
+                        prior_success,
+                        &mut |phase| progress(&format!("{}: {phase}", p.name)),
+                    )
                 })();
                 let source = match source {
-                    Ok(source) => source,
+                    Ok(PreparedAttempt::Execute(source)) => source,
+                    Ok(PreparedAttempt::Reused(origin)) => {
+                        self.conn.execute("UPDATE prerequisite_attempts SET state='Reused',detail=?2,finished_at=unixepoch() WHERE id=?1", params![attempt,origin])?;
+                        continue;
+                    }
                     Err(e) => {
                         let tx = self.conn.transaction()?;
                         tx.execute("UPDATE prerequisite_attempts SET state='Failed',detail=?2,finished_at=unixepoch() WHERE id=?1",params![attempt,e.to_string()])?;
@@ -625,29 +699,10 @@ mod coordinator {
                     source: &source,
                     prerequisite: p,
                 };
-                let previous: Option<(String, i32)> = self.conn.query_row(
-                    "WITH latest AS (
-                        SELECT CASE a.state WHEN 'Succeeded' THEN a.id WHEN 'Reused' THEN a.detail END AS origin
-                        FROM prerequisite_attempts a JOIN prerequisite_consents c ON c.id=a.consent_id
-                        WHERE c.generation_id=?1 AND c.fingerprint=?2 AND a.prerequisite_id=?3 AND a.id<>?4
-                        ORDER BY a.rowid DESC LIMIT 1
-                    )
-                    SELECT a.id,a.exit_code FROM latest JOIN prerequisite_attempts a ON a.id=latest.origin
-                    JOIN prerequisite_consents c ON c.id=a.consent_id
-                    WHERE c.generation_id=?1 AND c.fingerprint=?2 AND a.prerequisite_id=?3
-                    AND a.state='Succeeded' AND a.finished_at IS NOT NULL AND a.exit_code IS NOT NULL",
-                    params![generation,fingerprint,p.id,attempt], |r| Ok((r.get(0)?,r.get(1)?))
-                ).optional()?;
-                if let Some((previous, code)) = previous
-                    && p.success_exit_codes.contains(&code)
-                {
-                    self.conn.execute("UPDATE prerequisite_attempts SET state='Reused',detail=?2,finished_at=unixepoch() WHERE id=?1",params![attempt,previous])?;
-                    let _ = crate::materialization::cleanup_prerequisite_workspace(
-                        &self.paths.content,
-                        &attempt,
-                    );
-                    continue;
-                }
+                progress(&format!(
+                    "Running {} (waiting for Windows or installer)",
+                    p.name
+                ));
                 let outcome = executor.execute(&request);
                 let (state, code, detail) = match outcome {
                     PrerequisiteOutcome::Exited(code) if p.success_exit_codes.contains(&code) => {
@@ -664,6 +719,7 @@ mod coordinator {
                 };
                 self.conn.execute("UPDATE prerequisite_attempts SET state=?2,exit_code=?3,detail=?4,finished_at=unixepoch() WHERE id=?1",params![attempt,state,code,detail])?;
                 if state != "Ambiguous" {
+                    progress(&format!("Cleaning up {}", p.name));
                     let _ = crate::materialization::cleanup_prerequisite_workspace(
                         &self.paths.content,
                         &attempt,
@@ -685,6 +741,7 @@ mod coordinator {
                         .ok_or_else(|| invalid("installation missing"));
                 }
             }
+            progress("Verifying installed application files before activation");
             let activation = (|| -> Result<(), LibraryError> {
                 verify_generation(&root, generation, &destination_layout(&plan)?)?;
                 // Activation and completion are atomic; an interrupted transaction
@@ -1548,9 +1605,29 @@ mod tests {
             outcomes: VecDeque::new(),
             seen: vec![],
         };
+        let mut phases = Vec::new();
         let result = lib
-            .process_prerequisites(&profile, &generation, &consent, None, &mut mock)
+            .process_prerequisites_with_progress(
+                &profile,
+                &generation,
+                &consent,
+                None,
+                &mut mock,
+                &mut |phase| phases.push(phase.to_owned()),
+            )
             .unwrap();
+        assert_eq!(
+            phases
+                .iter()
+                .filter(|phase| phase.contains("Revalidating cached prerequisite source"))
+                .count(),
+            2
+        );
+        assert!(
+            !phases
+                .iter()
+                .any(|phase| phase.contains("Preparing complete prerequisite source"))
+        );
         assert!(mock.seen.is_empty());
         assert_eq!(
             result.active_generation.as_deref(),

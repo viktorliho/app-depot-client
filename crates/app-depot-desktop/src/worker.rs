@@ -214,6 +214,7 @@ fn run_standard(
     retry: bool,
     api: Option<&ApiClient>,
     executor: Option<&mut dyn PrerequisiteExecutor>,
+    progress: &mut dyn FnMut(&str),
 ) -> Result<(), String> {
     let saved = lib
         .prerequisite_requirements(profile, plan)
@@ -261,8 +262,15 @@ fn run_standard(
     }
     let mut unavailable = UnavailableExecutor;
     let mut adapter = Adapter(executor.unwrap_or(&mut unavailable));
-    lib.process_prerequisites(profile, &generation, &consent, api, &mut adapter)
-        .map_err(|e| e.to_string())?;
+    lib.process_prerequisites_with_progress(
+        profile,
+        &generation,
+        &consent,
+        api,
+        &mut adapter,
+        progress,
+    )
+    .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -788,6 +796,16 @@ fn operation(
                             executor
                                 .as_mut()
                                 .map(|e| e.as_mut() as &mut dyn PrerequisiteExecutor),
+                            &mut |phase| {
+                                send(
+                                    &tx,
+                                    &ctx,
+                                    Event::LocalOperation {
+                                        id: key.clone(),
+                                        phase: Some(phase.to_owned()),
+                                    },
+                                )
+                            },
                         )
                     });
                 if let Err(e) = result {
@@ -2296,6 +2314,7 @@ mod tests {
             false,
             None,
             None,
+            &mut |_| {},
         )
         .unwrap();
         let old = lib
@@ -2319,13 +2338,24 @@ mod tests {
                 None,
                 false,
                 None,
-                Some(&mut mock)
+                Some(&mut mock),
+                &mut |_| {},
             )
             .is_err()
         );
         assert_eq!(mock.calls, 0);
         run_standard(
-            &mut lib, &profile, &release, &saved, &fp, &selection, None, false, None, None,
+            &mut lib,
+            &profile,
+            &release,
+            &saved,
+            &fp,
+            &selection,
+            None,
+            false,
+            None,
+            None,
+            &mut |_| {},
         )
         .unwrap();
         let pending = lib
@@ -2349,6 +2379,7 @@ mod tests {
             false,
             None,
             Some(&mut mock),
+            &mut |_| {},
         )
         .unwrap();
         let state = lib
@@ -2393,6 +2424,7 @@ mod tests {
             true,
             None,
             Some(&mut mock),
+            &mut |_| {},
         )
         .unwrap();
         assert_eq!(mock.calls, 2);
@@ -2429,6 +2461,7 @@ mod tests {
             false,
             None,
             Some(&mut mock),
+            &mut |_| {},
         )
         .unwrap();
         assert_eq!(mock.calls, 3);
@@ -2455,6 +2488,7 @@ mod tests {
             false,
             None,
             None,
+            &mut |_| {},
         )
         .unwrap();
         let state = lib

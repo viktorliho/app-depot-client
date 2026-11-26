@@ -111,11 +111,11 @@ or Tree jobs and normal authorization. Each saved source is checked against
 its completed File identity or Tree inventory and its CAS object is rehashed.
 Prerequisite source pairs are retained with the generation but downloads are
 acquired and verified only for explicitly selected prerequisites during processing.
-Each selected attempt is journaled before source preparation. It receives an
+Each selected attempt is journaled before source preparation. An installer that will run receives an
 independent verified copy of the entire source Artifact under
 `staging/prerequisite-<attempt-id>/<attempt-id>/payload`. Tree paths and empty
 directories are preserved, including supporting files absent from the final
-application layout. A File Artifact has no declared relative path, so its
+application layout. On Windows, Core copies into exclusively created files, flushes them and their containing directories, and verifies the entire published work tree against the inventory before execution. Desktop reports the current prerequisite, copy and verification counts, execution and cleanup. Each invoked installer gets a fresh workspace because an earlier installer can change its supporting files. A File Artifact has no declared relative path, so its
 single local filename is `prerequisite`. The executor receives the source root,
 declared file and containing directory, not a CAS path. Source ownership is
 recorded by the existing attempt ID and an exclusive workspace marker; partial
@@ -148,7 +148,7 @@ exit codes and source identities. Failure or cancellation stops the round;
 another attempt requires explicit retry authorization, including review of an
 interrupted running attempt (recorded as ambiguous when progress is inspected
 without an active coordinator, or when retry is confirmed).
-After source revalidation, Core reuses the latest successful or reused attempt
+When considering reuse, Core revalidates the source references, complete inventory and cached file contents without creating an executable workspace. After source revalidation, Core reuses the latest successful or reused attempt
 when its original success records an accepted exit code for the same prerequisite,
 pinned plan fingerprint and generation. The final Ready
 transition, retirement and active pointer change commit in one SQLite

@@ -488,6 +488,47 @@ pub(crate) fn publish_tree_install(
     entries: &[crate::models::InventoryEntry],
     object: impl Fn(&str) -> io::Result<std::path::PathBuf>,
 ) -> io::Result<()> {
+    stage_install_tree(to, id, entries, object, true, &mut |_, _| {})
+}
+
+/// Private attempt workspace. The complete published layout is checked exactly
+/// once before the caller can hand any path to an installer.
+pub(crate) fn prepare_verified_tree(
+    to: &Path,
+    id: &str,
+    entries: &[crate::models::InventoryEntry],
+    object: impl Fn(&str) -> io::Result<std::path::PathBuf>,
+    progress: &mut dyn FnMut(&str),
+) -> io::Result<()> {
+    let mut last = std::time::Instant::now();
+    stage_install_tree(to, id, entries, object, false, &mut |done, total| {
+        if done == total || last.elapsed() >= std::time::Duration::from_millis(500) {
+            progress(&format!("Copying source entries: {done} / {total}"));
+            last = std::time::Instant::now();
+        }
+    })?;
+    progress("Verifying the complete prepared source");
+    let _installation = installation_chain(to, id)?;
+    verify_tree_inner(&to.join("payload"), entries, None, &mut |remaining| {
+        if remaining == 0 || last.elapsed() >= std::time::Duration::from_millis(500) {
+            progress(&format!(
+                "Verifying source entries: {} / {}",
+                entries.len() - remaining,
+                entries.len()
+            ));
+            last = std::time::Instant::now();
+        }
+    })
+}
+
+fn stage_install_tree(
+    to: &Path,
+    id: &str,
+    entries: &[crate::models::InventoryEntry],
+    object: impl Fn(&str) -> io::Result<std::path::PathBuf>,
+    verify_member: bool,
+    progress: &mut dyn FnMut(usize, usize),
+) -> io::Result<()> {
     validate_install_layout(entries)?;
     publish_install(to, id, |stage| {
         let payload = directory_child(
@@ -496,7 +537,7 @@ pub(crate) fn publish_tree_install(
             true,
             DIRECTORY_ACCESS | GENERIC_WRITE,
         )?;
-        write_tree(&payload, entries, object)
+        write_tree(&payload, entries, object, verify_member, progress)
     })
 }
 
@@ -923,6 +964,7 @@ pub(crate) fn inspect_removal_layout(
                 &installation.join("payload"),
                 entries,
                 Some((&payload, &mut identities)),
+                &mut |_| {},
             )?;
         }
         None => {
@@ -1062,7 +1104,7 @@ pub(crate) fn publish_tree(
         true,
         DIRECTORY_ACCESS | DELETE | GENERIC_WRITE,
     )?;
-    write_tree(&stage, entries, object)?;
+    write_tree(&stage, entries, object, true, &mut |_, _| {})?;
     rename_noreplace(&stage, parent, &name_utf16(name)?)?;
     sync_directory(parent_path)
 }
@@ -1071,58 +1113,98 @@ fn write_tree(
     stage: &File,
     entries: &[crate::models::InventoryEntry],
     object: impl Fn(&str) -> io::Result<std::path::PathBuf>,
+    verify_member: bool,
+    progress: &mut dyn FnMut(usize, usize),
 ) -> io::Result<()> {
     use crate::models::InventoryEntry;
-    // Final installation maps need not arrive in parent-before-child order.
+    // The tree itself is created exclusively and published by no-replace
+    // rename. Private attempts verify their members together after publication.
     let mut ordered: Vec<_> = entries.iter().collect();
     ordered.sort_unstable_by(|left, right| left.path().cmp(right.path()));
-    for entry in ordered {
-        let mut components = entry.path().rsplitn(2, '/');
-        let leaf = OsStr::new(components.next().unwrap());
-        let mut ancestors = Vec::new();
-        for part in components
-            .next()
-            .into_iter()
-            .flat_map(|prefix| prefix.split('/'))
-        {
-            let ancestor = directory_child(
-                ancestors.last().unwrap_or(stage),
-                OsStr::new(part),
-                false,
-                DIRECTORY_ACCESS | GENERIC_WRITE,
-            )?;
-            ancestors.push(ancestor);
+    let mut current_parent = "";
+    let mut ancestors = Vec::new();
+    require_case_insensitive(stage)?;
+    for (i, entry) in ordered.into_iter().enumerate() {
+        let (parent, leaf) = entry.path().rsplit_once('/').unwrap_or(("", entry.path()));
+        if parent != current_parent {
+            ancestors.last().unwrap_or(stage).sync_all()?;
+            ancestors.clear();
+            for part in parent.split('/').filter(|part| !part.is_empty()) {
+                let dir = directory_child(
+                    ancestors.last().unwrap_or(stage),
+                    OsStr::new(part),
+                    false,
+                    DIRECTORY_ACCESS | GENERIC_WRITE,
+                )?;
+                require_case_insensitive(&dir)?;
+                ancestors.push(dir);
+            }
+            current_parent = parent;
         }
         let target = ancestors.last().unwrap_or(stage);
-        require_case_insensitive(target)?;
         match entry {
             InventoryEntry::Directory { .. } => {
-                directory_child(target, leaf, true, DIRECTORY_ACCESS | GENERIC_WRITE)?
-                    .sync_all()?;
+                directory_child(
+                    target,
+                    OsStr::new(leaf),
+                    true,
+                    DIRECTORY_ACCESS | GENERIC_WRITE,
+                )?
+                .sync_all()?;
             }
             InventoryEntry::File { size, sha256, .. } => {
-                publish_copy_at(
-                    &object(sha256)?,
-                    target,
-                    &name_utf16(leaf)?,
-                    *size,
-                    false,
-                    |file| {
-                        let actual = crate::transfer::hash_open_file(file, *size)
-                            .map_err(io::Error::other)?;
-                        if actual != *sha256 {
-                            return Err(invalid("Tree source hash mismatch"));
-                        }
-                        Ok(())
-                    },
-                )?;
+                let path = object(sha256)?;
+                if verify_member {
+                    publish_copy_at(
+                        &path,
+                        target,
+                        &name_utf16(OsStr::new(leaf))?,
+                        *size,
+                        false,
+                        |file| {
+                            if crate::transfer::hash_open_file(file, *size)
+                                .map_err(io::Error::other)?
+                                != *sha256
+                            {
+                                return Err(invalid("Tree source hash mismatch"));
+                            }
+                            Ok(())
+                        },
+                    )?;
+                } else {
+                    copy_workspace_file(&path, target, OsStr::new(leaf), *size)?;
+                }
             }
         }
-        target.sync_all()?;
+        progress(i + 1, entries.len());
         #[cfg(test)]
         pause_tree_test("partial-tree-materialization");
     }
+    if let Some(dir) = ancestors.last() {
+        dir.sync_all()?;
+    }
     stage.sync_all()
+}
+
+// Only used inside a fresh attempt tree. The caller verifies every final
+// destination against the inventory before exposing the prepared source.
+fn copy_workspace_file(path: &Path, target: &File, leaf: &OsStr, size: u64) -> io::Result<()> {
+    let source = open_regular(path, false, false, FILE_SHARE_READ)?;
+    if volume(&source)? != volume(target)? || source.metadata()?.len() != size {
+        return Err(invalid("Tree source volume or size mismatch"));
+    }
+    let mut out = open_child(
+        target,
+        leaf,
+        GENERIC_WRITE | SYNCHRONIZE,
+        FILE_CREATE,
+        FILE_NON_DIRECTORY_FILE,
+        0,
+    )?;
+    if io::copy(&mut source.take(size), &mut out)? != size {
+        return Err(invalid("Tree source shortened"));
+    }
+    out.sync_all()
 }
 
 /// The open directory chain pins each enumerated path. Entries are reopened relative to
@@ -1131,13 +1213,14 @@ pub(crate) fn verify_tree(
     path: &Path,
     entries: &[crate::models::InventoryEntry],
 ) -> io::Result<()> {
-    verify_tree_inner(path, entries, None)
+    verify_tree_inner(path, entries, None, &mut |_| {})
 }
 
 fn verify_tree_inner(
     path: &Path,
     entries: &[crate::models::InventoryEntry],
     removal_root: Option<(&File, &mut RemovalIdentities)>,
+    report_remaining: &mut dyn FnMut(usize),
 ) -> io::Result<()> {
     use crate::models::InventoryEntry;
     use std::collections::HashMap;
@@ -1147,6 +1230,7 @@ fn verify_tree_inner(
         prefix: &str,
         remaining: &mut HashMap<&str, &InventoryEntry>,
         mut identities: Option<&mut RemovalIdentities>,
+        report_remaining: &mut dyn FnMut(usize),
     ) -> io::Result<()> {
         require_case_insensitive(dir)?;
         for child in std::fs::read_dir(path)? {
@@ -1182,6 +1266,7 @@ fn verify_tree_inner(
                         &relative,
                         remaining,
                         identities.as_deref_mut(),
+                        report_remaining,
                     )?;
                 }
                 InventoryEntry::File { size, sha256, .. } => {
@@ -1215,15 +1300,23 @@ fn verify_tree_inner(
                     }
                 }
             }
+            report_remaining(remaining.len());
         }
         Ok(())
     }
     let mut remaining = entries.iter().map(|entry| (entry.path(), entry)).collect();
     if let Some((root, ids)) = removal_root {
-        scan(root, path, "", &mut remaining, Some(ids))?;
+        scan(root, path, "", &mut remaining, Some(ids), report_remaining)?;
     } else {
         let chain = directory_chain(path, false)?;
-        scan(chain.last().unwrap(), path, "", &mut remaining, None)?;
+        scan(
+            chain.last().unwrap(),
+            path,
+            "",
+            &mut remaining,
+            None,
+            report_remaining,
+        )?;
     }
     if let Some(missing) = remaining.keys().min() {
         return Err(io::Error::new(
@@ -1322,6 +1415,25 @@ mod tests {
     use crate::models::InventoryEntry;
     use sha2::{Digest, Sha256};
     use std::fs;
+
+    #[test]
+    fn verified_prerequisite_tree_rejects_corrupt_supporting_file() {
+        let fixture = tempfile::tempdir().unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        let dst = fixture.path().join(&id);
+        let object = fixture.path().join("object");
+        fs::write(&object, b"good").unwrap();
+        let entries = [layout_dir("nested"), layout_file("nested/support", b"good")];
+        let error =
+            prepare_verified_tree(&dst, &id, &entries, |_| Ok(object.clone()), &mut |phase| {
+                if phase == "Verifying the complete prepared source" {
+                    fs::write(dst.join("payload/nested/support"), b"evil").unwrap();
+                }
+            })
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(fs::read(object).unwrap(), b"good");
+    }
 
     fn layout_file(path: &str, bytes: &[u8]) -> InventoryEntry {
         InventoryEntry::File {

@@ -233,6 +233,7 @@ pub(crate) fn publish_prerequisite_source(
     entries: &[InventoryEntry],
     relative_file: &str,
     object: impl Fn(&str) -> Result<std::path::PathBuf, LibraryError>,
+    progress: &mut dyn FnMut(&str),
 ) -> Result<crate::prerequisite::PreparedPrerequisiteSource, LibraryError> {
     crate::tree::validate_destination(entries)?;
     if !entries
@@ -244,6 +245,7 @@ pub(crate) fn publish_prerequisite_source(
         ));
     }
     let workspace = prerequisite_workspace(content, attempt)?;
+    progress("Preparing complete prerequisite source");
     // Exclusive creation, with a durable owner marker before materialization.
     #[cfg(target_os = "linux")]
     {
@@ -277,9 +279,14 @@ pub(crate) fn publish_prerequisite_source(
         object,
     )?;
     #[cfg(windows)]
-    crate::windows_fs::publish_tree_install(&owned, attempt, entries, |digest| {
-        object(digest).map_err(std::io::Error::other)
-    })?;
+    crate::windows_fs::prepare_verified_tree(
+        &owned,
+        attempt,
+        entries,
+        |digest| object(digest).map_err(std::io::Error::other),
+        progress,
+    )?;
+    #[cfg(target_os = "linux")]
     verify_generation(&owned, attempt, entries)?;
     let root = owned.join("payload");
     let file = root.join(relative_file);
