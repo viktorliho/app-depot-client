@@ -1251,16 +1251,39 @@ mod tests {
         for bytes in [b"base".as_slice(), b"overlay".as_slice()] {
             fs::write(objects.join(format!("{:x}", Sha256::digest(bytes))), bytes).unwrap();
         }
-        // Final destinations need not match source paths or have distinct source IDs.
-        let entries = [
-            layout_file("bin/renamed.dat", b"base"),
-            layout_file("localization/text.dat", b"overlay"),
-            layout_dir("empty"),
-            layout_dir("localization"),
-            layout_file("copy.dat", b"base"),
-            layout_dir("bin"),
-            layout_dir("empty/nested"),
-        ];
+        use crate::installation::{Plan, ResolveRequest};
+        use serde_json::json;
+        let source = |bytes: &[u8], association: uuid::Uuid| {
+            let hash = format!("{:x}", Sha256::digest(bytes));
+            json!({
+                "associationId": association.to_string(), "artifactId": format!("adfile:sha256:{hash}"),
+                "fileId": null, "sha256": hash, "size": bytes.len(), "executable": false
+            })
+        };
+        let base = source(b"base", uuid::Uuid::new_v4());
+        let overlay = source(b"overlay", uuid::Uuid::new_v4());
+        let release = uuid::Uuid::new_v4().to_string();
+        let revision = uuid::Uuid::new_v4().to_string();
+        let request = ResolveRequest {
+            platform: "windows/x86_64".into(),
+            revision_id: Some(revision.clone()),
+            selections: Default::default(),
+        };
+        let plan = Plan::parse(
+            &json!({
+                "version": 1, "appId": uuid::Uuid::new_v4().to_string(),
+                "releaseId": release, "revisionId": revision, "platform": request.platform,
+                "selections": {}, "unresolved": [],
+                "files": {"bin/renamed.dat": base, "localization/text.dat": overlay, "copy.dat": base},
+                "directories": ["bin", "empty", "empty/nested", "localization"],
+                "prerequisites": [], "launch": null
+            }),
+            &release,
+            &request,
+        ).unwrap();
+        let mut entries = crate::materialization::destination_layout(&plan).unwrap();
+        // Also exercise backend ordering independently of the shared projection.
+        entries.reverse();
         let id = uuid::Uuid::new_v4().to_string();
         let target = root.join(&id);
         publish_tree_install(&target, &id, &entries, |digest| Ok(objects.join(digest))).unwrap();
