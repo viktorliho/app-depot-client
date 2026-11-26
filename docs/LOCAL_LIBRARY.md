@@ -148,8 +148,9 @@ exit codes and source identities. Failure or cancellation stops the round;
 another attempt requires explicit retry authorization, including review of an
 interrupted running attempt (recorded as ambiguous when progress is inspected
 without an active coordinator, or when retry is confirmed).
-A prior completion may be reused only after the platform executor verifies its
-effects in the same generation and the source is revalidated. The final Ready
+After source revalidation, Core reuses the latest successful or reused attempt
+when its original success records an accepted exit code for the same prerequisite,
+pinned plan fingerprint and generation. The final Ready
 transition, retirement and active pointer change commit in one SQLite
 transaction. An interrupted activation therefore retains the prior active
 generation; explicit retry can recover after verifying prior completions.

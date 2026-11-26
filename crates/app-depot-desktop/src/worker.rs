@@ -258,9 +258,6 @@ fn run_standard(
         fn execute(&mut self, r: &PrerequisiteRequest<'_>) -> PrerequisiteOutcome {
             self.0.execute(r)
         }
-        fn verify_completion(&mut self, r: &PrerequisiteRequest<'_>) -> bool {
-            self.0.verify_completion(r)
-        }
     }
     let mut unavailable = UnavailableExecutor;
     let mut adapter = Adapter(executor.unwrap_or(&mut unavailable));

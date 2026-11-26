@@ -34,13 +34,6 @@ pub enum PrerequisiteOutcome {
 
 pub trait PrerequisiteExecutor {
     fn execute(&mut self, request: &PrerequisiteRequest<'_>) -> PrerequisiteOutcome;
-
-    /// Confirm that an earlier successful attempt's effects remain valid in
-    /// this exact generation. The source context is a freshly verified copy;
-    /// attempt_id identifies the earlier execution. Default is conservative.
-    fn verify_completion(&mut self, _request: &PrerequisiteRequest<'_>) -> bool {
-        false
-    }
 }
 
 pub struct NativeExecutor;

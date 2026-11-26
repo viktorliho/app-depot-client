@@ -625,22 +625,28 @@ mod coordinator {
                     source: &source,
                     prerequisite: p,
                 };
-                let previous: Option<(String,String)> = self.conn.query_row("SELECT CASE WHEN a.state='Reused' THEN a.detail ELSE a.id END,a.state FROM prerequisite_attempts a JOIN prerequisite_consents c ON c.id=a.consent_id WHERE c.generation_id=?1 AND c.fingerprint=?2 AND a.prerequisite_id=?3 AND a.id<>?4 ORDER BY a.rowid DESC LIMIT 1",params![generation,fingerprint,p.id,attempt],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
-                if let Some((previous, state)) = previous
-                    && matches!(state.as_str(), "Succeeded" | "Reused")
+                let previous: Option<(String, i32)> = self.conn.query_row(
+                    "WITH latest AS (
+                        SELECT CASE a.state WHEN 'Succeeded' THEN a.id WHEN 'Reused' THEN a.detail END AS origin
+                        FROM prerequisite_attempts a JOIN prerequisite_consents c ON c.id=a.consent_id
+                        WHERE c.generation_id=?1 AND c.fingerprint=?2 AND a.prerequisite_id=?3 AND a.id<>?4
+                        ORDER BY a.rowid DESC LIMIT 1
+                    )
+                    SELECT a.id,a.exit_code FROM latest JOIN prerequisite_attempts a ON a.id=latest.origin
+                    JOIN prerequisite_consents c ON c.id=a.consent_id
+                    WHERE c.generation_id=?1 AND c.fingerprint=?2 AND a.prerequisite_id=?3
+                    AND a.state='Succeeded' AND a.finished_at IS NOT NULL AND a.exit_code IS NOT NULL",
+                    params![generation,fingerprint,p.id,attempt], |r| Ok((r.get(0)?,r.get(1)?))
+                ).optional()?;
+                if let Some((previous, code)) = previous
+                    && p.success_exit_codes.contains(&code)
                 {
-                    let prior = PrerequisiteRequest {
-                        attempt_id: &previous,
-                        ..request
-                    };
-                    if executor.verify_completion(&prior) {
-                        self.conn.execute("UPDATE prerequisite_attempts SET state='Reused',detail=?2,finished_at=unixepoch() WHERE id=?1",params![attempt,previous])?;
-                        let _ = crate::materialization::cleanup_prerequisite_workspace(
-                            &self.paths.content,
-                            &attempt,
-                        );
-                        continue;
-                    }
+                    self.conn.execute("UPDATE prerequisite_attempts SET state='Reused',detail=?2,finished_at=unixepoch() WHERE id=?1",params![attempt,previous])?;
+                    let _ = crate::materialization::cleanup_prerequisite_workspace(
+                        &self.paths.content,
+                        &attempt,
+                    );
+                    continue;
                 }
                 let outcome = executor.execute(&request);
                 let (state, code, detail) = match outcome {
@@ -1362,7 +1368,6 @@ mod tests {
         struct Mock {
             outcomes: VecDeque<PrerequisiteOutcome>,
             seen: Vec<String>,
-            verify: bool,
         }
         impl PrerequisiteExecutor for Mock {
             fn execute(&mut self, request: &PrerequisiteRequest<'_>) -> PrerequisiteOutcome {
@@ -1370,9 +1375,6 @@ mod tests {
                 assert_eq!(fs::read(&request.source.file).unwrap(), b"installer");
                 self.seen.push(request.prerequisite.id.clone());
                 self.outcomes.pop_front().expect("unexpected execution")
-            }
-            fn verify_completion(&mut self, _: &PrerequisiteRequest<'_>) -> bool {
-                self.verify
             }
         }
         let temp = tempfile::tempdir().unwrap();
@@ -1450,11 +1452,9 @@ mod tests {
         let mut mock = Mock {
             outcomes: VecDeque::from([
                 PrerequisiteOutcome::Exited(7),
-                PrerequisiteOutcome::Exited(0),
-                PrerequisiteOutcome::Exited(9),
+                PrerequisiteOutcome::Cancelled,
             ]),
             seen: vec![],
-            verify: false,
         };
         assert!(
             lib.process_prerequisites(&profile, &generation, "missing", None, &mut mock)
@@ -1466,7 +1466,22 @@ mod tests {
         let result = lib
             .process_prerequisites(&profile, &generation, &consent, None, &mut mock)
             .unwrap();
-        assert_eq!(mock.seen, ["first", "optional", "last"]);
+        assert_eq!(mock.seen, ["first", "optional"]);
+        assert_eq!(result.active_generation.as_deref(), Some(old.as_str()));
+        drop(lib);
+        let mut lib = Library::open(paths.clone()).unwrap();
+        let consent = lib
+            .confirm_prerequisites(&profile, &generation, &fingerprint, &selected, true)
+            .unwrap();
+        mock.seen.clear();
+        mock.outcomes.extend([
+            PrerequisiteOutcome::Exited(0),
+            PrerequisiteOutcome::Exited(9),
+        ]);
+        let result = lib
+            .process_prerequisites(&profile, &generation, &consent, None, &mut mock)
+            .unwrap();
+        assert_eq!(mock.seen, ["optional", "last"]);
         assert_eq!(result.active_generation.as_deref(), Some(old.as_str()));
         assert!(
             lib.process_prerequisites(&profile, &generation, &consent, None, &mut mock)
@@ -1478,8 +1493,8 @@ mod tests {
         );
         let progress = lib.prerequisite_progress(&profile, &generation).unwrap();
         assert_eq!(progress["consents"][0]["attempts"][0]["exitCode"], 7);
-        assert_eq!(progress["consents"][0]["attempts"][2]["state"], "Failed");
-        assert_eq!(progress["consents"][0]["attempts"][2]["exitCode"], 9);
+        assert_eq!(progress["consents"][1]["attempts"][2]["state"], "Failed");
+        assert_eq!(progress["consents"][1]["attempts"][2]["exitCode"], 9);
         drop(lib);
         let mut lib = Library::open(paths.clone()).unwrap();
         for outcome in [
@@ -1493,7 +1508,6 @@ mod tests {
             let mut mock = Mock {
                 outcomes: VecDeque::from([outcome]),
                 seen: vec![],
-                verify: true,
             };
             let result = lib
                 .process_prerequisites(&profile, &generation, &consent, None, &mut mock)
@@ -1509,7 +1523,6 @@ mod tests {
         let mut mock = Mock {
             outcomes: VecDeque::from([PrerequisiteOutcome::Exited(0)]),
             seen: vec![],
-            verify: true,
         };
         assert!(
             lib.process_prerequisites(&profile, &generation, &consent, None, &mut mock)
@@ -1534,7 +1547,6 @@ mod tests {
         let mut mock = Mock {
             outcomes: VecDeque::new(),
             seen: vec![],
-            verify: true,
         };
         let result = lib
             .process_prerequisites(&profile, &generation, &consent, None, &mut mock)
@@ -1547,12 +1559,12 @@ mod tests {
         assert_eq!(result.generations[0].state, "Retired");
         assert_eq!(result.generations[1].state, "Ready");
         let progress = lib.prerequisite_progress(&profile, &generation).unwrap();
-        assert_eq!(progress["consents"][1]["attempts"][2]["state"], "Cancelled");
-        assert_eq!(progress["consents"][2]["attempts"][2]["state"], "Ambiguous");
-        assert_eq!(progress["consents"][5]["attempts"][0]["state"], "Reused");
-        assert_eq!(progress["consents"][5]["attempts"][1]["state"], "Declined");
-        assert_eq!(progress["consents"][5]["attempts"][2]["state"], "Reused");
-        assert_eq!(progress["consents"][5]["retryAuthorized"], true);
+        assert_eq!(progress["consents"][2]["attempts"][2]["state"], "Cancelled");
+        assert_eq!(progress["consents"][3]["attempts"][2]["state"], "Ambiguous");
+        assert_eq!(progress["consents"][6]["attempts"][0]["state"], "Reused");
+        assert_eq!(progress["consents"][6]["attempts"][1]["state"], "Declined");
+        assert_eq!(progress["consents"][6]["attempts"][2]["state"], "Reused");
+        assert_eq!(progress["consents"][6]["retryAuthorized"], true);
         // Optional-only plans still require explicit review, but a declined
         // prerequisite is not acquired or executed, even if its source is absent.
         plan["prerequisites"] = json!([{"id":"optional","name":"Optional","file":installer,"path":"original","arguments":[],"optional":true,"evidence":"fixture","successExitCodes":[0]}]);
@@ -1566,8 +1578,18 @@ mod tests {
             .prerequisite_requirements(&profile, &optional_id)
             .unwrap()
             .fingerprint;
-        let consent = lib
+        let mut fresh = Mock {
+            outcomes: VecDeque::from([PrerequisiteOutcome::Cancelled]),
+            seen: vec![],
+        };
+        let initial = lib
             .confirm_prerequisites(&profile, &next_id, &fp, &["optional".into()], false)
+            .unwrap();
+        lib.process_prerequisites(&profile, &next_id, &initial, None, &mut fresh)
+            .unwrap();
+        assert_eq!(fresh.seen, ["optional"]);
+        let consent = lib
+            .confirm_prerequisites(&profile, &next_id, &fp, &["optional".into()], true)
             .unwrap();
         // Simulate a crash with a durably journaled Running attempt.
         lib.conn
@@ -1578,7 +1600,7 @@ mod tests {
             .unwrap();
         lib.conn.execute("INSERT INTO prerequisite_attempts(id,consent_id,prerequisite_id,state) VALUES (?1,?2,'optional','Running')",params![id(),consent]).unwrap();
         let progress = lib.prerequisite_progress(&profile, &next_id).unwrap();
-        assert_eq!(progress["consents"][0]["attempts"][0]["state"], "Ambiguous");
+        assert_eq!(progress["consents"][1]["attempts"][0]["state"], "Ambiguous");
         assert!(
             lib.confirm_prerequisites(&profile, &next_id, &fp, &[], false)
                 .is_err()
@@ -1603,7 +1625,7 @@ mod tests {
         assert_eq!(result.active_generation.as_deref(), Some(next_id.as_str()));
         assert!(mock.seen.is_empty());
         assert_eq!(
-            lib.prerequisite_progress(&profile, &next_id).unwrap()["consents"][1]["attempts"][0]["state"],
+            lib.prerequisite_progress(&profile, &next_id).unwrap()["consents"][2]["attempts"][0]["state"],
             "Declined"
         );
     }
@@ -1836,7 +1858,7 @@ mod tests {
         assert_eq!(result.active_generation.as_deref(), Some(old.as_str()));
         assert_eq!(
             mock.seen,
-            ["file", "file", "tree"],
+            ["file", "tree"],
             "{:?}",
             result.generations.last().unwrap().last_error
         );
