@@ -475,12 +475,20 @@ pub(crate) fn publish_file_install(
     })
 }
 
+/// Materialize a final installation layout from verified content objects.
+/// Entry paths are destinations relative to payload, independent of the source
+/// Artifact paths. The caller authorizes source references; this backend checks
+/// size and digest again while copying, never linking to the object store.
+/// The layout may reuse a source file ID or digest at multiple destinations.
+/// The enclosing installation marker and no-replace publication are shared
+/// with ordinary File/Tree installations.
 pub(crate) fn publish_tree_install(
     to: &Path,
     id: &str,
     entries: &[crate::models::InventoryEntry],
     object: impl Fn(&str) -> io::Result<std::path::PathBuf>,
 ) -> io::Result<()> {
+    validate_install_layout(entries)?;
     publish_install(to, id, |stage| {
         let payload = directory_child(
             stage,
@@ -490,6 +498,38 @@ pub(crate) fn publish_tree_install(
         )?;
         write_tree(&payload, entries, object)
     })
+}
+
+fn validate_install_layout(entries: &[crate::models::InventoryEntry]) -> io::Result<()> {
+    use crate::models::InventoryEntry;
+    use std::collections::HashSet;
+
+    crate::tree::validate_destination(entries).map_err(io::Error::other)?;
+    let directories: HashSet<_> = entries
+        .iter()
+        .filter_map(|entry| match entry {
+            InventoryEntry::Directory { path } => Some(path.as_str()),
+            InventoryEntry::File { .. } => None,
+        })
+        .collect();
+    for entry in entries {
+        if entry
+            .path()
+            .rsplit_once('/')
+            .is_some_and(|(parent, _)| !directories.contains(parent))
+        {
+            return Err(invalid("installation layout parent directory is missing"));
+        }
+        if let InventoryEntry::File { sha256, .. } = entry
+            && (sha256.len() != 64
+                || !sha256
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+        {
+            return Err(invalid("invalid installation source digest"));
+        }
+    }
+    Ok(())
 }
 
 fn publish_install(
@@ -938,7 +978,10 @@ fn write_tree(
     object: impl Fn(&str) -> io::Result<std::path::PathBuf>,
 ) -> io::Result<()> {
     use crate::models::InventoryEntry;
-    for entry in entries {
+    // Final installation maps need not arrive in parent-before-child order.
+    let mut ordered: Vec<_> = entries.iter().collect();
+    ordered.sort_unstable_by(|left, right| left.path().cmp(right.path()));
+    for entry in ordered {
         let mut components = entry.path().rsplitn(2, '/');
         let leaf = OsStr::new(components.next().unwrap());
         let mut ancestors = Vec::new();
@@ -1181,7 +1224,154 @@ fn rename_noreplace(source: &File, target: &File, name: &[u16]) -> io::Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::InventoryEntry;
+    use sha2::{Digest, Sha256};
     use std::fs;
+
+    fn layout_file(path: &str, bytes: &[u8]) -> InventoryEntry {
+        InventoryEntry::File {
+            path: path.into(),
+            file_id: "same-source-file-id".into(),
+            size: bytes.len() as u64,
+            sha256: format!("{:x}", Sha256::digest(bytes)),
+            executable: false,
+        }
+    }
+
+    fn layout_dir(path: &str) -> InventoryEntry {
+        InventoryEntry::Directory { path: path.into() }
+    }
+
+    #[test]
+    fn manifest_destination_layout_uses_independent_cas_copies() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path();
+        let objects = root.join("objects");
+        ensure_directory(&objects).unwrap();
+        for bytes in [b"base".as_slice(), b"overlay".as_slice()] {
+            fs::write(objects.join(format!("{:x}", Sha256::digest(bytes))), bytes).unwrap();
+        }
+        // Final destinations need not match source paths or have distinct source IDs.
+        let entries = [
+            layout_file("bin/renamed.dat", b"base"),
+            layout_file("localization/text.dat", b"overlay"),
+            layout_dir("empty"),
+            layout_dir("localization"),
+            layout_file("copy.dat", b"base"),
+            layout_dir("bin"),
+            layout_dir("empty/nested"),
+        ];
+        let id = uuid::Uuid::new_v4().to_string();
+        let target = root.join(&id);
+        publish_tree_install(&target, &id, &entries, |digest| Ok(objects.join(digest))).unwrap();
+        verify_tree_install(&target, &id, &entries).unwrap();
+        assert_eq!(
+            fs::read(target.join("payload/bin/renamed.dat")).unwrap(),
+            b"base"
+        );
+        assert_eq!(
+            fs::read(target.join("payload/localization/text.dat")).unwrap(),
+            b"overlay"
+        );
+        assert!(target.join("payload/empty/nested").is_dir());
+        assert_eq!(
+            fs::read(target.join(".app-depot-installation-id")).unwrap(),
+            id.as_bytes()
+        );
+        fs::write(target.join("payload/bin/renamed.dat"), b"edit").unwrap();
+        assert_eq!(fs::read(target.join("payload/copy.dat")).unwrap(), b"base");
+        assert_eq!(
+            fs::read(objects.join(format!("{:x}", Sha256::digest(b"base")))).unwrap(),
+            b"base"
+        );
+        assert_eq!(
+            fs::read(objects.join(format!("{:x}", Sha256::digest(b"overlay")))).unwrap(),
+            b"overlay"
+        );
+        assert!(
+            publish_tree_install(&target, &id, &entries, |digest| Ok(objects.join(digest)))
+                .is_err()
+        );
+        assert_eq!(
+            fs::read(target.join("payload/bin/renamed.dat")).unwrap(),
+            b"edit"
+        );
+    }
+
+    #[test]
+    fn manifest_layout_rejects_invalid_or_conflicting_destinations_before_staging() {
+        let fixture = tempfile::tempdir().unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        let target = fixture.path().join(&id);
+        for entries in [
+            vec![layout_file("../outside", b"x")],
+            vec![layout_file("C:relative", b"x")],
+            vec![layout_file("NUL.txt", b"x")],
+            vec![layout_file("stream:ads", b"x")],
+            vec![layout_file("trailing.", b"x")],
+            vec![layout_dir("Dir"), layout_dir("dir")],
+            vec![layout_dir("same"), layout_file("same", b"x")],
+            vec![layout_file("missing/child", b"x")],
+            vec![
+                layout_file("parent", b"x"),
+                layout_file("parent/child", b"x"),
+            ],
+            vec![layout_file("same", b"x"), layout_file("same", b"x")],
+        ] {
+            assert!(
+                publish_tree_install(&target, &id, &entries, |_| panic!(
+                    "invalid map reached source lookup"
+                ))
+                .is_err()
+            );
+            assert_eq!(fixture.path().read_dir().unwrap().count(), 0);
+        }
+    }
+
+    #[test]
+    fn manifest_layout_failed_copy_does_not_publish_or_modify_sources() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path();
+        let good = root.join("good");
+        let corrupt = root.join("corrupt");
+        fs::write(&good, b"good").unwrap();
+        fs::write(&corrupt, b"bad!").unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        let target = root.join(&id);
+        let entries = [
+            layout_file("a-good", b"good"),
+            layout_file("z-bad", b"want"),
+        ];
+        let good_hash = format!("{:x}", Sha256::digest(b"good"));
+        assert!(
+            publish_tree_install(&target, &id, &entries, |digest| {
+                Ok(if digest == good_hash {
+                    good.clone()
+                } else {
+                    corrupt.clone()
+                })
+            })
+            .is_err()
+        );
+        assert!(!target.exists());
+        assert_eq!(fs::read(&good).unwrap(), b"good");
+        assert_eq!(fs::read(&corrupt).unwrap(), b"bad!");
+        let stage = root
+            .read_dir()
+            .unwrap()
+            .map(Result::unwrap)
+            .find(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".app-depot-install-")
+            })
+            .unwrap()
+            .path();
+        assert_eq!(fs::read(stage.join("payload/a-good")).unwrap(), b"good");
+        assert!(!stage.join("payload/z-bad").exists());
+        assert!(!stage.join(".app-depot-installation-id").exists());
+    }
 
     #[test]
     fn failed_publication_cleans_only_its_exclusive_temporary_file() {
