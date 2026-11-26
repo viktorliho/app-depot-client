@@ -624,6 +624,16 @@ pub(crate) fn bind_launch_target(
     target: &str,
     working_directory: &str,
 ) -> io::Result<LaunchBinding> {
+    bind_image(installation, id, target, working_directory, false)
+}
+
+pub(crate) fn bind_image(
+    installation: &Path,
+    id: &str,
+    target: &str,
+    working_directory: &str,
+    allow_x86: bool,
+) -> io::Result<LaunchBinding> {
     let installation = installation_chain(installation, id)?;
     let root = installation.last().unwrap();
     require_case_insensitive(root)?;
@@ -632,7 +642,7 @@ pub(crate) fn bind_launch_target(
     let working_directory = launch_directories(root, working_directory)?;
     let mut image = open_installed_file(image_directories.last().unwrap_or(root), leaf)?;
     require_single_link(&image)?;
-    validate_amd64_image(&mut image)?;
+    validate_image(&mut image, allow_x86)?;
     Ok(LaunchBinding {
         _installation: installation,
         _working_directory: working_directory,
@@ -659,7 +669,7 @@ fn launch_directories(root: &File, relative: &str) -> io::Result<Vec<File>> {
     Ok(chain)
 }
 
-fn validate_amd64_image(file: &mut File) -> io::Result<()> {
+fn validate_image(file: &mut File, allow_x86: bool) -> io::Result<()> {
     let mut dos = [0u8; 64];
     file.read_exact(&mut dos)?;
     if &dos[..2] != b"MZ" {
@@ -676,13 +686,13 @@ fn validate_amd64_image(file: &mut File) -> io::Result<()> {
     let characteristics = u16::from_le_bytes([pe[22], pe[23]]);
     let optional_size = u16::from_le_bytes([pe[20], pe[21]]);
     if &pe[..4] != b"PE\0\0"
-        || machine != 0x8664
+        || !((machine == 0x8664 && pe[24..26] == [0x0b, 0x02])
+            || (allow_x86 && machine == 0x14c && pe[24..26] == [0x0b, 0x01]))
         || characteristics & 0x2002 != 0x0002
         || optional_size < 2
-        || pe[24..26] != [0x0b, 0x02]
     {
         return Err(invalid(
-            "launch target is not a native Windows x64 executable",
+            "launch target is not a compatible native Windows executable",
         ));
     }
     Ok(())

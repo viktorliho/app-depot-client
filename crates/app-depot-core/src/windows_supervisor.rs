@@ -81,7 +81,7 @@ fn open_job(id: uuid::Uuid) -> io::Result<Option<OwnedHandle>> {
 pub(crate) fn job_active(id: uuid::Uuid) -> io::Result<Option<bool>> {
     open_job(id)?.as_ref().map(active).transpose()
 }
-fn active(job: &OwnedHandle) -> io::Result<bool> {
+pub(crate) fn active(job: &OwnedHandle) -> io::Result<bool> {
     let mut counts = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
     // SAFETY: the live job and output buffer match the information class.
     if unsafe {

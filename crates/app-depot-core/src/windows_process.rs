@@ -159,6 +159,67 @@ pub(crate) fn create_suspended(
     })
 }
 
+/// Called only after CreateProcessW requires elevation for the pinned PE.
+pub(crate) fn authorized_elevation(
+    image: &Path,
+    cwd: &Path,
+    arguments: &[String],
+) -> crate::prerequisite::PrerequisiteOutcome {
+    use crate::prerequisite::PrerequisiteOutcome as Outcome;
+    use windows_sys::Win32::{Foundation::ERROR_CANCELLED, UI::Shell::*};
+    use windows_sys::w;
+    let wide = |s: &OsStr| {
+        s.encode_wide()
+            .map(|c| if c == 47 { 92 } else { c })
+            .chain([0])
+            .collect::<Vec<_>>()
+    };
+    let image = wide(image.as_os_str());
+    let cwd = wide(cwd.as_os_str());
+    let mut parameters = Vec::new();
+    for arg in arguments {
+        if !parameters.is_empty() {
+            parameters.push(32);
+        }
+        append_arg(OsStr::new(arg), &mut parameters);
+    }
+    parameters.push(0);
+    let mut info = SHELLEXECUTEINFOW {
+        cbSize: size_of::<SHELLEXECUTEINFOW>() as u32,
+        fMask: SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC | SEE_MASK_CLASSNAME,
+        lpClass: w!("exefile"),
+        lpVerb: w!("runas"),
+        lpFile: image.as_ptr(),
+        lpParameters: parameters.as_ptr(),
+        lpDirectory: cwd.as_ptr(),
+        nShow: 1,
+        ..Default::default()
+    };
+    // SAFETY: all buffers remain live and terminated throughout the synchronous call.
+    if unsafe { ShellExecuteExW(&mut info) } == 0 {
+        let error = io::Error::last_os_error();
+        return if error.raw_os_error() == Some(ERROR_CANCELLED as i32) {
+            Outcome::Cancelled
+        } else {
+            Outcome::Failed(error.to_string())
+        };
+    }
+    if info.hProcess.is_null() {
+        return Outcome::Ambiguous("Windows returned no elevated process handle".into());
+    }
+    // SAFETY: SEE_MASK_NOCLOSEPROCESS transfers ownership of the returned handle.
+    let mut child = WindowsChild {
+        handle: unsafe { OwnedHandle::from_raw_handle(info.hProcess) },
+        id: 0,
+    };
+    match child.wait() {
+        Ok(exit) => Outcome::Ambiguous(format!(
+            "Elevated installer returned {exit}; descendant completion could not be verified"
+        )),
+        Err(error) => Outcome::Ambiguous(error.to_string()),
+    }
+}
+
 // The Windows CRT convention quotes each argument and doubles backslashes before quotes.
 fn append_arg(arg: &OsStr, output: &mut Vec<u16>) {
     const QUOTE: u16 = b'"' as u16;

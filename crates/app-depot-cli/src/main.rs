@@ -1221,23 +1221,12 @@ fn run_install(options: &Options) -> Result<(), CliError> {
             print_json(&serde_json::json!({"consentId":consent}))?;
         }
         [_, action, generation, consent] if action == "process" && options.confirm => {
-            struct Unavailable;
-            impl app_depot_core::prerequisite::PrerequisiteExecutor for Unavailable {
-                fn execute(
-                    &mut self,
-                    _: &app_depot_core::prerequisite::PrerequisiteRequest<'_>,
-                ) -> app_depot_core::prerequisite::PrerequisiteOutcome {
-                    app_depot_core::prerequisite::PrerequisiteOutcome::Failed(
-                        "Native prerequisite execution is unavailable on this platform".into(),
-                    )
-                }
-            }
             print_json(&library.process_prerequisites(
                 profile_id,
                 generation,
                 consent,
                 None,
-                &mut Unavailable,
+                &mut app_depot_core::prerequisite::NativeExecutor,
             )?)?;
         }
         [_, action, release] if action == "status" => {

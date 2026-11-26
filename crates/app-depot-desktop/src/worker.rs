@@ -182,9 +182,10 @@ static MANIFEST_BUSY: AtomicBool = AtomicBool::new(false);
 pub(crate) fn manifest_platform() -> Option<&'static str> {
     app_depot_core::launch::host()
 }
-// Windows native adapter is being integrated separately. No fake success.
 fn native_prerequisite_executor() -> Option<Box<dyn PrerequisiteExecutor>> {
-    None
+    cfg!(windows).then(|| {
+        Box::new(app_depot_core::prerequisite::NativeExecutor) as Box<dyn PrerequisiteExecutor>
+    })
 }
 pub(crate) fn native_prerequisites_available() -> bool {
     native_prerequisite_executor().is_some()
