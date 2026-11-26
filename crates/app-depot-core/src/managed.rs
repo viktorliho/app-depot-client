@@ -441,8 +441,8 @@ pub(crate) fn copy_independent(
 ) -> Result<(), LibraryError> {
     use std::os::unix::fs::PermissionsExt;
     let mut input = open_regular(source, false)?;
-    if hash_file(source, size)? != digest {
-        return Err(invalid("immutable object failed SHA-256 validation"));
+    if input.metadata()?.len() != size {
+        return Err(invalid("immutable object size mismatch"));
     }
     // FICLONE creates independent inodes with shared COW blocks. Unsupported filesystems
     // transparently fall back to a bounded ordinary copy.
@@ -456,7 +456,7 @@ pub(crate) fn copy_independent(
         ) {
             return Err(error.into());
         }
-        std::io::copy(&mut input, destination)?;
+        crate::transfer::copy_verified(&mut input, &mut *destination, size, digest)?;
     }
     destination.set_permissions(fs::Permissions::from_mode(if executable {
         0o700
@@ -464,7 +464,7 @@ pub(crate) fn copy_independent(
         0o600
     }))?;
     destination.sync_all()?;
-    if hash_file(destination_path, size)? != digest {
+    if cloned && hash_file(destination_path, size)? != digest {
         return Err(invalid("runtime copy failed SHA-256 validation"));
     }
     Ok(())

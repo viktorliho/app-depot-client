@@ -105,7 +105,6 @@ fn publish_layout(
     marker.write_all(id.as_bytes())?;
     marker.sync_all()?;
     root.sync_all()?;
-    verify_generation(stage, id, entries)?;
     rename_tree_noreplace(stage, target)?;
     sync_dir(
         target
@@ -116,17 +115,76 @@ fn publish_layout(
     Ok(())
 }
 
+/// Short-lived evidence for one verified layout in one coordinator round.
+/// Explicit verification and restart always begin with an empty map.
+#[cfg(any(target_os = "linux", windows))]
+#[derive(Default)]
+pub(crate) struct LayoutChecks(std::collections::HashMap<String, (FileStamp, String)>);
+
 #[cfg(target_os = "linux")]
+type FileStamp = (u64, u64, i64, i64);
+#[cfg(windows)]
+type FileStamp = (u64, [u8; 16], i64, i64);
+
+#[cfg(any(target_os = "linux", windows))]
+impl LayoutChecks {
+    pub(crate) fn check(
+        &mut self,
+        path: &str,
+        file: &std::fs::File,
+        size: u64,
+        digest: &str,
+    ) -> std::io::Result<()> {
+        let meta = file.metadata()?;
+        if meta.len() != size {
+            return Err(std::io::Error::other("installed file size differs"));
+        }
+        #[cfg(target_os = "linux")]
+        let stamp = {
+            use std::os::unix::fs::MetadataExt;
+            (meta.dev(), meta.ino(), meta.ctime(), meta.ctime_nsec())
+        };
+        #[cfg(windows)]
+        let stamp = crate::windows_fs::installation_file_stamp(file)?;
+        if !self
+            .0
+            .get(path)
+            .is_some_and(|(old, hash)| old == &stamp && hash == digest)
+        {
+            if crate::transfer::hash_open_file(file, size).map_err(std::io::Error::other)? != digest
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("installed file hash differs: {path}"),
+                ));
+            }
+            self.0.insert(path.to_owned(), (stamp, digest.to_owned()));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(any(target_os = "linux", windows))]
 pub(crate) fn verify_generation(
     root: &std::path::Path,
     id: &str,
     entries: &[InventoryEntry],
 ) -> Result<(), LibraryError> {
-    use crate::{
-        launch::open_nofollow,
-        managed::{hash_open, runtime_paths},
+    check_generation(root, id, entries, &mut LayoutChecks::default())
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn check_generation(
+    root: &std::path::Path,
+    id: &str,
+    entries: &[InventoryEntry],
+    checks: &mut LayoutChecks,
+) -> Result<(), LibraryError> {
+    use crate::{launch::open_nofollow, managed::runtime_paths};
+    use std::{
+        collections::BTreeSet,
+        os::unix::fs::{MetadataExt, PermissionsExt},
     };
-    use std::{collections::BTreeSet, os::unix::fs::PermissionsExt};
     verify_linux_marker(root, id)?;
     open_nofollow(root, "payload", true)?;
     let mut expected = BTreeSet::from([
@@ -149,14 +207,15 @@ pub(crate) fn verify_generation(
                 let file = open_nofollow(root, &relative, false)?;
                 let meta = file.metadata()?;
                 if !meta.is_file()
+                    || meta.nlink() != 1
                     || meta.len() != *size
                     || (meta.permissions().mode() & 0o111 != 0) != *executable
-                    || hash_open(file)? != *sha256
                 {
                     return Err(LibraryError::Invalid(format!(
                         "installation file differs: {relative}"
                     )));
                 }
+                checks.check(&relative, &file, *size, sha256)?;
             }
         }
     }
@@ -201,12 +260,13 @@ pub(crate) fn publish_generation(
     Ok(())
 }
 #[cfg(windows)]
-pub(crate) fn verify_generation(
+pub(crate) fn check_generation(
     root: &std::path::Path,
     id: &str,
     entries: &[InventoryEntry],
+    checks: &mut LayoutChecks,
 ) -> Result<(), LibraryError> {
-    crate::windows_fs::verify_tree_install(root, id, entries)?;
+    crate::windows_fs::check_tree_install(root, id, entries, checks)?;
     Ok(())
 }
 
@@ -232,6 +292,7 @@ pub(crate) fn publish_prerequisite_source(
     attempt: &str,
     entries: &[InventoryEntry],
     relative_file: &str,
+    previous: Option<&crate::prerequisite::PreparedPrerequisiteSource>,
     object: impl Fn(&str) -> Result<std::path::PathBuf, LibraryError>,
     progress: &mut dyn FnMut(&str),
 ) -> Result<crate::prerequisite::PreparedPrerequisiteSource, LibraryError> {
@@ -245,7 +306,6 @@ pub(crate) fn publish_prerequisite_source(
         ));
     }
     let workspace = prerequisite_workspace(content, attempt)?;
-    progress("Preparing complete prerequisite source");
     // Exclusive creation, with a durable owner marker before materialization.
     #[cfg(target_os = "linux")]
     {
@@ -268,6 +328,30 @@ pub(crate) fn publish_prerequisite_source(
     }
     #[cfg(windows)]
     crate::windows_fs::create_prerequisite_workspace(&workspace, attempt)?;
+    // Transfer the whole verified directory to the new journal owner before
+    // launching. A crash on either side leaves each outer marker valid.
+    if let Some(previous) = previous {
+        let from = previous
+            .root
+            .parent()
+            .ok_or_else(|| LibraryError::Invalid("missing source parent".into()))?;
+        if verify_generation(from, &previous.owner_id, entries).is_ok() {
+            progress("Reusing verified prerequisite workspace");
+            let to = workspace.join(&previous.owner_id);
+            #[cfg(target_os = "linux")]
+            crate::tree_download::rename_tree_noreplace(from, &to)?;
+            #[cfg(windows)]
+            crate::windows_fs::rename_directory_noreplace(from, &to)?;
+            crate::transfer::sync_dir(&workspace)?;
+            crate::transfer::sync_dir(from.parent().expect("attempt workspace"))?;
+            return crate::prerequisite::PreparedPrerequisiteSource::new(
+                &previous.owner_id,
+                to.join("payload"),
+                relative_file,
+            );
+        }
+    }
+    progress("Preparing complete prerequisite source");
     let owned = workspace.join(attempt);
     #[cfg(target_os = "linux")]
     publish_layout(
@@ -286,19 +370,11 @@ pub(crate) fn publish_prerequisite_source(
         |digest| object(digest).map_err(std::io::Error::other),
         progress,
     )?;
-    #[cfg(target_os = "linux")]
-    verify_generation(&owned, attempt, entries)?;
-    let root = owned.join("payload");
-    let file = root.join(relative_file);
-    let directory = file
-        .parent()
-        .ok_or_else(|| LibraryError::Invalid("prerequisite file has no directory".into()))?
-        .to_path_buf();
-    Ok(crate::prerequisite::PreparedPrerequisiteSource {
-        root,
-        file,
-        directory,
-    })
+    crate::prerequisite::PreparedPrerequisiteSource::new(
+        attempt,
+        owned.join("payload"),
+        relative_file,
+    )
 }
 
 /// Remove only a journal-owned workspace whose executor is known to be idle.

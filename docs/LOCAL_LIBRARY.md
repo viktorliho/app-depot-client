@@ -107,22 +107,11 @@ pre-upgrade backup to return to an older executable.
 An explicit Standard install journals a `Preparing` generation and all final
 payload source Association/Artifact pairs before acquisition. Existing completed
 jobs and verified references are reused; absent sources use the existing File
-or Tree jobs and normal authorization. Each saved source is checked against
-its completed File identity or Tree inventory and its CAS object is rehashed.
-Prerequisite source pairs are retained with the generation but downloads are
-acquired and verified only for explicitly selected prerequisites during processing.
-Each selected attempt is journaled before source preparation. An installer that will run receives an
-independent verified copy of the entire source Artifact under
-`staging/prerequisite-<attempt-id>/<attempt-id>/payload`. Tree paths and empty
-directories are preserved, including supporting files absent from the final
-application layout. On Windows, Core copies into exclusively created files, flushes them and their containing directories, and verifies the entire published work tree against the inventory before execution. Desktop reports the current prerequisite, copy and verification counts, execution and cleanup. Each invoked installer gets a fresh workspace because an earlier installer can change its supporting files. A File Artifact has no declared relative path, so its
-single local filename is `prerequisite`. The executor receives the source root,
-declared file and containing directory, not a CAS path. Source ownership is
-recorded by the existing attempt ID and an exclusive workspace marker; partial
-publication stays within that workspace. Definite outcomes permit cleanup;
-interrupted or ambiguous attempts retain their source workspace for review.
-Progress reports remaining workspaces and retries cleanup of definite
-outcomes. A retry always uses a new independent layout. Linux uninstall checks
+or Tree jobs and normal authorization. The coordinator binds each saved source to the completed File identity or Tree inventory. Materializing a writable layout verifies the bytes during copying or checks the independent reflink. A pending generation resumes at prerequisite processing. The selected prerequisites share an acquisition phase before execution, with one lookup or download per Association/Artifact pair. Declined prerequisites need no acquisition.
+
+Each selected attempt is journaled before execution. If the mounted application directory or one of its subdirectories has the original Tree identity, Core runs the declared installer there. It checks the complete layout before the round, before using the application as an installer source, and before activation. Within the round, unchanged regular files reuse their checked digest using file identity and change timestamps. Each check still validates the marker, paths, types, sizes and layout. Explicit Verify, restart and recovery start with fresh checks.
+
+For a separate or remapped Artifact, the coordinator prepares a CAS-independent workspace under `staging/prerequisite-<attempt-id>`. Tree paths, supporting files and empty directories retain their original layout. A standalone File uses the local name `prerequisite`. Consecutive selected steps using the same Association and Artifact can transfer the verified layout to the next attempt's marked workspace by no-replace rename. A changed layout is rebuilt. The executor receives the declared file and its containing directory. A definite outcome permits cleanup, while an ambiguous private workspace remains owned by its attempt. Progress retries interrupted cleanup. Linux uninstall checks
 attempt workspaces for running processes and removes them before deleting their
 journal. Windows Standard removal refuses ambiguous attempts and retained attempt
 workspaces, preserving their journal until prerequisite progress can establish
@@ -148,7 +137,7 @@ exit codes and source identities. Failure or cancellation stops the round;
 another attempt requires explicit retry authorization, including review of an
 interrupted running attempt (recorded as ambiguous when progress is inspected
 without an active coordinator, or when retry is confirmed).
-When considering reuse, Core revalidates the source references, complete inventory and cached file contents without creating an executable workspace. After source revalidation, Core reuses the latest successful or reused attempt
+Core checks the completed source registration and inventory for a recorded success. It reuses the latest successful or reused attempt
 when its original success records an accepted exit code for the same prerequisite,
 pinned plan fingerprint and generation. The final Ready
 transition, retirement and active pointer change commit in one SQLite

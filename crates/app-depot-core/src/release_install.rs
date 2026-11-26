@@ -131,6 +131,53 @@ mod coordinator {
             Err(invalid("invalid local generation identity"))
         }
     }
+    // A mapped subtree is suitable only if its complete relative inventory
+    // has the original Tree identity, including empty directories and modes.
+    fn embedded_root(
+        plan: &Plan,
+        layout: &[InventoryEntry],
+        step: &crate::installation::Prerequisite,
+    ) -> Option<String> {
+        let id = step.file.file_id.as_ref()?;
+        for (dest, source) in plan.files.as_ref()? {
+            if source.association_id != step.file.association_id
+                || source.artifact_id != step.file.artifact_id
+                || source.file_id.as_ref() != Some(id)
+            {
+                continue;
+            }
+            let Some(prefix) = dest.strip_suffix(&step.path) else {
+                continue;
+            };
+            if !prefix.is_empty() && !prefix.ends_with('/') {
+                continue;
+            }
+            let entries: Vec<_> = layout
+                .iter()
+                .filter_map(|entry| {
+                    let relative = entry.path().strip_prefix(prefix)?;
+                    let mut local = entry.clone();
+                    match &mut local {
+                        InventoryEntry::File { path, .. } | InventoryEntry::Directory { path } => {
+                            *path = relative.to_owned()
+                        }
+                    }
+                    Some(local)
+                })
+                .collect();
+            if crate::tree::identity(&entries).ok().as_ref() == Some(&step.file.artifact_id) {
+                return Some(prefix.to_owned());
+            }
+        }
+        None
+    }
+
+    struct AttemptSources<'a> {
+        inventories: &'a mut BTreeMap<String, Vec<InventoryEntry>>,
+        embedded: Option<(&'a std::path::Path, &'a str)>,
+        previous: Option<&'a crate::prerequisite::PreparedPrerequisiteSource>,
+    }
+
     enum PreparedAttempt {
         Reused(String),
         Execute(crate::prerequisite::PreparedPrerequisiteSource),
@@ -214,7 +261,9 @@ mod coordinator {
                     "retry the pending plan or uninstall before selecting another plan",
                 ));
             }
-            let already_prepared = pending.is_some_and(|g| g.state == "PrerequisitesPending");
+            if pending.is_some_and(|g| g.state == "PrerequisitesPending") {
+                return existing.ok_or_else(|| invalid("pending installation missing"));
+            }
             let id = pending.map_or_else(|| Uuid::new_v4().to_string(), |g| g.id.clone());
             canonical(&id)?;
             let tx = self.conn.transaction()?;
@@ -240,18 +289,18 @@ mod coordinator {
                 let _download = self.lock_download_slot()?;
                 let target = self.paths.content.join("apps").join(&id);
                 match fs::symlink_metadata(&target) {
-                    Ok(_) => verify_generation(&target, &id, &layout)?,
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound && !already_prepared => {
+                    Ok(_) => {
+                        verify_generation(&target, &id, &layout)?;
+                        crate::transfer::sync_dir(&self.paths.content.join("apps"))?;
+                        #[cfg(target_os = "linux")]
+                        crate::transfer::sync_dir(&self.paths.content.join("staging"))?;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                         publish_generation(&self.paths.content, &id, &layout, |digest| {
                             self.object(&format!("adfile:sha256:{digest}"))
                         })?
                     }
                     Err(e) => return Err(e.into()),
-                }
-                crate::transfer::sync_dir(&self.paths.content.join("apps"))?;
-                crate::transfer::sync_dir(&self.paths.content.join("staging"))?;
-                if already_prepared {
-                    return Ok(());
                 }
                 let state = if !plan
                     .prerequisites
@@ -296,22 +345,65 @@ mod coordinator {
             Ok(())
         }
 
-        fn authorize_prerequisite_path(
+        fn prerequisite_inventory(
             &self,
             job: &DownloadJob,
-            p: &crate::installation::Prerequisite,
-        ) -> Result<(), LibraryError> {
-            if let Some(file_id) = &p.file.file_id {
-                let entries = self
-                    .tree_inventory(&job.id)?
-                    .ok_or_else(|| invalid("missing prerequisite inventory"))?;
-                if !entries.iter().any(|e| matches!(e, InventoryEntry::File { path, file_id: id, .. } if path == &p.path && id == file_id)) {
-                    return Err(invalid("prerequisite path does not match verified Tree member"));
-                }
-            } else if !p.path.is_empty() {
-                return Err(invalid("File prerequisite must have an empty source path"));
+        ) -> Result<Vec<InventoryEntry>, LibraryError> {
+            let entries = self
+                .tree_inventory(&job.id)?
+                .ok_or_else(|| invalid("missing verified Tree inventory"))?;
+            if crate::tree::identity(&entries)? != job.artifact_id {
+                return Err(invalid("Tree identity mismatch"));
             }
-            Ok(())
+            // Each member must still have a durable verified CAS reference.
+            let mut stmt = self.conn.prepare("SELECT path,file_id,size,sha256,executable,verified FROM tree_files WHERE job_id=?1")?;
+            let indexed = stmt
+                .query_map([&job.id], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        (
+                            r.get::<_, String>(1)?,
+                            r.get::<_, u64>(2)?,
+                            r.get::<_, String>(3)?,
+                            r.get::<_, bool>(4)?,
+                            r.get::<_, bool>(5)?,
+                        ),
+                    ))
+                })?
+                .collect::<Result<BTreeMap<_, _>, _>>()?;
+            let mut count = 0;
+            for entry in &entries {
+                if let InventoryEntry::File {
+                    path,
+                    file_id,
+                    size,
+                    sha256,
+                    executable,
+                } = entry
+                {
+                    count += 1;
+                    if indexed
+                        .get(path)
+                        .is_none_or(|(id, len, digest, exec, verified)| {
+                            id != file_id
+                                || len != size
+                                || digest != sha256
+                                || exec != executable
+                                || !verified
+                        })
+                    {
+                        return Err(invalid(
+                            "Tree source member lacks a matching verified CAS reference",
+                        ));
+                    }
+                }
+            }
+            if indexed.len() != count {
+                return Err(invalid(
+                    "Tree source member index differs from verified inventory",
+                ));
+            }
+            Ok(entries)
         }
 
         fn prepare_prerequisite_source(
@@ -320,6 +412,7 @@ mod coordinator {
             p: &crate::installation::Prerequisite,
             attempt: &str,
             prior_success: Option<String>,
+            sources: AttemptSources<'_>,
             progress: &mut dyn FnMut(&str),
         ) -> Result<PreparedAttempt, LibraryError> {
             let _download = self.lock_download_slot()?;
@@ -334,99 +427,71 @@ mod coordinator {
                     "completed prerequisite Artifact reference disappeared",
                 ));
             }
-            self.authorize_plan_files(job, &[&p.file])?;
-            self.authorize_prerequisite_path(job, p)?;
-            let (entries, relative_file) = if p.file.file_id.is_some() {
-                let entries = self
-                    .tree_inventory(&job.id)?
-                    .ok_or_else(|| invalid("missing verified Tree inventory"))?;
-                // Each member must still have a durable verified CAS reference.
-                let mut stmt = self.conn.prepare("SELECT path,file_id,size,sha256,executable,verified FROM tree_files WHERE job_id=?1")?;
-                let indexed = stmt
-                    .query_map([&job.id], |r| {
-                        Ok((
-                            r.get::<_, String>(0)?,
-                            (
-                                r.get::<_, String>(1)?,
-                                r.get::<_, u64>(2)?,
-                                r.get::<_, String>(3)?,
-                                r.get::<_, bool>(4)?,
-                                r.get::<_, bool>(5)?,
-                            ),
-                        ))
-                    })?
-                    .collect::<Result<BTreeMap<_, _>, _>>()?;
-                let mut count = 0;
-                for entry in &entries {
-                    if let InventoryEntry::File {
+            let standalone;
+            let (entries, relative_file) = if let Some(id) = &p.file.file_id {
+                use std::collections::btree_map::Entry;
+                let entries = match sources.inventories.entry(job.id.clone()) {
+                    Entry::Occupied(slot) => slot.into_mut(),
+                    Entry::Vacant(slot) => slot.insert(self.prerequisite_inventory(job)?),
+                };
+                let matches_member = entries.iter().any(|entry| match entry {
+                    InventoryEntry::Directory { .. } => false,
+                    InventoryEntry::File {
                         path,
                         file_id,
                         size,
                         sha256,
                         executable,
-                    } = entry
-                    {
-                        count += 1;
-                        if indexed
-                            .get(path)
-                            .is_none_or(|(id, len, digest, exec, verified)| {
-                                id != file_id
-                                    || len != size
-                                    || digest != sha256
-                                    || exec != executable
-                                    || !verified
-                            })
-                        {
-                            return Err(invalid(
-                                "Tree source member lacks a matching verified CAS reference",
-                            ));
-                        }
+                    } => {
+                        path == &p.path
+                            && file_id == id
+                            && *size == p.file.size
+                            && sha256 == &p.file.sha256
+                            && *executable == p.file.executable
                     }
-                }
-                if indexed.len() != count {
+                });
+                if !matches_member {
                     return Err(invalid(
-                        "Tree source member index differs from verified inventory",
+                        "prerequisite path does not match verified Tree member",
                     ));
                 }
-                (entries, p.path.as_str())
+                (entries.as_slice(), p.path.as_str())
             } else {
+                if !p.path.is_empty()
+                    || p.file.size != job.expected_size
+                    || job.artifact_id != format!("adfile:sha256:{}", p.file.sha256)
+                {
+                    return Err(invalid("saved prerequisite does not match verified File"));
+                }
                 // File Artifacts have no path in InstallationManifestV1.
                 // This is an opaque local name, not executable-type inference.
-                (
-                    vec![InventoryEntry::File {
-                        path: "prerequisite".into(),
-                        file_id: String::new(),
-                        size: p.file.size,
-                        sha256: p.file.sha256.clone(),
-                        executable: p.file.executable,
-                    }],
-                    "prerequisite",
-                )
+                standalone = [InventoryEntry::File {
+                    path: "prerequisite".into(),
+                    file_id: String::new(),
+                    size: p.file.size,
+                    sha256: p.file.sha256.clone(),
+                    executable: p.file.executable,
+                }];
+                (&standalone[..], "prerequisite")
             };
             if let Some(origin) = prior_success {
-                // Reuse still requires intact source bytes, including supporting
-                // files. No executor will consume a writable copy this time.
-                crate::tree::validate_destination(&entries)?;
-                progress("Revalidating cached prerequisite source for reuse");
-                let mut checked = std::collections::HashSet::new();
-                for entry in &entries {
-                    if let InventoryEntry::File { size, sha256, .. } = entry
-                        && checked.insert((sha256, size))
-                        && crate::transfer::hash_file(
-                            &self.object(&format!("adfile:sha256:{sha256}"))?,
-                            *size,
-                        )? != *sha256
-                    {
-                        return Err(invalid("Cached prerequisite source hash mismatch"));
-                    }
-                }
+                progress("Reusing recorded prerequisite completion");
                 return Ok(PreparedAttempt::Reused(origin));
+            }
+            if let Some((payload, generation)) = sources.embedded {
+                return crate::prerequisite::PreparedPrerequisiteSource::new(
+                    generation,
+                    payload.to_owned(),
+                    relative_file,
+                )
+                .map(PreparedAttempt::Execute);
             }
             crate::materialization::publish_prerequisite_source(
                 &self.paths.content,
                 attempt,
-                &entries,
+                entries,
                 relative_file,
+                sources.previous,
                 |digest| self.object(&format!("adfile:sha256:{digest}")),
                 progress,
             )
@@ -613,10 +678,36 @@ mod coordinator {
             Self::validate_prerequisite_selection(&plan, &selected)?;
             // Validate every durable attempt identity before any new source publication.
             self.prerequisite_attempt_ids(generation)?;
-            progress("Verifying installed application files before prerequisites");
+
             let root = self.paths.content.join("apps").join(generation);
             let payload = root.join("payload");
-            verify_generation(&root, generation, &destination_layout(&plan)?)?;
+            let layout = destination_layout(&plan)?;
+            let mut embedded_roots = BTreeMap::new();
+
+            progress("Checking installed application files");
+            let mut checks = crate::materialization::LayoutChecks::default();
+            crate::materialization::check_generation(&root, generation, &layout, &mut checks)?;
+            let mut inventories = BTreeMap::new();
+            let mut acquired = BTreeMap::new();
+            for p in plan
+                .prerequisites
+                .iter()
+                .flatten()
+                .filter(|p| selected.contains(&p.id))
+            {
+                if let std::collections::btree_map::Entry::Vacant(slot) =
+                    acquired.entry((&p.file.association_id, &p.file.artifact_id))
+                {
+                    progress(&format!("Acquiring source for {}", p.name));
+                    slot.insert(self.acquire_plan_source(
+                        profile,
+                        &plan.release_id,
+                        &p.file.association_id,
+                        &p.file.artifact_id,
+                        client,
+                    )?);
+                }
+            }
             let tx = self.conn.transaction()?;
             for p in plan.prerequisites.iter().flatten() {
                 tx.execute("INSERT OR IGNORE INTO installation_sources(generation_id,association_id,artifact_id) VALUES (?1,?2,?3)",params![generation,p.file.association_id,p.file.artifact_id])?;
@@ -626,7 +717,10 @@ mod coordinator {
                 [consent],
             )?;
             tx.commit()?;
-            for p in plan.prerequisites.iter().flatten() {
+            let mut steps = plan.prerequisites.iter().flatten().peekable();
+            let mut retained: Option<(String, crate::prerequisite::PreparedPrerequisiteSource)> =
+                None;
+            while let Some(p) = steps.next() {
                 let attempt = Uuid::new_v4().to_string();
                 if !selected.contains(&p.id) {
                     self.conn.execute("INSERT INTO prerequisite_attempts(id,consent_id,prerequisite_id,state,finished_at) VALUES (?1,?2,?3,'Declined',unixepoch())",params![attempt,consent,p.id])?;
@@ -650,21 +744,40 @@ mod coordinator {
                     .filter(|(_, code)| p.success_exit_codes.contains(code))
                     .map(|(id, _)| id);
                 let source = (|| -> Result<PreparedAttempt, LibraryError> {
-                    let job = self.acquire_plan_source(
-                        profile,
-                        &plan.release_id,
-                        &p.file.association_id,
-                        &p.file.artifact_id,
-                        client,
-                    )?;
+                    let job = &acquired[&(&p.file.association_id, &p.file.artifact_id)];
+                    let embedded = embedded_roots
+                        .entry((&p.file.association_id, &p.file.artifact_id))
+                        .or_insert_with(|| {
+                            embedded_root(&plan, &layout, p).map(|prefix| payload.join(prefix))
+                        })
+                        .as_deref();
+                    if embedded.is_some() && prior_success.is_none() {
+                        crate::materialization::check_generation(
+                            &root,
+                            generation,
+                            &layout,
+                            &mut checks,
+                        )?;
+                    }
                     self.prepare_prerequisite_source(
-                        &job,
+                        job,
                         p,
                         &attempt,
                         prior_success,
+                        AttemptSources {
+                            inventories: &mut inventories,
+                            embedded: embedded.map(|root| (root, generation)),
+                            previous: retained.as_ref().map(|(_, source)| source),
+                        },
                         &mut |phase| progress(&format!("{}: {phase}", p.name)),
                     )
                 })();
+                if let Some((owner, _)) = retained.take() {
+                    crate::materialization::cleanup_prerequisite_workspace(
+                        &self.paths.content,
+                        &owner,
+                    )?;
+                }
                 let source = match source {
                     Ok(PreparedAttempt::Execute(source)) => source,
                     Ok(PreparedAttempt::Reused(origin)) => {
@@ -704,6 +817,7 @@ mod coordinator {
                     p.name
                 ));
                 let outcome = executor.execute(&request);
+
                 let (state, code, detail) = match outcome {
                     PrerequisiteOutcome::Exited(code) if p.success_exit_codes.contains(&code) => {
                         ("Succeeded", Some(code), None)
@@ -718,7 +832,16 @@ mod coordinator {
                     PrerequisiteOutcome::Ambiguous(reason) => ("Ambiguous", None, Some(reason)),
                 };
                 self.conn.execute("UPDATE prerequisite_attempts SET state=?2,exit_code=?3,detail=?4,finished_at=unixepoch() WHERE id=?1",params![attempt,state,code,detail])?;
-                if state != "Ambiguous" {
+                if state == "Succeeded"
+                    && source.owner_id != generation
+                    && steps.peek().is_some_and(|next| {
+                        selected.contains(&next.id)
+                            && next.file.artifact_id == p.file.artifact_id
+                            && next.file.association_id == p.file.association_id
+                    })
+                {
+                    retained = Some((attempt, source));
+                } else if state != "Ambiguous" {
                     progress(&format!("Cleaning up {}", p.name));
                     let _ = crate::materialization::cleanup_prerequisite_workspace(
                         &self.paths.content,
@@ -743,7 +866,7 @@ mod coordinator {
             }
             progress("Verifying installed application files before activation");
             let activation = (|| -> Result<(), LibraryError> {
-                verify_generation(&root, generation, &destination_layout(&plan)?)?;
+                crate::materialization::check_generation(&root, generation, &layout, &mut checks)?;
                 // Activation and completion are atomic; an interrupted transaction
                 // leaves the old generation active and requires fresh authorization.
                 let tx = self.conn.transaction()?;
@@ -837,7 +960,6 @@ mod coordinator {
             } else {
                 None
             };
-            let mut checked = std::collections::HashSet::new();
             for source in files {
                 if let Some(entries) = &inventory {
                     if source
@@ -857,14 +979,6 @@ mod coordinator {
                     || job.artifact_id != format!("adfile:sha256:{}", source.sha256)
                 {
                     return Err(invalid("saved source does not match verified File"));
-                }
-                if checked.insert((&source.sha256, source.size))
-                    && crate::transfer::hash_file(
-                        &self.object(&format!("adfile:sha256:{}", source.sha256))?,
-                        source.size,
-                    )? != source.sha256
-                {
-                    return Err(invalid("source CAS digest mismatch"));
                 }
             }
             Ok(())
@@ -1355,7 +1469,7 @@ mod tests {
             .content
             .join("staging")
             .join(format!("manifest-{pending}"));
-        fs::create_dir(&stage).unwrap();
+        fs::create_dir_all(&stage).unwrap();
         fs::write(stage.join("partial"), b"interrupted").unwrap();
         lib.conn.execute_batch("CREATE TRIGGER fail_activation BEFORE UPDATE OF active_generation ON release_installations WHEN NEW.active_generation IS NOT NULL BEGIN SELECT RAISE(ABORT, 'synthetic activation failure'); END;").unwrap();
         assert!(lib.install_saved_plan(&profile, &plan_id, None).is_err());
@@ -1619,7 +1733,7 @@ mod tests {
         assert_eq!(
             phases
                 .iter()
-                .filter(|phase| phase.contains("Revalidating cached prerequisite source"))
+                .filter(|phase| phase.contains("Reusing recorded prerequisite completion"))
                 .count(),
             2
         );
@@ -1804,6 +1918,119 @@ mod tests {
             );
         }
         lib.verify_release_installation(&profile, &release).unwrap();
+    }
+
+    #[test]
+    fn embedded_tree_prerequisites_share_prepared_payload() {
+        exercise_tree_steps(Some(""), false, 8 * 1024 * 1024);
+    }
+
+    #[test]
+    fn nested_tree_prerequisites_use_the_mapped_directory() {
+        exercise_tree_steps(Some("media/"), false, 32);
+    }
+
+    #[test]
+    fn separate_tree_workspace_transfers_ownership_or_rebuilds_modified_sources() {
+        exercise_tree_steps(None, false, 32);
+        exercise_tree_steps(None, true, 32);
+    }
+
+    fn exercise_tree_steps(prefix: Option<&str>, modify: bool, size: usize) {
+        use crate::prerequisite::{PrerequisiteExecutor, PrerequisiteOutcome, PrerequisiteRequest};
+        struct Recorder {
+            roots: Vec<PathBuf>,
+            owners: Vec<String>,
+            modify: bool,
+        }
+        impl PrerequisiteExecutor for Recorder {
+            fn execute(&mut self, request: &PrerequisiteRequest<'_>) -> PrerequisiteOutcome {
+                assert_eq!(request.source.directory, request.source.root.join("setup"));
+                assert!(!request.source.root.join("setup/output").exists());
+                if self.modify && self.roots.is_empty() {
+                    fs::write(
+                        request.source.root.join("setup/output"),
+                        b"installer output",
+                    )
+                    .unwrap();
+                }
+                self.roots.push(request.source.root.clone());
+                self.owners.push(request.source.owner_id.clone());
+                PrerequisiteOutcome::Exited(0)
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let paths = LibraryPaths {
+            metadata: temp.path().join("metadata"),
+            content: temp.path().join("content"),
+        };
+        let mut lib = Library::open(paths.clone()).unwrap();
+        let profile = lib
+            .add_profile("fixture", "http://localhost:8787", false)
+            .unwrap()
+            .id;
+        let (app, release, revision) = (id(), id(), id());
+        lib.conn
+            .execute(
+                "INSERT INTO apps(profile_id,id,metadata_json,last_seen) VALUES (?1,?2,'{}',0)",
+                params![profile.0, app],
+            )
+            .unwrap();
+        lib.conn.execute("INSERT INTO releases(profile_id,id,app_id,metadata_json,last_seen) VALUES (?1,?2,?3,'{}',0)",params![profile.0,release,app]).unwrap();
+        let tree = source_layout(
+            &lib,
+            &profile,
+            &release,
+            &vec![42; size],
+            Some("setup/install"),
+            None,
+        );
+        let steps: Vec<_> = ["a","b"].into_iter().map(|id| {
+            json!({"id":id,"name":id,"file":tree,"path":"setup/install","arguments":[],"optional":false,"evidence":"fixture","successExitCodes":[0]})
+        }).collect();
+        let mut plan = json!({"version":1,"appId":app,"releaseId":release,"revisionId":revision,"platform":crate::launch::host().unwrap(),"selections":{},"unresolved":[],"files":{"setup/install":tree},"directories":["setup"],"prerequisites":steps,"launch":null});
+        if prefix == Some("media/") {
+            plan["directories"] = json!(["media", "media/setup"]);
+            plan["files"] = json!({"media/setup/install":tree,"app":source(&lib,&profile,&release,b"app",false)});
+        } else if prefix.is_none() {
+            plan["directories"] = json!([]);
+            plan["files"] = json!({"app":source(&lib,&profile,&release,b"app",false)});
+        }
+        let saved = save(&lib, &profile, &plan);
+        let pending = lib.install_saved_plan(&profile, &saved, None).unwrap();
+        let generation = &pending.generations.last().unwrap().id;
+        let fingerprint = lib
+            .prerequisite_requirements(&profile, &saved)
+            .unwrap()
+            .fingerprint;
+        let round = lib
+            .confirm_prerequisites(
+                &profile,
+                generation,
+                &fingerprint,
+                &["a".into(), "b".into()],
+                false,
+            )
+            .unwrap();
+        let mut recorder = Recorder {
+            roots: vec![],
+            owners: vec![],
+            modify,
+        };
+        let ready = lib
+            .process_prerequisites(&profile, generation, &round, None, &mut recorder)
+            .unwrap();
+        assert_eq!(ready.active_generation.as_ref(), Some(generation));
+        let payload = &pending.generations.last().unwrap().path;
+        assert_eq!(recorder.roots.len(), 2);
+        if let Some(prefix) = prefix {
+            assert_eq!(recorder.roots, vec![payload.join(prefix); 2]);
+            assert_eq!(recorder.owners, vec![generation.as_str(); 2]);
+        } else {
+            assert_ne!(recorder.roots[0], recorder.roots[1]);
+            assert_eq!(recorder.owners[0] == recorder.owners[1], !modify);
+            assert!(recorder.roots.iter().all(|root| !root.exists()));
+        }
     }
 
     #[test]

@@ -2,13 +2,36 @@
 use crate::installation::Prerequisite;
 use std::path::{Path, PathBuf};
 
-/// An independent, verified copy of the source Artifact. Tree paths are
+/// A verified working layout independent of CAS. Tree paths are
 /// relative to `root`; a File Artifact has no declared relative name.
 #[derive(Debug, Clone)]
 pub struct PreparedPrerequisiteSource {
+    pub owner_id: String,
     pub root: PathBuf,
     pub file: PathBuf,
     pub directory: PathBuf,
+}
+
+impl PreparedPrerequisiteSource {
+    pub(crate) fn new(
+        owner_id: &str,
+        root: PathBuf,
+        relative_file: &str,
+    ) -> Result<Self, crate::library::LibraryError> {
+        let file = root.join(relative_file);
+        let directory = file
+            .parent()
+            .ok_or_else(|| {
+                crate::library::LibraryError::Invalid("missing prerequisite directory".into())
+            })?
+            .to_owned();
+        Ok(Self {
+            owner_id: owner_id.to_owned(),
+            root,
+            file,
+            directory,
+        })
+    }
 }
 
 /// The coordinator has verified the complete source layout and recorded
@@ -60,7 +83,12 @@ fn execute_windows(request: &PrerequisiteRequest<'_>) -> PrerequisiteOutcome {
     let source = request.source;
     let launch = || -> std::io::Result<_> {
         let invalid = || std::io::Error::other("Invalid prepared prerequisite path");
-        let owned = source.root.parent().ok_or_else(invalid)?;
+        let owned = if source.owner_id == request.generation_id {
+            request.payload.parent()
+        } else {
+            source.root.parent()
+        }
+        .ok_or_else(invalid)?;
         let relative = |path: &Path| {
             path.strip_prefix(owned)
                 .ok()
@@ -70,7 +98,7 @@ fn execute_windows(request: &PrerequisiteRequest<'_>) -> PrerequisiteOutcome {
         };
         let target = relative(&source.file)?;
         let work = relative(&source.directory)?;
-        let _binding = windows_fs::bind_image(owned, request.attempt_id, &target, &work, true)?;
+        let _binding = windows_fs::bind_image(owned, &source.owner_id, &target, &work, true)?;
         let child = match windows_process::create_suspended(
             &source.file,
             &source.directory,

@@ -369,7 +369,6 @@ const _: () = {
     assert!(offset_of!(RenameInformation, name) == offset_of!(FILE_RENAME_INFORMATION, FileName));
 };
 
-#[cfg(test)]
 pub(crate) fn rename_directory_noreplace(from: &Path, to: &Path) -> io::Result<()> {
     let (Some(from_parent), Some(from_name), Some(to_parent), Some(to_name)) =
         (from.parent(), from.file_name(), to.parent(), to.file_name())
@@ -509,7 +508,7 @@ pub(crate) fn prepare_verified_tree(
     })?;
     progress("Verifying the complete prepared source");
     let _installation = installation_chain(to, id)?;
-    verify_tree_inner(&to.join("payload"), entries, None, &mut |remaining| {
+    verify_tree_inner(&to.join("payload"), entries, None, None, &mut |remaining| {
         if remaining == 0 || last.elapsed() >= std::time::Duration::from_millis(500) {
             progress(&format!(
                 "Verifying source entries: {} / {}",
@@ -625,13 +624,32 @@ pub(crate) fn verify_tree_install(
     entries: &[crate::models::InventoryEntry],
 ) -> io::Result<()> {
     let _installation = installation_chain(to, id)?;
-    verify_tree(&to.join("payload"), entries).map_err(|error| {
-        if error.kind() == io::ErrorKind::NotFound {
-            invalid("installed Tree is incomplete")
-        } else {
-            error
-        }
-    })
+    verify_tree(&to.join("payload"), entries).map_err(incomplete_installation)
+}
+
+pub(crate) fn check_tree_install(
+    to: &Path,
+    id: &str,
+    entries: &[crate::models::InventoryEntry],
+    checks: &mut crate::materialization::LayoutChecks,
+) -> io::Result<()> {
+    let _installation = installation_chain(to, id)?;
+    verify_tree_inner(
+        &to.join("payload"),
+        entries,
+        None,
+        Some(checks),
+        &mut |_| {},
+    )
+    .map_err(incomplete_installation)
+}
+
+fn incomplete_installation(error: io::Error) -> io::Error {
+    if error.kind() == io::ErrorKind::NotFound {
+        invalid("installed Tree is incomplete")
+    } else {
+        error
+    }
 }
 
 /// Keep the installation ancestors, working directory and candidate image pinned.
@@ -964,6 +982,7 @@ pub(crate) fn inspect_removal_layout(
                 &installation.join("payload"),
                 entries,
                 Some((&payload, &mut identities)),
+                None,
                 &mut |_| {},
             )?;
         }
@@ -1154,26 +1173,13 @@ fn write_tree(
             }
             InventoryEntry::File { size, sha256, .. } => {
                 let path = object(sha256)?;
-                if verify_member {
-                    publish_copy_at(
-                        &path,
-                        target,
-                        &name_utf16(OsStr::new(leaf))?,
-                        *size,
-                        false,
-                        |file| {
-                            if crate::transfer::hash_open_file(file, *size)
-                                .map_err(io::Error::other)?
-                                != *sha256
-                            {
-                                return Err(invalid("Tree source hash mismatch"));
-                            }
-                            Ok(())
-                        },
-                    )?;
-                } else {
-                    copy_workspace_file(&path, target, OsStr::new(leaf), *size)?;
-                }
+                copy_workspace_file(
+                    &path,
+                    target,
+                    OsStr::new(leaf),
+                    *size,
+                    verify_member.then_some(sha256.as_str()),
+                )?;
             }
         }
         progress(i + 1, entries.len());
@@ -1186,9 +1192,14 @@ fn write_tree(
     stage.sync_all()
 }
 
-// Only used inside a fresh attempt tree. The caller verifies every final
-// destination against the inventory before exposing the prepared source.
-fn copy_workspace_file(path: &Path, target: &File, leaf: &OsStr, size: u64) -> io::Result<()> {
+// The stage is exclusive. Private attempts verify the complete published tree.
+fn copy_workspace_file(
+    path: &Path,
+    target: &File,
+    leaf: &OsStr,
+    size: u64,
+    digest: Option<&str>,
+) -> io::Result<()> {
     let source = open_regular(path, false, false, FILE_SHARE_READ)?;
     if volume(&source)? != volume(target)? || source.metadata()?.len() != size {
         return Err(invalid("Tree source volume or size mismatch"));
@@ -1201,7 +1212,9 @@ fn copy_workspace_file(path: &Path, target: &File, leaf: &OsStr, size: u64) -> i
         FILE_NON_DIRECTORY_FILE,
         0,
     )?;
-    if io::copy(&mut source.take(size), &mut out)? != size {
+    if let Some(digest) = digest {
+        crate::transfer::copy_verified(source, &mut out, size, digest)?;
+    } else if io::copy(&mut source.take(size), &mut out)? != size {
         return Err(invalid("Tree source shortened"));
     }
     out.sync_all()
@@ -1213,13 +1226,14 @@ pub(crate) fn verify_tree(
     path: &Path,
     entries: &[crate::models::InventoryEntry],
 ) -> io::Result<()> {
-    verify_tree_inner(path, entries, None, &mut |_| {})
+    verify_tree_inner(path, entries, None, None, &mut |_| {})
 }
 
 fn verify_tree_inner(
     path: &Path,
     entries: &[crate::models::InventoryEntry],
     removal_root: Option<(&File, &mut RemovalIdentities)>,
+    checks: Option<&mut crate::materialization::LayoutChecks>,
     report_remaining: &mut dyn FnMut(usize),
 ) -> io::Result<()> {
     use crate::models::InventoryEntry;
@@ -1230,6 +1244,7 @@ fn verify_tree_inner(
         prefix: &str,
         remaining: &mut HashMap<&str, &InventoryEntry>,
         mut identities: Option<&mut RemovalIdentities>,
+        mut checks: Option<&mut crate::materialization::LayoutChecks>,
         report_remaining: &mut dyn FnMut(usize),
     ) -> io::Result<()> {
         require_case_insensitive(dir)?;
@@ -1266,6 +1281,7 @@ fn verify_tree_inner(
                         &relative,
                         remaining,
                         identities.as_deref_mut(),
+                        checks.as_deref_mut(),
                         report_remaining,
                     )?;
                 }
@@ -1287,7 +1303,11 @@ fn verify_tree_inner(
                     {
                         return Err(invalid("unsafe Tree file"));
                     }
-                    if crate::transfer::hash_open_file(&file, *size).map_err(io::Error::other)?
+                    if let Some(cache) = checks.as_deref_mut() {
+                        require_single_link(&file)?;
+                        cache.check(&relative, &file, *size, sha256)?;
+                    } else if crate::transfer::hash_open_file(&file, *size)
+                        .map_err(io::Error::other)?
                         != *sha256
                     {
                         return Err(io::Error::new(
@@ -1306,7 +1326,15 @@ fn verify_tree_inner(
     }
     let mut remaining = entries.iter().map(|entry| (entry.path(), entry)).collect();
     if let Some((root, ids)) = removal_root {
-        scan(root, path, "", &mut remaining, Some(ids), report_remaining)?;
+        scan(
+            root,
+            path,
+            "",
+            &mut remaining,
+            Some(ids),
+            checks,
+            report_remaining,
+        )?;
     } else {
         let chain = directory_chain(path, false)?;
         scan(
@@ -1315,6 +1343,7 @@ fn verify_tree_inner(
             "",
             &mut remaining,
             None,
+            checks,
             report_remaining,
         )?;
     }
@@ -1332,6 +1361,25 @@ pub(crate) fn pause_tree_test(boundary: &str) {
     if let Some(stage) = std::env::var_os("APP_DEPOT_TREE_TEST_STAGE") {
         crate::transfer::pause_file_commit_test(Path::new(&stage), boundary);
     }
+}
+
+pub(crate) fn installation_file_stamp(file: &File) -> io::Result<(u64, [u8; 16], i64, i64)> {
+    use windows_sys::Win32::Storage::FileSystem::{FILE_BASIC_INFO, FileBasicInfo};
+    let mut info = FILE_BASIC_INFO::default();
+    // SAFETY: the open handle and output buffer match FileBasicInfo.
+    if unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle(),
+            FileBasicInfo,
+            (&raw mut info).cast(),
+            size_of::<FILE_BASIC_INFO>() as u32,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let (volume, id) = file_identity(file)?;
+    Ok((volume, id, info.ChangeTime, info.LastWriteTime))
 }
 
 fn file_identity(file: &File) -> io::Result<(u64, [u8; 16])> {

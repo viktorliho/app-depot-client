@@ -228,6 +228,39 @@ pub(crate) fn hash_file(path: &Path, expected_size: u64) -> Result<String, Libra
     hash_open_file(&open_regular(path, false)?, expected_size)
 }
 
+/// Verify the exact bytes written into a private, unpublished layout.
+#[cfg(any(target_os = "linux", windows))]
+pub(crate) fn copy_verified(
+    mut input: impl Read,
+    mut output: impl Write,
+    size: u64,
+    digest: &str,
+) -> std::io::Result<()> {
+    let mut hash = Sha256::new();
+    let mut buffer = [0; CHUNK];
+    let mut remaining = size;
+    while remaining > 0 {
+        let bound = remaining.min(CHUNK as u64) as usize;
+        let n = input.read(&mut buffer[..bound])?;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "source shortened",
+            ));
+        }
+        output.write_all(&buffer[..n])?;
+        hash.update(&buffer[..n]);
+        remaining -= n as u64;
+    }
+    if input.read(&mut buffer[..1])? != 0 || format!("{:x}", hash.finalize()) != digest {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "source identity mismatch",
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn hash_open_file(mut file: &File, expected_size: u64) -> Result<String, LibraryError> {
     if file.metadata()?.len() != expected_size {
         return Err(invalid("verified file has wrong size"));
