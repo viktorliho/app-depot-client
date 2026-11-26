@@ -624,7 +624,13 @@ pub(crate) fn bind_launch_target(
     target: &str,
     working_directory: &str,
 ) -> io::Result<LaunchBinding> {
-    bind_image(installation, id, target, working_directory, false)
+    bind_image(
+        installation,
+        id,
+        target,
+        working_directory,
+        cfg!(target_arch = "x86_64"),
+    )
 }
 
 pub(crate) fn bind_image(
