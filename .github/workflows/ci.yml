@@ -1,7 +1,7 @@
 name: Client CI
 on:
   push:
-    branches: [main, 'feature/**']
+    branches: [main, 'feature/**', m5.3b-windows-executor]
   pull_request:
   workflow_dispatch:
     inputs:

@@ -1,6 +1,6 @@
 # M5.3B Windows executor handoff
 
-**Status: partial implementation, ready for development handoff.** Client base is `637f53b17ac34c3859daa784f105a2dd7f8d0853`. The server contract is `docs/installation-manifest-v1.md` at `2ed0c5bc176136c7f4087132d992425893b465a8`.
+**Historical handoff at commit 34df141.** The branch subsequently adopted observed installer exit as the completion result for UAC launches. The blocker and test results below describe the handoff revision. Client base is `637f53b17ac34c3859daa784f105a2dd7f8d0853`. The server contract is `docs/installation-manifest-v1.md` at `2ed0c5bc176136c7f4087132d992425893b465a8`.
 
 ## Implementation and remaining blocker
 

@@ -213,9 +213,10 @@ pub(crate) fn authorized_elevation(
         id: 0,
     };
     match child.wait() {
-        Ok(exit) => Outcome::Ambiguous(format!(
-            "Elevated installer returned {exit}; descendant completion could not be verified"
-        )),
+        Ok(exit) => match exit.code() {
+            Some(code) => Outcome::Exited(code),
+            None => Outcome::Ambiguous("Elevated installer returned no exit code".into()),
+        },
         Err(error) => Outcome::Ambiguous(error.to_string()),
     }
 }
