@@ -105,16 +105,22 @@ pub(crate) fn prepare(
     child: &Suspended,
     started: u64,
     previous: Option<&str>,
+    generation: bool,
 ) -> io::Result<(String, OwnedHandle)> {
     let nonce = Uuid::new_v4();
     let job = new_job(nonce, child)?;
     let untracked = previous.is_some_and(|value| !clean_exit(value));
-    let mut process = Command::new(std::env::current_exe()?)
+    let mut command = Command::new(std::env::current_exe()?);
+    command
         .arg(ARG)
         .arg(&paths.metadata)
         .arg(&paths.content)
         .arg(installation)
-        .arg(nonce.to_string())
+        .arg(nonce.to_string());
+    if generation {
+        command.arg("generation");
+    }
+    let mut process = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -164,16 +170,26 @@ pub(crate) fn dispatch() -> Option<bool> {
             };
             let installation = args.next()?.into_string().ok()?;
             let job = Uuid::parse_str(&args.next()?.into_string().ok()?).ok()?;
+            let generation = match args.next().as_deref() {
+                None => false,
+                Some(value) if value == OsStr::new("generation") => true,
+                _ => return None,
+            };
             if args.next().is_some() || Uuid::parse_str(&installation).is_err() {
                 return None;
             }
-            supervise(paths, &installation, job).ok()
+            supervise(paths, &installation, job, generation).ok()
         })()
         .is_some(),
     )
 }
 
-fn supervise(paths: LibraryPaths, installation: &str, nonce: Uuid) -> io::Result<()> {
+fn supervise(
+    paths: LibraryPaths,
+    installation: &str,
+    nonce: Uuid,
+    generation: bool,
+) -> io::Result<()> {
     let job = open_job(nonce)?.ok_or_else(|| io::Error::other("launch job is unavailable"))?;
     let library = Library::open(paths).map_err(io::Error::other)?;
     {
@@ -187,13 +203,20 @@ fn supervise(paths: LibraryPaths, installation: &str, nonce: Uuid) -> io::Result
     // SAFETY: this pseudo-handle refers to the current authenticated helper.
     let started =
         creation_time(unsafe { windows_sys::Win32::System::Threading::GetCurrentProcess() })?;
+    let (read, update) = if generation {
+        (
+            "SELECT process_start FROM installation_generations WHERE id=?1",
+            "UPDATE installation_generations SET process_id=NULL,process_start=?2 WHERE id=?1 AND process_start=?3",
+        )
+    } else {
+        (
+            "SELECT process_start FROM installations WHERE id=?1",
+            "UPDATE installations SET process_id=NULL,process_start=?2 WHERE id=?1 AND process_start=?3",
+        )
+    };
     let record: Option<String> = library
         .conn
-        .query_row(
-            "SELECT process_start FROM installations WHERE id=?1",
-            [installation],
-            |r| r.get(0),
-        )
+        .query_row(read, [installation], |r| r.get(0))
         .map_err(io::Error::other)?;
     if let Some(record) = record
         && let Some(launch) = live_record(&record)
@@ -201,10 +224,17 @@ fn supervise(paths: LibraryPaths, installation: &str, nonce: Uuid) -> io::Result
         && launch.supervisor == std::process::id()
         && launch.supervisor_started == started
     {
-        library.conn.execute(
-            "UPDATE installations SET process_id=NULL,process_start=?2 WHERE id=?1 AND process_start=?3",
-            params![installation, format!("{EXITED}{nonce}:{}", u8::from(launch.untracked)), record],
-        ).map_err(io::Error::other)?;
+        library
+            .conn
+            .execute(
+                update,
+                params![
+                    installation,
+                    format!("{EXITED}{nonce}:{}", u8::from(launch.untracked)),
+                    record
+                ],
+            )
+            .map_err(io::Error::other)?;
     }
     Ok(())
 }

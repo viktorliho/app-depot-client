@@ -112,7 +112,7 @@ pub(crate) fn sensitive_env_name(key: &std::ffi::OsStr) -> bool {
         || name == "SSH_AUTH_SOCK"
 }
 #[cfg(windows)]
-fn windows_paths(file: bool, target: &str, work: &str) -> (String, String) {
+pub(crate) fn windows_paths(file: bool, target: &str, work: &str) -> (String, String) {
     if file {
         return ("payload".into(), String::new());
     }
@@ -132,17 +132,12 @@ impl Library {
         profile: &ServerProfileId,
         release: &str,
     ) -> Result<Vec<LaunchCandidate>, LibraryError> {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", windows))]
         if self.release_installation(profile, release)?.is_some() {
             return Ok(self
                 .manifest_launch_candidate(profile, release)?
                 .into_iter()
                 .collect());
-        }
-        #[cfg(windows)]
-        if self.release_installation(profile, release)?.is_some() {
-            // Standard generation launch supervision has not been integrated on Windows.
-            return Ok(Vec::new());
         }
         let snapshot = self
             .cached_snapshot(profile, release)?

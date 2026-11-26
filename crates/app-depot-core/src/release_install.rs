@@ -105,17 +105,15 @@ impl Library {
 #[cfg(any(target_os = "linux", windows))]
 mod coordinator {
     use super::*;
+    use crate::launch::LaunchCandidate;
+    #[cfg(target_os = "linux")]
+    use crate::managed::{delete_owned, process_start, runtime_busy};
     use crate::{
         api::ApiClient,
         installation::Source,
         materialization::{destination_layout, publish_generation, verify_generation},
         models::InventoryEntry,
         transfer::DownloadJob,
-    };
-    #[cfg(target_os = "linux")]
-    use crate::{
-        launch::LaunchCandidate,
-        managed::{delete_owned, process_start, runtime_busy},
     };
     #[cfg(target_os = "linux")]
     use std::process::Child;
@@ -131,11 +129,11 @@ mod coordinator {
     }
     impl Library {
         #[cfg(target_os = "linux")]
-        fn manifest_lifecycle_lock(&self) -> Result<std::fs::File, LibraryError> {
+        pub(crate) fn manifest_lifecycle_lock(&self) -> Result<std::fs::File, LibraryError> {
             self.lifecycle_lock()
         }
         #[cfg(windows)]
-        fn manifest_lifecycle_lock(&self) -> Result<std::fs::File, LibraryError> {
+        pub(crate) fn manifest_lifecycle_lock(&self) -> Result<std::fs::File, LibraryError> {
             use crate::transfer::{create_content_file, open_regular};
             use fs2::FileExt;
             let path = self.paths.metadata.join(".app-depot-manifest.lock");
@@ -683,7 +681,7 @@ mod coordinator {
                 &destination_layout(&plan)?,
             )
         }
-        fn active_release_generation(
+        pub(crate) fn active_release_generation(
             &self,
             profile: &ServerProfileId,
             release: &str,
@@ -702,7 +700,6 @@ mod coordinator {
             }
             Ok(g)
         }
-        #[cfg(target_os = "linux")]
         pub(crate) fn manifest_launch_candidate(
             &self,
             profile: &ServerProfileId,
@@ -742,6 +739,7 @@ mod coordinator {
                 .into(),
                 local_root: Some(g.path),
             };
+            #[cfg(target_os = "linux")]
             if ready
                 && let Err(reason) = crate::materialization::verify_linux_marker(
                     &self.paths.content.join("apps").join(&g.id),
@@ -752,6 +750,31 @@ mod coordinator {
             {
                 candidate.status = "Unavailable".into();
                 candidate.reason = reason;
+            }
+            #[cfg(windows)]
+            if ready {
+                let root = self.paths.content.join("apps").join(&g.id);
+                let (target, work) = crate::launch::windows_paths(
+                    false,
+                    candidate.target.as_deref().unwrap(),
+                    candidate.working_directory.as_deref().unwrap(),
+                );
+                let occupancy = self.windows_generation_occupancy(&g.id)?;
+                if occupancy != crate::windows_process::ProcessState::Idle {
+                    candidate.status =
+                        if occupancy == crate::windows_process::ProcessState::Running {
+                            "Running"
+                        } else {
+                            "ProcessUnknown"
+                        }
+                        .into();
+                    candidate.reason = "Managed generation occupancy is not idle".into();
+                } else if let Err(error) =
+                    crate::windows_fs::bind_launch_target(&root, &g.id, &target, &work)
+                {
+                    candidate.status = "Unavailable".into();
+                    candidate.reason = error.to_string();
+                }
             }
             Ok(Some(candidate))
         }
@@ -1375,14 +1398,51 @@ mod tests {
             )
             .unwrap();
         lib.conn.execute("INSERT INTO releases(profile_id,id,app_id,metadata_json,last_seen) VALUES (?1,?2,?3,'{}',0)",params![profile.0,release,app]).unwrap();
-        let f = source(&lib, &profile, &release, b"fixture File", false);
+        let image = fs::read(std::env::current_exe().unwrap()).unwrap();
+        let f = source(&lib, &profile, &release, &image, false);
         let t = source(&lib, &profile, &release, b"fixture Tree", true);
-        let plan = json!({"version":1,"appId":app,"releaseId":release,"revisionId":revision,"platform":"windows/x86_64","selections":{},"unresolved":[],"files":{"renamed":f,"data/renamed":t},"directories":["data","empty"],"prerequisites":[],"launch":null});
+        let association = f["associationId"].as_str().unwrap().to_owned();
+        let plan = json!({"version":1,"appId":app,"releaseId":release,"revisionId":revision,"platform":"windows/x86_64","selections":{},"unresolved":[],"files":{"renamed":f,"data/renamed":t},"directories":["data","empty"],"prerequisites":[],"launch":{"method":"NativePortableV1","associationId":association,"entryPointId":"fixture","revisionId":revision,"path":"renamed","workingDirectory":"","arguments":[]}});
         let plan_id = save(&lib, &profile, &plan);
         let first = lib.install_saved_plan(&profile, &plan_id, None).unwrap();
         assert_eq!(first.generations[0].state, "Ready");
         lib.verify_release_installation(&profile, &release).unwrap();
         assert!(first.generations[0].path.join("empty").is_dir());
+        let first_id = first.active_generation.unwrap();
+        let candidate = lib.launch_candidates(&profile, &release).unwrap().remove(0);
+        assert_eq!(candidate.status, "Ready");
+        assert_eq!(candidate.selection_revision(), first_id);
+        assert!(
+            lib.play_declared(&profile, &release, &association, "fixture", &revision)
+                .is_err()
+        );
+        lib.conn
+            .execute(
+                "UPDATE installation_generations SET process_start='windows:pending' WHERE id=?1",
+                [&first_id],
+            )
+            .unwrap();
+        assert_eq!(
+            lib.launch_candidates(&profile, &release).unwrap()[0].status,
+            "ProcessUnknown"
+        );
+        assert!(
+            lib.windows_active_processes()
+                .unwrap()
+                .iter()
+                .any(|(id, state)| id == &first_id
+                    && *state == crate::windows_process::ProcessState::Unknown)
+        );
+        assert!(
+            lib.play_declared(&profile, &release, &association, "fixture", &first_id)
+                .is_err()
+        );
+        lib.conn
+            .execute(
+                "UPDATE installation_generations SET process_start=NULL WHERE id=?1",
+                [&first_id],
+            )
+            .unwrap();
         let mut blocked = plan.clone();
         blocked["prerequisites"] = json!([{"id":"required","name":"Inert prerequisite","file":t,"path":"original","arguments":[],"optional":false,"evidence":"fixture","successExitCodes":[0]}]);
         let blocked_id = save(&lib, &profile, &blocked);
@@ -1390,10 +1450,9 @@ mod tests {
         assert_eq!(next.generations[0].state, "Ready");
         assert_eq!(next.generations[1].state, "PrerequisitesPending");
         lib.verify_release_installation(&profile, &release).unwrap();
-        assert!(
-            lib.launch_candidates(&profile, &release)
-                .unwrap()
-                .is_empty()
+        assert_eq!(
+            lib.launch_candidates(&profile, &release).unwrap()[0].status,
+            "Unavailable"
         );
     }
 }

@@ -297,11 +297,18 @@ impl Library {
 
     pub fn windows_active_processes(&self) -> Result<Vec<(String, ProcessState)>, LibraryError> {
         let mut statement = self.conn.prepare(
-            "SELECT id,process_id,process_start FROM installations WHERE process_id IS NOT NULL OR process_start IS NOT NULL ORDER BY id",
+            "SELECT id,process_id,process_start,0 FROM installations WHERE process_id IS NOT NULL OR process_start IS NOT NULL
+             UNION ALL SELECT id,process_id,process_start,1 FROM installation_generations WHERE process_id IS NOT NULL OR process_start IS NOT NULL ORDER BY id",
         )?;
         let rows = statement.query_map([], |row| {
             let time: Option<String> = row.get(2)?;
-            Ok((row.get(0)?, process_state(row.get(1)?, time.as_deref())))
+            let state = process_state(row.get(1)?, time.as_deref());
+            let state = if row.get::<_, bool>(3)? {
+                crate::windows_supervisor::occupancy(time.as_deref(), state)
+            } else {
+                state
+            };
+            Ok((row.get(0)?, state))
         })?;
         Ok(rows
             .collect::<Result<Vec<_>, _>>()?
@@ -318,8 +325,12 @@ impl Library {
         entry: &str,
         revision: &str,
     ) -> Result<WindowsChild, LibraryError> {
+        let _lifecycle = self.manifest_lifecycle_lock()?;
         // Windows install and recovery use this same lock to serialize filesystem/SQLite changes.
         let _lock = self.lock_download_slot()?;
+        if self.release_installation(profile, release)?.is_some() {
+            return self.play_generation(profile, release, association, entry, revision);
+        }
         let candidate = self
             .launch_candidates(profile, release)?
             .into_iter()
@@ -372,6 +383,7 @@ impl Library {
             &initial,
             start,
             prior.as_deref(),
+            false,
         );
         let (record, _job) = match record {
             Ok((record, job)) => (record, Some(job)),
@@ -382,6 +394,100 @@ impl Library {
             params![install.id, pid, record],
         )? != 1 {
             return Err(LibraryError::Invalid("could not persist launch identity".into()));
+        }
+        Ok(initial.resume()?)
+    }
+
+    pub(crate) fn windows_generation_occupancy(
+        &self,
+        id: &str,
+    ) -> Result<ProcessState, LibraryError> {
+        let (pid, record): (Option<i64>, Option<String>) = self.conn.query_row(
+            "SELECT process_id,process_start FROM installation_generations WHERE id=?1",
+            [id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if pid.is_none() && record.is_none() {
+            return Ok(ProcessState::Idle);
+        }
+        Ok(crate::windows_supervisor::occupancy(
+            record.as_deref(),
+            process_state(pid, record.as_deref()),
+        ))
+    }
+
+    fn play_generation(
+        &self,
+        profile: &ServerProfileId,
+        release: &str,
+        association: &str,
+        entry: &str,
+        revision: &str,
+    ) -> Result<WindowsChild, LibraryError> {
+        let g = self.active_release_generation(profile, release)?;
+        let candidate = self
+            .manifest_launch_candidate(profile, release)?
+            .ok_or_else(|| LibraryError::Invalid("saved plan has no launch".into()))?;
+        if candidate.association_id != association
+            || candidate.entry_id != entry
+            || candidate.selection_revision() != revision
+            || candidate.status != "Ready"
+            || self.windows_generation_occupancy(&g.id)? != ProcessState::Idle
+        {
+            return Err(LibraryError::Invalid(
+                "installed generation launch is not ready or changed".into(),
+            ));
+        }
+        let root = self.paths.content.join("apps").join(&g.id);
+        let (target, work) = crate::launch::windows_paths(
+            false,
+            candidate.target.as_deref().unwrap(),
+            candidate.working_directory.as_deref().unwrap(),
+        );
+        let pinned = windows_fs::bind_launch_target(&root, &g.id, &target, &work)?;
+        let prior: Option<String> = self.conn.query_row(
+            "SELECT process_start FROM installation_generations WHERE id=?1",
+            [&g.id],
+            |r| r.get(0),
+        )?;
+        if self.conn.execute(
+            "UPDATE installation_generations SET process_id=NULL,process_start='windows:pending' WHERE id=?1 AND state='Ready'",
+            [&g.id],
+        )? != 1 {
+            return Err(LibraryError::Invalid("generation is no longer ready".into()));
+        }
+        let initial = match create_suspended(
+            &root.join(&target),
+            &root.join(&work),
+            &candidate.arguments,
+        ) {
+            Ok(process) => process,
+            Err(error) => {
+                self.conn.execute("UPDATE installation_generations SET process_start=?2 WHERE id=?1 AND process_start='windows:pending'", params![g.id, prior])?;
+                return Err(error.into());
+            }
+        };
+        let reopened = windows_fs::bind_launch_target(&root, &g.id, &target, &work)?;
+        if !pinned.matches(&reopened)? {
+            return Err(LibraryError::Invalid(
+                "Windows generation launch path identity changed".into(),
+            ));
+        }
+        let (pid, start) = initial.identity()?;
+        // A new Standard generation requires a live supervisor before executing.
+        let (record, _job) = crate::windows_supervisor::prepare(
+            &self.paths,
+            &g.id,
+            &initial,
+            start,
+            prior.as_deref(),
+            true,
+        )?;
+        if self.conn.execute(
+            "UPDATE installation_generations SET process_id=?2,process_start=?3 WHERE id=?1 AND process_start='windows:pending'",
+            params![g.id, pid, record],
+        )? != 1 {
+            return Err(LibraryError::Invalid("could not persist generation launch identity".into()));
         }
         Ok(initial.resume()?)
     }
