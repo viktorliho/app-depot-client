@@ -400,7 +400,25 @@ pub(crate) fn publish_verified_copy(
     let name = name_utf16(name)?;
     let chain = directory_chain(parent, false)?;
     let target = chain.last().unwrap();
-    publish_copy_at(from, target, &name, expected_size, true, verify)
+    publish_copy_at(from, target, &name, expected_size, true, |source, out| {
+        copy_then_verify(source, out, expected_size, verify)
+    })
+}
+
+fn copy_then_verify(
+    source: File,
+    out: &mut File,
+    size: u64,
+    verify: impl FnOnce(&File) -> io::Result<()>,
+) -> io::Result<()> {
+    if io::copy(&mut source.take(size), out)? != size {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "publication source shortened",
+        ));
+    }
+    out.seek(SeekFrom::Start(0))?;
+    verify(out)
 }
 
 fn publish_copy_at(
@@ -409,7 +427,7 @@ fn publish_copy_at(
     name: &[u16],
     expected_size: u64,
     readonly: bool,
-    verify: impl FnOnce(&File) -> io::Result<()>,
+    copy: impl FnOnce(File, &mut File) -> io::Result<()>,
 ) -> io::Result<()> {
     require_case_insensitive(target)?;
     let source = open_regular(from, false, false, FILE_SHARE_READ)?;
@@ -432,14 +450,7 @@ fn publish_copy_at(
         0,
     )?;
     let result = (|| {
-        if io::copy(&mut source.take(expected_size), &mut temporary)? != expected_size {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "publication source shortened",
-            ));
-        }
-        temporary.seek(SeekFrom::Start(0))?;
-        verify(&temporary)?;
+        copy(source, &mut temporary)?;
         if readonly {
             let mut permissions = temporary.metadata()?.permissions();
             permissions.set_readonly(true);
@@ -469,7 +480,7 @@ pub(crate) fn publish_file_install(
             &name_utf16(OsStr::new("payload"))?,
             size,
             false,
-            verify,
+            |source, out| copy_then_verify(source, out, size, verify),
         )
     })
 }
@@ -1173,13 +1184,18 @@ fn write_tree(
             }
             InventoryEntry::File { size, sha256, .. } => {
                 let path = object(sha256)?;
-                copy_workspace_file(
-                    &path,
-                    target,
-                    OsStr::new(leaf),
-                    *size,
-                    verify_member.then_some(sha256.as_str()),
-                )?;
+                if verify_member {
+                    publish_copy_at(
+                        &path,
+                        target,
+                        &name_utf16(OsStr::new(leaf))?,
+                        *size,
+                        false,
+                        |source, out| crate::transfer::copy_verified(source, out, *size, sha256),
+                    )?;
+                } else {
+                    copy_workspace_file(&path, target, OsStr::new(leaf), *size)?;
+                }
             }
         }
         progress(i + 1, entries.len());
@@ -1193,13 +1209,7 @@ fn write_tree(
 }
 
 // The stage is exclusive. Private attempts verify the complete published tree.
-fn copy_workspace_file(
-    path: &Path,
-    target: &File,
-    leaf: &OsStr,
-    size: u64,
-    digest: Option<&str>,
-) -> io::Result<()> {
+fn copy_workspace_file(path: &Path, target: &File, leaf: &OsStr, size: u64) -> io::Result<()> {
     let source = open_regular(path, false, false, FILE_SHARE_READ)?;
     if volume(&source)? != volume(target)? || source.metadata()?.len() != size {
         return Err(invalid("Tree source volume or size mismatch"));
@@ -1212,9 +1222,7 @@ fn copy_workspace_file(
         FILE_NON_DIRECTORY_FILE,
         0,
     )?;
-    if let Some(digest) = digest {
-        crate::transfer::copy_verified(source, &mut out, size, digest)?;
-    } else if io::copy(&mut source.take(size), &mut out)? != size {
+    if io::copy(&mut source.take(size), &mut out)? != size {
         return Err(invalid("Tree source shortened"));
     }
     out.sync_all()
