@@ -1954,6 +1954,14 @@ mod tests {
                     )
                     .unwrap();
                 }
+                #[cfg(windows)]
+                {
+                    use crate::prerequisite::NativeExecutor;
+                    assert_eq!(
+                        NativeExecutor.execute(request),
+                        PrerequisiteOutcome::Exited(0)
+                    );
+                }
                 self.roots.push(request.source.root.clone());
                 self.owners.push(request.source.owner_id.clone());
                 PrerequisiteOutcome::Exited(0)
@@ -1977,21 +1985,27 @@ mod tests {
             )
             .unwrap();
         lib.conn.execute("INSERT INTO releases(profile_id,id,app_id,metadata_json,last_seen) VALUES (?1,?2,?3,'{}',0)",params![profile.0,release,app]).unwrap();
+        #[cfg(windows)]
+        let image = fs::read(std::env::current_exe().unwrap()).unwrap();
+        #[cfg(not(windows))]
+        let image = vec![42; size];
+        #[cfg(windows)]
+        let _ = size;
         let tree = source_layout(
             &lib,
             &profile,
             &release,
-            &vec![42; size],
-            Some("setup/install"),
+            &image,
+            Some("setup/native-prerequisite-fixture.exe"),
             None,
         );
         let steps: Vec<_> = ["a","b"].into_iter().map(|id| {
-            json!({"id":id,"name":id,"file":tree,"path":"setup/install","arguments":[],"optional":false,"evidence":"fixture","successExitCodes":[0]})
+            json!({"id":id,"name":id,"file":tree,"path":"setup/native-prerequisite-fixture.exe","arguments":["--exact","release_install::tests::windows_prerequisite_fixture_child"],"optional":false,"evidence":"fixture","successExitCodes":[0]})
         }).collect();
-        let mut plan = json!({"version":1,"appId":app,"releaseId":release,"revisionId":revision,"platform":crate::launch::host().unwrap(),"selections":{},"unresolved":[],"files":{"setup/install":tree},"directories":["setup"],"prerequisites":steps,"launch":null});
+        let mut plan = json!({"version":1,"appId":app,"releaseId":release,"revisionId":revision,"platform":crate::launch::host().unwrap(),"selections":{},"unresolved":[],"files":{"setup/native-prerequisite-fixture.exe":tree},"directories":["setup"],"prerequisites":steps,"launch":null});
         if prefix == Some("media/") {
             plan["directories"] = json!(["media", "media/setup"]);
-            plan["files"] = json!({"media/setup/install":tree,"app":source(&lib,&profile,&release,b"app",false)});
+            plan["files"] = json!({"media/setup/native-prerequisite-fixture.exe":tree,"app":source(&lib,&profile,&release,b"app",false)});
         } else if prefix.is_none() {
             plan["directories"] = json!([]);
             plan["files"] = json!({"app":source(&lib,&profile,&release,b"app",false)});
@@ -2030,6 +2044,19 @@ mod tests {
             assert_ne!(recorder.roots[0], recorder.roots[1]);
             assert_eq!(recorder.owners[0] == recorder.owners[1], !modify);
             assert!(recorder.roots.iter().all(|root| !root.exists()));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_prerequisite_fixture_child() {
+        let exe = std::env::current_exe().unwrap();
+        if exe.file_name().unwrap() == "native-prerequisite-fixture.exe" {
+            assert_eq!(
+                std::fs::canonicalize(".").unwrap(),
+                std::fs::canonicalize(exe.parent().unwrap()).unwrap()
+            );
+            assert!(std::path::Path::new("native-prerequisite-fixture.exe").is_file());
         }
     }
 
