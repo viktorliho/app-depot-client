@@ -1,5 +1,7 @@
 # App Depot Desktop for Windows x64
 
+The owner accepted Windows Desktop v0.1.4 as part of the first unified stable Linux and Windows release. The Windows MVP is complete and in maintenance mode. Deferred Windows work includes Repair, physical CAS garbage collection, extended Windows 10 lifecycle validation, Windows Server 2022 compatibility investigation and automatic Desktop update rollback. These are outside the accepted MVP scope.
+
 ## Install and connect
 
 Setup accepts Windows 10 version 2004 (build 19041) or later and Windows 11 on x64. The owner confirmed RC2 installs and starts from the Start menu on a physical Windows 10 PC, displays the Guest catalog and artwork and preserves its profile across restart. File/Tree operations, Play and recovery on Windows 10 still require separate validation on an isolated test system.
@@ -33,7 +35,7 @@ Client CI checks the version floor and x64 configuration in the actual Inno Setu
 
 When a dedicated disposable Windows 10 x64 workstation runner is available, give it the `app-depot-windows-10` label and manually dispatch **Client CI** on `main` with `windows_10_smoke` enabled. That job consumes the exact setup artifact produced by the workflow, verifies the OS and exercises the same install, reinstall and uninstall smoke checks. It needs no build tools on the test machine. Keep personal PCs off the runner pool.
 
-Historical Windows-only prereleases may retain their tags. Stable Windows packages now ship with Linux under one annotated Desktop `vX.Y.Z` tag. The release workflow passes `-Stable` to the build script so the installer and installed executable report the shared product version. The workflow requires both platforms before making the release public.
+Historical Windows-only prereleases may retain their tags. Stable Windows packages now ship with Linux under one annotated Desktop `vX.Y.Z` tag. The release workflow passes `-Stable` to the build script so the installer and installed executable report the shared product version. For explicitly assigned Desktop release tasks, the workflow publishes only after both platforms and every required draft asset pass verification. Routine main commits run CI and produce candidates. See [Distribution](DISTRIBUTION.md).
 
 ## Desktop release channels
 

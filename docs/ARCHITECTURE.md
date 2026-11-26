@@ -85,7 +85,7 @@ Catalog grid/list share the same filtered App set. The details header offers dir
 
 Desktop is one cross-platform product. Every new stable Desktop release publishes all supported platforms together from one annotated `vX.Y.Z` tag, one immutable main commit and one workspace version. Linux x86-64 AppImage and Windows x64 Inno Setup are required. macOS joins the release set when officially supported. GitHub Latest is reserved for the complete stable Desktop release. SteamOS Decky publishes independently under `decky-vX.Y.Z`.
 
-The release workflow builds and verifies both platform packages before its publish job can create or finalize a draft. The dedicated Desktop updater queries the official GitHub release without App Depot Server credentials. Both platforms require the complete stable release and verify their exact platform asset and checksum. The Linux helper preserves atomic exchange and recovery for user-owned AppImages. Windows verifies installer downloads. In-app execution and relaunch remain pending. See [DISTRIBUTION.md](DISTRIBUTION.md).
+The release workflow builds and verifies both platform packages before its publish job creates, verifies and publishes a complete draft using GitHub Actions permissions. An explicitly assigned Desktop release authorizes that lifecycle. Routine main commits run cross-platform CI without publishing releases. The dedicated Desktop updater queries the official GitHub release independently of App Depot Server credentials. Both platforms require the complete stable release and verify their exact platform asset and checksum. The Linux helper preserves atomic exchange and recovery for user-owned AppImages. Windows verifies and hands off Setup, closes Desktop safely and relaunches after successful installation. See [DISTRIBUTION.md](DISTRIBUTION.md).
 
 ### ADR-016. SteamOS Decky and the four-platform strategy (M3.0)
 
@@ -93,7 +93,7 @@ The release workflow builds and verifies both platform packages before its publi
 | --- | --- |
 | Linux Desktop | Maintain the existing AppImage and egui catalog, library and application management. |
 | SteamOS Decky | Functional MVP in maintenance mode. Steam Library remains the catalog and Play surface, with a small Decky control surface and a Rust wrapper. |
-| Windows Desktop | Next major platform. Reuse the Rust core and the existing egui desktop frontend and visual design with Windows adapters. |
+| Windows Desktop | Functional MVP accepted by the owner at v0.1.4 and in maintenance mode. Shares Rust core and egui frontend with Linux, using Windows platform adapters. |
 | macOS Desktop | Subsequent platform. Reuse the Rust core and broadly the same desktop UI, with platform adapters. |
 
 All clients use the authoritative App Depot Server protocol and declarations. The core remains independent of Steam and Decky.

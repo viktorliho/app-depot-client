@@ -37,10 +37,15 @@ done
   done
 )
 
-if test "$RESUME_DRAFT" = true; then
+if gh release view "$tag" --json tagName >/dev/null 2>&1; then
+  if test "$RESUME_DRAFT" != true && test "${GITHUB_RUN_ATTEMPT:-1}" -le 1; then
+    echo "Release $tag already exists. Inspect it before requesting draft recovery." >&2
+    exit 1
+  fi
   gh release view "$tag" --json isDraft,isPrerelease,tagName \
     --jq '.isDraft and (.isPrerelease | not) and (.tagName == "'"$tag"'")' | grep -Fx true
 else
+  test "$RESUME_DRAFT" != true
   gh release create "$tag" --verify-tag --draft --latest=false \
     --title "App Depot Desktop $tag" --notes-file "docs/release-notes/$tag.md"
 fi
@@ -75,4 +80,8 @@ test "$actual_names" = "$expected_names"
 verify_tag
 verify_latest_version
 gh release view "$tag" --json isDraft,isPrerelease --jq '.isDraft and (.isPrerelease | not)' | grep -Fx true
-echo "Verified complete Desktop draft $tag at $APP_DEPOT_SOURCE_REVISION. Owner publication is a separate step."
+gh release edit "$tag" --draft=false --prerelease=false --latest=true
+test "$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq '.tag_name')" = "$tag"
+gh release view "$tag" --json isDraft,isPrerelease,tagName \
+  --jq '(.isDraft | not) and (.isPrerelease | not) and (.tagName == "'"$tag"'")' | grep -Fx true
+echo "Published verified complete Desktop release $tag at $APP_DEPOT_SOURCE_REVISION."

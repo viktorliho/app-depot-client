@@ -9,6 +9,7 @@ cd "$fixture"
 export PATH="$fixture/bin:$PATH"
 export RELEASE_TAG=v0.1.4 RELEASE_TAG_OBJECT=annotated APP_DEPOT_SOURCE_REVISION=revision
 export GITHUB_REPOSITORY=example/fixture RESUME_DRAFT=false
+export GITHUB_RUN_ATTEMPT=1
 
 cat >bin/git <<'EOF'
 #!/usr/bin/env bash
@@ -23,7 +24,9 @@ cat >bin/gh <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 if test "$1" = api; then
-  if test -e published; then echo v0.1.4; else echo v0.1.3; fi
+  if test -e newer-latest; then echo v0.1.5
+  elif test -e published; then echo v0.1.4
+  else echo v0.1.3; fi
   exit
 fi
 test "$1" = release
@@ -32,7 +35,11 @@ case "$2" in
   create) test ! -e created; touch created ;;
   upload) test ! -e "draft/$(basename "$4")"; cp "$4" draft/ ;;
   download) test "$4" = --pattern; test "$6" = --dir; cp "draft/$5" "$7/" ;;
-  edit) touch published; exit 1 ;;
+  edit)
+    test "$*" = 'release edit v0.1.4 --draft=false --prerelease=false --latest=true'
+    test ! -e published
+    test "$(find draft -type f | wc -l)" -eq 5
+    touch published ;;
   view)
     test -e created
     query="${!#}"
@@ -40,8 +47,13 @@ case "$2" in
       '.assets[].name') find draft -type f -printf '%f\n' ;;
       *'.digest')
         name="$(printf '%s\n' "$query" | cut -d '"' -f2)"
+        if test -e wrong-digest && test "$name" = SHA256SUMS; then
+          echo 'sha256:wrong'; exit
+        fi
         printf 'sha256:%s\n' "$(sha256sum "draft/$name" | cut -d ' ' -f1)" ;;
-      *) echo true ;;
+      *'(.isDraft | not)'*) test -e published; echo true ;;
+      *'.isDraft'*) test ! -e published; echo true ;;
+      *) echo v0.1.4 ;;
     esac ;;
   *) exit 2 ;;
 esac
@@ -61,6 +73,13 @@ fi
 test ! -e created
 printf 'Windows fixture' > "assets/$setup"
 (cd assets && sha256sum "$setup" > SHA256SUMS)
+touch newer-latest
+if bash "$script" assets; then
+  echo 'Publication accepted an older release' >&2
+  exit 1
+fi
+test ! -e created
+mv newer-latest rejected-newer-latest
 
 # Resume a draft whose one existing upload matches the artifacts.
 touch created
@@ -73,17 +92,48 @@ fi
 test ! -e published
 test "$(find draft -type f | wc -l)" -eq 1
 cp "assets/$image" "draft/$image"
-bash "$script" assets
+touch draft/unknown
+if bash "$script" assets; then
+  echo 'Publication accepted an unexpected draft asset' >&2
+  exit 1
+fi
 test ! -e published
+mv draft/unknown rejected-unknown
+touch wrong-digest
+if bash "$script" assets; then
+  echo 'Publication accepted incorrect GitHub digest metadata' >&2
+  exit 1
+fi
+test ! -e published
+mv wrong-digest rejected-digest
+bash "$script" assets
+test -e published
 test "$(find draft -type f | wc -l)" -eq 5
+if bash "$script" assets; then
+  echo 'Publication accepted an already-published release' >&2
+  exit 1
+fi
 
 # A first run creates a new draft only after the same complete asset checks.
 mv draft resumed-draft
 mv created resumed-created
+mv published resumed-published
 mkdir draft
 export RESUME_DRAFT=false
 bash "$script" assets
 test -e created
-test ! -e published
+test -e published
 test "$(find draft -type f | wc -l)" -eq 5
-echo 'Desktop release draft fixtures passed'
+
+# Retrying only the failed publication job retains its original build artifacts.
+mv draft first-draft
+mv created first-created
+mv published first-published
+mkdir draft
+touch created
+cp "assets/$image" "draft/$image"
+export GITHUB_RUN_ATTEMPT=2
+bash "$script" assets
+test -e published
+test "$(find draft -type f | wc -l)" -eq 5
+echo 'Desktop release publication and draft retry fixtures passed'
