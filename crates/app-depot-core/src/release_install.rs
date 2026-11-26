@@ -1450,9 +1450,8 @@ mod tests {
         assert_eq!(next.generations[0].state, "Ready");
         assert_eq!(next.generations[1].state, "PrerequisitesPending");
         lib.verify_release_installation(&profile, &release).unwrap();
-        assert_eq!(
-            lib.launch_candidates(&profile, &release).unwrap()[0].status,
-            "Unavailable"
-        );
+        let candidate = lib.launch_candidates(&profile, &release).unwrap().remove(0);
+        assert_eq!(candidate.status, "Ready");
+        assert_eq!(candidate.selection_revision(), first_id);
     }
 }

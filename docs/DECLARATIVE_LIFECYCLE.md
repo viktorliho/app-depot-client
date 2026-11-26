@@ -51,5 +51,8 @@ silently retry an attempted round. `install process GENERATION_ID CONSENT_ID
 execution is unavailable and cannot produce success, while an optional-only
 plan can be explicitly declined and activated without launching anything.
 The shared executor interface is available for the native Windows integration.
-No launch selection means no Standard launch candidate. Windows Standard
-launch and removal await generation-specific integration.
+No launch selection means no Standard launch candidate. Windows projects the
+active generation and binds its declared installed target to the existing NTFS
+launch checks. Play records generation-specific supervision before resuming the
+process. Running or uncertain occupancy blocks another Play of that generation.
+Windows Standard removal remains unavailable pending a durable generation removal journal.

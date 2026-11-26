@@ -160,7 +160,12 @@ download references continue to protect CAS through normal collection. No data
 outside the managed generation directories is removed.
 
 Common installation acquisition, generation state, publication and verification
-coordination uses the Windows adapter as well as Linux. The Windows Standard CLI remains gated, including uninstall and Play, until the generation-specific ownership and
-supervision integration is verified. Windows may leave unpublished staging for
+coordination uses the Windows adapter as well as Linux. Windows Play uses the
+active generation UUID as its selection guard and records Job Object supervision
+in the generation row before resuming the pinned executable. The watcher
+retains occupancy after the Desktop closes and records completion after observed
+job descendants exit. Windows Standard installation commands and removal remain
+gated; the existing Windows removal journal references legacy installation IDs.
+Windows may leave unpublished staging for
 manual inspection, as in its existing Tree installer; the Linux retry cleanup
 policy does not apply to those directories.
