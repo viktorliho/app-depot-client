@@ -122,11 +122,49 @@ fn nt_result(status: i32) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
-fn trace_sharing_violation(error: &io::Error, operation: std::fmt::Arguments<'_>) {
-    if error.raw_os_error() == Some(windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION as i32)
-    {
-        eprintln!("Windows filesystem sharing violation: {operation}");
+// Resolve handle names only on the error path. Operations themselves stay handle-relative.
+fn diagnostic_path(file: &File) -> std::path::PathBuf {
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::Storage::FileSystem::GetFinalPathNameByHandleW;
+    let mut buffer = vec![0u16; 32768];
+    // SAFETY: the handle is live and buffer has the advertised capacity.
+    let length = unsafe {
+        GetFinalPathNameByHandleW(
+            file.as_raw_handle(),
+            buffer.as_mut_ptr(),
+            buffer.len() as u32,
+            0,
+        )
+    } as usize;
+    if length == 0 || length >= buffer.len() {
+        return "<unresolved handle>".into();
+    }
+    std::ffi::OsString::from_wide(&buffer[..length]).into()
+}
+
+// Retry only the failed kernel operation, keeping the original parent/source pinned.
+pub(crate) fn retry_sharing<T>(
+    mut operation: impl FnMut() -> io::Result<T>,
+    context: impl FnOnce() -> String,
+) -> io::Result<T> {
+    let mut delays = [25, 75, 200, 500, 1000].into_iter();
+    loop {
+        match operation() {
+            Err(error)
+                if error.raw_os_error()
+                    == Some(windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION as i32) =>
+            {
+                if let Some(ms) = delays.next() {
+                    std::thread::sleep(std::time::Duration::from_millis(ms));
+                } else {
+                    return Err(io::Error::new(
+                        error.kind(),
+                        format!("{}: {error}", context()),
+                    ));
+                }
+            }
+            result => return result,
+        }
     }
 }
 
@@ -138,6 +176,7 @@ fn open_child(
     options: u32,
     share: u32,
 ) -> io::Result<File> {
+    let component = name;
     let mut name = name_utf16(name)?;
     let bytes = (name.len() * size_of::<u16>()) as u16;
     let name = UNICODE_STRING {
@@ -156,32 +195,31 @@ fn open_child(
     let mut status_block = IO_STATUS_BLOCK::default();
     // SAFETY: the name is one validated relative component. All pointers and the parent handle
     // stay live for this synchronous call. A successful call transfers the returned handle.
-    let status = unsafe {
-        NtCreateFile(
-            &mut raw,
-            access,
-            &attributes,
-            &mut status_block,
-            null(),
-            FILE_ATTRIBUTE_NORMAL,
-            share,
-            disposition,
-            options | FILE_SYNCHRONOUS_IO_NONALERT,
-            null(),
-            0,
-        )
-    };
-    let result = nt_result(status);
-    #[cfg(test)]
-    if let Err(error) = &result {
-        trace_sharing_violation(
-            error,
-            format_args!(
-                "NtCreateFile status={status:#010x} access={access:#010x} share={share:#x} disposition={disposition:#x} options={options:#x}"
-            ),
-        );
-    }
-    result?;
+    retry_sharing(
+        || {
+            nt_result(unsafe {
+                NtCreateFile(
+                    &mut raw,
+                    access,
+                    &attributes,
+                    &mut status_block,
+                    null(),
+                    FILE_ATTRIBUTE_NORMAL,
+                    share,
+                    disposition,
+                    options | FILE_SYNCHRONOUS_IO_NONALERT,
+                    null(),
+                    0,
+                )
+            })
+        },
+        || {
+            format!(
+                "NtCreateFile {} access={access:#x} share={share:#x} disposition={disposition:#x}",
+                diagnostic_path(parent).join(component).display()
+            )
+        },
+    )?;
     // SAFETY: NtCreateFile succeeded and returned an owned synchronous file handle.
     Ok(unsafe { File::from_raw_handle(raw) })
 }
@@ -250,11 +288,16 @@ fn directory_chain(path: &Path, create: bool) -> io::Result<Vec<File>> {
             _ => Err(invalid("unsafe path component")),
         })
         .collect::<io::Result<Vec<_>>>()?;
-    let root = OpenOptions::new()
-        .access_mode(DIRECTORY_ACCESS)
-        .share_mode(SHARE)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
-        .open(root)?;
+    let root = retry_sharing(
+        || {
+            OpenOptions::new()
+                .access_mode(DIRECTORY_ACCESS)
+                .share_mode(SHARE)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+                .open(&root)
+        },
+        || format!("CreateFileW {root} access={DIRECTORY_ACCESS:#x} share={SHARE:#x}"),
+    )?;
     check_directory(&root)?;
     let mut chain = vec![root];
     for name in names {
@@ -336,18 +379,13 @@ pub(crate) fn sync_directory(path: &Path) -> io::Result<()> {
         return Err(invalid("directory sync requires a named directory"));
     };
     let chain = directory_chain(parent, false)?;
-    let result = directory_child(
+    let directory = directory_child(
         chain.last().unwrap(),
         name,
         false,
         DIRECTORY_ACCESS | GENERIC_WRITE,
-    )?
-    .sync_all();
-    #[cfg(test)]
-    if let Err(error) = &result {
-        trace_sharing_violation(error, format_args!("parent directory flush"));
-    }
-    result
+    )?;
+    sync_handle(&directory)
 }
 
 #[repr(C)]
@@ -456,11 +494,16 @@ fn publish_copy_at(
             permissions.set_readonly(true);
             temporary.set_permissions(permissions)?;
         }
-        temporary.sync_all()?;
+        sync_handle(&temporary)?;
         rename_noreplace(&temporary, target, name)
     })();
-    if result.is_err() {
-        delete_open_file(temporary)?;
+    if let Err(original) = &result {
+        delete_open_file(temporary).map_err(|cleanup| {
+            io::Error::new(
+                original.kind(),
+                format!("{original}; deleting temporary {temporary_name}: {cleanup}"),
+            )
+        })?;
     }
     result
 }
@@ -615,9 +658,9 @@ fn publish_install(
         0,
     )?;
     marker.write_all(id.as_bytes())?;
-    marker.sync_all()?;
+    sync_handle(&marker)?;
     drop(marker);
-    stage.sync_all()?;
+    sync_handle(&stage)?;
     #[cfg(test)]
     pause_tree_test("before-tree-install-publication");
     rename_noreplace(&stage, parent, &name_utf16(OsStr::new(id))?)?;
@@ -1057,8 +1100,8 @@ pub(crate) fn create_prerequisite_workspace(path: &Path, attempt: &str) -> io::R
         0,
     )?;
     marker.write_all(attempt.as_bytes())?;
-    marker.sync_all()?;
-    root.sync_all()?;
+    sync_handle(&marker)?;
+    sync_handle(&root)?;
     sync_directory(parent)
 }
 
@@ -1157,7 +1200,7 @@ fn write_tree(
     for (i, entry) in ordered.into_iter().enumerate() {
         let (parent, leaf) = entry.path().rsplit_once('/').unwrap_or(("", entry.path()));
         if parent != current_parent {
-            ancestors.last().unwrap_or(stage).sync_all()?;
+            sync_handle(ancestors.last().unwrap_or(stage))?;
             ancestors.clear();
             for part in parent.split('/').filter(|part| !part.is_empty()) {
                 let dir = directory_child(
@@ -1174,13 +1217,13 @@ fn write_tree(
         let target = ancestors.last().unwrap_or(stage);
         match entry {
             InventoryEntry::Directory { .. } => {
-                directory_child(
+                let directory = directory_child(
                     target,
                     OsStr::new(leaf),
                     true,
                     DIRECTORY_ACCESS | GENERIC_WRITE,
-                )?
-                .sync_all()?;
+                )?;
+                sync_handle(&directory)?;
             }
             InventoryEntry::File { size, sha256, .. } => {
                 let path = object(sha256)?;
@@ -1203,9 +1246,9 @@ fn write_tree(
         pause_tree_test("partial-tree-materialization");
     }
     if let Some(dir) = ancestors.last() {
-        dir.sync_all()?;
+        sync_handle(dir)?;
     }
-    stage.sync_all()
+    sync_handle(stage)
 }
 
 // The stage is exclusive. Private attempts verify the complete published tree.
@@ -1225,7 +1268,7 @@ fn copy_workspace_file(path: &Path, target: &File, leaf: &OsStr, size: u64) -> i
     if io::copy(&mut source.take(size), &mut out)? != size {
         return Err(invalid("Tree source shortened"));
     }
-    out.sync_all()
+    sync_handle(&out)
 }
 
 /// The open directory chain pins each enumerated path. Entries are reopened relative to
@@ -1256,7 +1299,10 @@ fn verify_tree_inner(
         report_remaining: &mut dyn FnMut(usize),
     ) -> io::Result<()> {
         require_case_insensitive(dir)?;
-        for child in std::fs::read_dir(path)? {
+        for child in retry_sharing(
+            || std::fs::read_dir(path),
+            || format!("read_dir {}", path.display()),
+        )? {
             let child = child?;
             let name = child.file_name();
             let component = name
@@ -1411,6 +1457,13 @@ fn volume(file: &File) -> io::Result<u64> {
     Ok(file_identity(file)?.0)
 }
 
+fn sync_handle(file: &File) -> io::Result<()> {
+    retry_sharing(
+        || file.sync_all(),
+        || format!("FlushFileBuffers {}", diagnostic_path(file).display()),
+    )
+}
+
 fn delete_open_file(file: File) -> io::Result<()> {
     let mut status_block = IO_STATUS_BLOCK::default();
     let info = FILE_DISPOSITION_INFORMATION_EX {
@@ -1420,16 +1473,25 @@ fn delete_open_file(file: File) -> io::Result<()> {
     };
     // SAFETY: the exclusive creation handle grants DELETE on this exact file. This call
     // keeps the handle and disposition buffer valid until synchronous completion.
-    let status = unsafe {
-        NtSetInformationFile(
-            file.as_raw_handle(),
-            &mut status_block,
-            (&raw const info).cast(),
-            size_of::<FILE_DISPOSITION_INFORMATION_EX>() as u32,
-            FileDispositionInformationEx,
-        )
-    };
-    nt_result(status)
+    retry_sharing(
+        || {
+            nt_result(unsafe {
+                NtSetInformationFile(
+                    file.as_raw_handle(),
+                    &mut status_block,
+                    (&raw const info).cast(),
+                    size_of::<FILE_DISPOSITION_INFORMATION_EX>() as u32,
+                    FileDispositionInformationEx,
+                )
+            })
+        },
+        || {
+            format!(
+                "NtSetInformationFile(FileDispositionInformationEx) {}",
+                diagnostic_path(&file).display()
+            )
+        },
+    )
 }
 
 fn rename_noreplace(source: &File, target: &File, name: &[u16]) -> io::Result<()> {
@@ -1443,26 +1505,28 @@ fn rename_noreplace(source: &File, target: &File, name: &[u16]) -> io::Result<()
     let mut status_block = IO_STATUS_BLOCK::default();
     // SAFETY: fixed C layout checked against the SDK binding. Both endpoint handles and the
     // complete name buffer remain valid for this synchronous operation. Flags forbid replacement.
-    let status = unsafe {
-        NtSetInformationFile(
-            source.as_raw_handle(),
-            &mut status_block,
-            (&raw const info).cast(),
-            size_of::<RenameInformation>() as u32,
-            FileRenameInformation,
-        )
-    };
-    let result = nt_result(status);
-    #[cfg(test)]
-    if let Err(error) = &result {
-        trace_sharing_violation(
-            error,
-            format_args!(
-                "NtSetInformationFile(FileRenameInformation) status={status:#010x} flags=0"
-            ),
-        );
-    }
-    result
+    retry_sharing(
+        || {
+            nt_result(unsafe {
+                NtSetInformationFile(
+                    source.as_raw_handle(),
+                    &mut status_block,
+                    (&raw const info).cast(),
+                    size_of::<RenameInformation>() as u32,
+                    FileRenameInformation,
+                )
+            })
+        },
+        || {
+            format!(
+                "NtSetInformationFile(FileRenameInformation) {} -> {}",
+                diagnostic_path(source).display(),
+                diagnostic_path(target)
+                    .join(String::from_utf16_lossy(name))
+                    .display()
+            )
+        },
+    )
 }
 
 #[cfg(test)]
@@ -1657,6 +1721,28 @@ mod tests {
         assert_eq!(fs::read(stage.join("payload/a-good")).unwrap(), b"good");
         assert!(!stage.join("payload/z-bad").exists());
         assert!(!stage.join(".app-depot-installation-id").exists());
+    }
+
+    #[test]
+    fn source_contention_retries_without_recopying_and_reports_persistent_path() {
+        let fixture = tempfile::tempdir().unwrap();
+        let source = fixture.path().join("object");
+        let target = fixture.path().join("published");
+        fs::write(&source, b"data").unwrap();
+        let writer = OpenOptions::new().write(true).open(&source).unwrap();
+        let error =
+            publish_verified_copy(&source, &target, 4, |_| panic!("source locked")).unwrap_err();
+        for expected in ["NtCreateFile", "object", "os error 32"] {
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+        assert!(!target.exists());
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            drop(writer);
+        });
+        publish_verified_copy(&source, &target, 4, |_| Ok(())).unwrap();
+        release.join().unwrap();
+        assert_eq!(fs::read(target).unwrap(), b"data");
     }
 
     #[test]

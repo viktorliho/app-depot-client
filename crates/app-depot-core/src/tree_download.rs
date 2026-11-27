@@ -1822,7 +1822,7 @@ mod tests {
                 .unwrap();
             assert!(matches!(
                 library.check_windows_removal(&pending.id),
-                Err(LibraryError::Io(error)) if error.raw_os_error() == Some(32)
+                Err(LibraryError::Io(error)) if error.to_string().contains("NtCreateFile") && error.to_string().contains("os error 32")
             ));
             assert!(payload.join("empty/nested").is_dir());
             drop(locked);

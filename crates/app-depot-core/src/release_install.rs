@@ -288,7 +288,14 @@ mod coordinator {
                 }
                 let _download = self.lock_download_slot()?;
                 let target = self.paths.content.join("apps").join(&id);
-                match fs::symlink_metadata(&target) {
+                #[cfg(windows)]
+                let metadata = crate::windows_fs::retry_sharing(
+                    || fs::symlink_metadata(&target),
+                    || format!("symlink_metadata {}", target.display()),
+                );
+                #[cfg(not(windows))]
+                let metadata = fs::symlink_metadata(&target);
+                match metadata {
                     Ok(_) => {
                         verify_generation(&target, &id, &layout)?;
                         crate::transfer::sync_dir(&self.paths.content.join("apps"))?;

@@ -182,4 +182,8 @@ operation refuses removal and preserves it. Interrupted cleanup retains its
 journal and source references until final SQLite deletion. Native prerequisite
 execution remains unavailable in the CLI. Windows may leave unpublished staging for
 manual inspection, as in its existing Tree installer; the Linux retry cleanup
-policy does not apply to those directories.
+policy does not apply to those directories. Windows retries a sharing violation
+on a pinned open, flush or no-replace rename with bounded backoff. A rename
+retry retains the checked temporary handle and its bytes. Persistent contention
+reports the operation and path in the generation error. A completed download
+remains eligible for offline reuse.
