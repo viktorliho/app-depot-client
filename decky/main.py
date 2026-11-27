@@ -11,6 +11,7 @@ from pathlib import Path
 import stat
 import struct
 import tempfile
+import time
 from uuid import UUID
 
 
@@ -213,7 +214,7 @@ class Plugin:
             "set_runtime": self.set_runtime, "status": self.status, "discover": self.discover, "test": self.test,
             "configure": self.configure, "catalog": self.catalog, "artwork": self.artwork,
             "shortcut": self.shortcut, "acknowledge": self.acknowledge, "binding": self.binding,
-            "installed": self.installed, "uninstall": self.uninstall,
+            "launch_issue": self.launch_issue, "installed": self.installed, "uninstall": self.uninstall,
             "grid_states": self.grid_states, "finish_grids": self.finish_grids,
         }
         if not isinstance(method, str) or method not in operations:
@@ -282,6 +283,21 @@ class Plugin:
 
     async def catalog(self, profile, refresh):
         return await self._rust("decky", "sync" if refresh else "catalog", identity(profile))
+
+    async def launch_issue(self):
+        base = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state")
+        path = base / "app-depot-decky/last-launch.json"
+        try:
+            with path.open("rb") as stream:
+                metadata = os.fstat(stream.fileno())
+                if not stat.S_ISREG(metadata.st_mode) or time.time() - metadata.st_mtime > 90:
+                    return None
+                record = json.loads(stream.read(512))
+        except (OSError, ValueError):
+            return None
+        if isinstance(record, dict) and record.get("stage") == "steam_game_display_unavailable":
+            return str(metadata.st_mtime_ns)
+        return None
 
     async def installed(self):
         return await self._rust("decky", "installed")

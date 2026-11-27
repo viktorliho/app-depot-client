@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { callable, definePlugin } from '@decky/api';
+import { callable, definePlugin, toaster } from '@decky/api';
 import { ButtonItem, ConfirmModal, PanelSection, PanelSectionRow, showModal, Spinner, TextField, ToggleField } from '@decky/ui';
 import { artwork, reconcile, steamId } from './steam.ts';
 import type { Bridge, CatalogApp } from './steam.ts';
@@ -219,6 +219,7 @@ function AppDepot() {
     setElapsed(0);
     setRemoval({ app, started: performance.now() });
     setRemoveResult('');
+    toaster.toast({ title: 'App Depot', body: `Uninstalling ${app.name}…`, playSound: false });
     try {
       const result = await uninstall(app.profile, app.id, app.revision);
       setRows(current => current.filter(row => row.id !== app.id || row.profile !== app.profile));
@@ -335,14 +336,15 @@ function AppDepot() {
       {message && <PanelSectionRow><div role="status" style={{ whiteSpace: 'pre-wrap' }}>{message}</div></PanelSectionRow>}
     </PanelSection>
     <PanelSection title="Installed">
+      {removal && <PanelSectionRow><div role="status" style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+        <Spinner style={{ width: 18, height: 18 }} /> Uninstalling {removal.app.name} · {elapsed}s
+      </div></PanelSectionRow>}
       {(removal && !rows.some(row => row.id === removal.app.id && row.profile === removal.app.profile)
         ? [...rows, removal.app] : rows).map(row => {
         const item = describeInstalled(row, removal?.app, elapsed);
         return <PanelSectionRow key={item.key}>
           <ButtonItem layout="inline" label={<span style={{ overflowWrap: 'anywhere' }}>{item.label}</span>}
-            description={item.active ? <span role="status" style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
-              <Spinner style={{ width: 16, height: 16 }} /> {item.description}
-            </span> : item.description}
+            description={item.active ? undefined : item.description}
             disabled={item.disabled} onClick={() => askUninstall(row)}>Uninstall</ButtonItem>
         </PanelSectionRow>;
       })}
@@ -394,6 +396,18 @@ export default definePlugin(() => {
       reportBackground('sync', diagnostic(error));
     }
   };
+  const launchIssue = rpcMethod<[], string | null>('launch_issue');
+  let lastIssue: string | null = null;
+  const issueTimer = setInterval(async () => {
+    try {
+      const issue = await launchIssue();
+      if (!stopped && issue && issue !== lastIssue) {
+        lastIssue = issue;
+        toaster.toast({ title: 'App Depot · Steam game display unavailable',
+          body: 'Switch to Desktop Mode, then return to Gaming Mode and press Play again.', duration: 10000 });
+      }
+    } catch { /* The Loader may be restarting. */ }
+  }, 4000);
   const initial = setTimeout(() => { void start(); }, 1800);
   const timer = setInterval(() => {
     void observeInstallations();
@@ -401,6 +415,6 @@ export default definePlugin(() => {
   return {
     name: 'App Depot', titleView: <div>App Depot</div>,
     content: <AppDepot />, icon: <span aria-hidden>↓</span>,
-    onDismount: () => { stopped = true; clearInterval(timer); clearTimeout(initial); },
+    onDismount: () => { stopped = true; clearInterval(timer); clearInterval(issueTimer); clearTimeout(initial); },
   };
 });

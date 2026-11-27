@@ -1517,7 +1517,12 @@ fn main() -> ExitCode {
             };
             #[cfg(all(feature = "decky", target_os = "linux"))]
             if trace_launch {
-                decky::record_launch("exited", Some(code));
+                let stage = if matches!(error, CliError::Decky("steam_game_display_unavailable")) {
+                    "steam_game_display_unavailable"
+                } else {
+                    "exited"
+                };
+                decky::record_launch(stage, Some(code));
             }
             ExitCode::from(code)
         }

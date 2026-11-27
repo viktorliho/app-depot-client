@@ -32,6 +32,19 @@ ID = 0x80000004
 
 
 class ConnectionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_only_recent_missing_game_display_is_reported(self):
+        plugin = main.Plugin()
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"XDG_STATE_HOME": tmp}):
+            path = Path(tmp) / "app-depot-decky/last-launch.json"
+            path.parent.mkdir()
+            self.assertIsNone(await plugin.launch_issue())
+            path.write_text('{"exitCode":9,"stage":"exited"}')
+            self.assertIsNone(await plugin.launch_issue())
+            path.write_text('{"exitCode":9,"stage":"steam_game_display_unavailable"}')
+            self.assertEqual(await plugin.launch_issue(), str(path.stat().st_mtime_ns))
+            os.utime(path, (1, 1))
+            self.assertIsNone(await plugin.launch_issue())
+
     async def test_rpc_reports_expected_errors_and_hides_exception_details(self):
         plugin = main.Plugin()
 

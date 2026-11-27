@@ -1,4 +1,5 @@
 use super::*;
+mod gamescope;
 mod handheld;
 mod manifest;
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -277,6 +278,14 @@ fn convert_grid(
 }
 
 pub(super) fn run_decky(options: &Options) -> Result<(), CliError> {
+    if options
+        .positional
+        .get(1)
+        .is_some_and(|action| action == "play")
+        && gamescope::display_unavailable()
+    {
+        return Err(CliError::Decky("steam_game_display_unavailable"));
+    }
     if options.positional.len() == 2 && options.positional[1] == "discover" {
         let results = app_depot_core::discovery::discover(Duration::from_secs(3))
             .map_err(|_| CliError::Decky("discovery_unavailable"))?;
