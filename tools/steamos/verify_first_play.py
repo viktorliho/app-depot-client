@@ -464,12 +464,40 @@ def run(args, root):
                        APP_DEPOT_TEST_TREE_ASSOCIATION_ID=association)
             subprocess.run(
                 ["cargo", "test", "-p", "app-depot-core", "--locked", "--test", "real_server",
-                 "--", "--ignored"], env=env, cwd=args.client_repo, check=True, timeout=180,
+                 "--", "--ignored", "--skip", "installs_real_standard_plan_and_reuses_downloads"],
+                env=env, cwd=args.client_repo, check=True, timeout=180,
             )
             subprocess.run(
                 ["cargo", "test", "-p", "app-depot", "--locked", "--test", "tree_sigkill",
                  "--", "--ignored"], env=env, cwd=args.client_repo, check=True, timeout=180,
             )
+            # The portable launch fixture intentionally has no installation manifest.
+            # Exercise the Standard test against an explicit declaration on this Dev Server.
+            release_path = f"/releases/{release}/declarations"
+            def replace_release(data):
+                with opener.open(Request(origin + "/api/v1" + release_path,
+                                         headers=authorization), timeout=10) as response:
+                    etag = response.headers["ETag"]
+                request(opener, origin, "PUT", release_path, {"data": data},
+                        {**authorization, "If-Match": etag})
+            original = request(opener, origin, "GET", release_path, headers=authorization)["data"]
+            entry = request(opener, origin, "GET", f"/associations/{association}/declarations",
+                            headers=authorization)
+            associations = request(opener, origin, "GET", f"/releases/{release}/artifacts",
+                                   headers=authorization)["items"]
+            file_id = next(a["id"] for a in associations
+                           if a["id"] != association)
+            replace_release({**original, "appDepot": {"installation": {"version": 1,
+                "payload": [{"associationId": association, "destination": ""},
+                            {"associationId": file_id, "destination": "extra.dat"}],
+                "launch": {"associationId": association, "entryPointId": "fixture",
+                           "revisionId": entry["revisionId"], "destination": "bin/run.sh"}}}})
+            subprocess.run(
+                ["cargo", "test", "-p", "app-depot-core", "--locked", "--test", "real_server",
+                 "installs_real_standard_plan_and_reuses_downloads", "--", "--ignored"],
+                env=env, cwd=args.client_repo, check=True, timeout=180,
+            )
+            replace_release(original)
         if args.decky_plugin:
             decky_origin = origin
             if args.decky_lan_host:

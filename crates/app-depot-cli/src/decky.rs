@@ -1,4 +1,5 @@
 use super::*;
+mod manifest;
 use base64::{Engine, engine::general_purpose::STANDARD};
 use eframe::egui;
 use serde_json::{Value, json};
@@ -186,10 +187,20 @@ fn catalog(library: &Library, profile: &ServerProfileId) -> Result<Value, CliErr
             .iter()
             .filter(|item| item.app_id == app.id)
             .collect::<Vec<_>>();
-        let downloaded = library
-            .cached_releases(profile, &app.id)?
-            .iter()
-            .any(|release| downloaded_releases.contains(&release.value.id));
+        let mut downloaded = false;
+        for release in library.cached_releases(profile, &app.id)? {
+            let id = &release.value.id;
+            if let Some(state) = library.release_installation(profile, id)? {
+                downloaded |= state.active_generation.is_some();
+            } else if downloaded_releases.contains(id) {
+                downloaded |= !library.cached_snapshot(profile, id)?.is_some_and(|s| {
+                    s.value
+                        .release
+                        .app_depot()
+                        .is_some_and(|v| v.get("installation").is_some())
+                });
+            }
+        }
         if !row.stale || !selected.is_empty() {
             rows.push(json!({"id":app.id,"name":app.name,"stale":row.stale,
                 "downloaded":downloaded,"installations":selected}));
@@ -294,8 +305,14 @@ pub(super) fn run_decky(options: &Options) -> Result<(), CliError> {
             "profiles": library.profiles(false)?.iter().map(public_profile).collect::<Vec<_>>(),
             "library": selected_library_paths(options)?.content,
             "usage": library.storage_usage()?,
+            "runtimes": manifest::runtimes(),
+            "windowsRuntime": manifest::default_runtime(&library)?,
             "version": env!("CARGO_PKG_VERSION"),
         }))?,
+        [_, action, path] if action == "set-runtime" => {
+            manifest::set_runtime(&library, path)?;
+            print_json(&json!(true))?;
+        }
         [_, action] if action == "installed" => {
             let mut rows = Vec::new();
             for profile in library.profiles(false)? {
@@ -468,14 +485,22 @@ fn play(options: &Options, mut library: Library, id: &str, app: &str) -> Result<
     let saved = fs::read(&path)
         .ok()
         .and_then(|bytes| serde_json::from_slice::<Vec<String>>(&bytes).ok());
-    let selected = saved
-        .as_ref()
-        .and_then(|saved| {
-            choices
-                .iter()
-                .position(|choice| choice_key(choice) == *saved)
-        })
-        .or_else(|| (saved.is_none() && choices.len() == 1).then_some(0));
+    let selected = saved.as_ref().and_then(|saved| {
+        choices
+            .iter()
+            .position(|choice| choice_key(choice) == *saved)
+    });
+    if selected.is_none() {
+        match manifest::first_play(&mut library, &profile, app, &name, &stop, &choices, &path) {
+            Ok(true) => return Ok(()),
+            Ok(false) => (),
+            Err(error) => {
+                manifest::show_error(&name, &error.to_string());
+                return Err(error);
+            }
+        }
+    }
+    let selected = selected.or_else(|| (choices.len() == 1).then_some(0));
     if let Some(index) = selected {
         let choice = choices.swap_remove(index);
         if matches!(choice.status.as_str(), "Ready" | "PreparationRequired") {
@@ -551,28 +576,32 @@ struct PlayUi {
     error: Option<String>,
 }
 
+fn save_choice(path: &std::path::Path, choice: &LaunchCandidate) -> Result<(), CliError> {
+    let destination = path.parent().unwrap();
+    fs::create_dir_all(destination).map_err(LibraryError::Io)?;
+    // Distinct temp names allow two Play requests without sharing an open file.
+    let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
+    let result = (|| -> io::Result<()> {
+        use std::io::Write;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
+        serde_json::to_writer(&mut file, &choice_key(choice))?;
+        file.flush()?;
+        fs::rename(&tmp, path)
+    })();
+    if let Err(error) = result {
+        return Err(LibraryError::Io(error).into());
+    }
+
+    Ok(())
+}
+
 impl PlayUi {
     fn start(&mut self) -> Result<(), CliError> {
         let choice = &self.choices[self.index];
-        let destination = self.path.parent().unwrap();
-        fs::create_dir_all(destination).map_err(LibraryError::Io)?;
-        // Distinct temp names allow two Play requests without sharing an open file.
-        let tmp = self
-            .path
-            .with_extension(format!("{}.tmp", std::process::id()));
-        let result = (|| -> io::Result<()> {
-            use std::io::Write;
-            let mut file = fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&tmp)?;
-            serde_json::to_writer(&mut file, &choice_key(choice))?;
-            file.flush()?;
-            fs::rename(&tmp, &self.path)
-        })();
-        if let Err(error) = result {
-            return Err(LibraryError::Io(error).into());
-        }
+        save_choice(&self.path, choice)?;
 
         // Resume only after explicit Retry/Play. The shared library still arbitrates
         // the single transfer slot, and running jobs are never restarted here.
@@ -747,7 +776,7 @@ impl eframe::App for PlayUi {
             }
             ctx.request_repaint_after(Duration::from_millis(250));
         } else if self.choices.is_empty() {
-            root.label("No supported native Linux launch is declared for this App.");
+            root.label("No supported launch is declared for this application.");
         } else {
             if self.choices.len() > 1 {
                 if down || ctx.input(|input| input.key_pressed(egui::Key::ArrowDown)) {

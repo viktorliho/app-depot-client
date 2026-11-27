@@ -155,6 +155,8 @@ class Plugin:
                 identity(app)
                 if not isinstance(revision, str) or len(revision) != 64 or any(ch not in "0123456789abcdef" for ch in revision):
                     raise ValueError("Invalid local selection revision")
+            case ("decky", "set-runtime", runtime) if isinstance(runtime, str) and os.path.isabs(runtime):
+                pass
             case ("decky", "mute-grid"):
                 if type(image) is not bytes or len(image) > 16 * 1024 * 1024:
                     raise ValueError("Invalid cached grid")
@@ -208,7 +210,7 @@ class Plugin:
 
     async def request(self, method, *args):
         operations = {
-            "status": self.status, "discover": self.discover, "test": self.test,
+            "set_runtime": self.set_runtime, "status": self.status, "discover": self.discover, "test": self.test,
             "configure": self.configure, "catalog": self.catalog, "artwork": self.artwork,
             "shortcut": self.shortcut, "acknowledge": self.acknowledge, "binding": self.binding,
             "installed": self.installed, "uninstall": self.uninstall,
@@ -241,6 +243,9 @@ class Plugin:
         ):
             raise RpcFailure("package_metadata_invalid")
         return version
+
+    async def set_runtime(self, runtime):
+        return await self._rust("decky", "set-runtime", runtime)
 
     async def discover(self):
         return await self._rust("decky", "discover")

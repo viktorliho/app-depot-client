@@ -4,7 +4,7 @@ M3.1a packages an unprivileged Decky backend, a Decky control surface and an x86
 
 ## Build and test on Debian
 
-Use Debian 13 x86-64, Rust 1.95.0 with rustfmt and clippy, and Node 26.5.0 with npm 11.17.0. Install build-essential, pkg-config, libssl-dev and libdbus-1-dev as for Desktop, plus libudev-dev for gamepad support. Python 3 and python3-vdf are needed for the Decky tests. python3-pil is only needed for the M3.0 fixture suite. The compiled plugin needs no Node, Rust, compiler or Python packages on the Deck.
+Use Debian 13 x86-64, Rust 1.100.0 with rustfmt and clippy, and Node 26.5.0 with npm 11.17.0. Install build-essential, pkg-config, libssl-dev and libdbus-1-dev as for Desktop, plus libudev-dev for gamepad support and clang, llvm-dlltool and lld-link for the prerequisite supervisor. Python 3 and python3-vdf are needed for the Decky tests. python3-pil is only needed for the M3.0 fixture suite. The compiled plugin needs no Node, Rust, compiler or Python packages on the Deck.
 
 ~~~sh
 cargo fmt --check
@@ -111,7 +111,7 @@ Inspect the latest native launch record at `$XDG_STATE_HOME/app-depot-decky/last
 4. Choose an undownloaded native App. Use the Deck controls for any choice and observe transfer phases. Cancel during download, then Retry. Confirm checkpoint resume and launch. Stop an uninstalled Play while its Server is offline and confirm Retry/Exit. Restore connectivity and Retry. Start an installed App offline and check it opens without a download window.
 5. Check the native game's sustained focus, built-in controls, Steam Controller if available, Steam Input layouts, overlay, Stop Game, normal exit, descendant processes, playtime and return to Steam. Confirm no transfer process remains after cancellation and no game remains after Stop Game. Check that the parent waits while the game runs.
 6. Check Steam artwork in portrait and wide slots before and after download, verify transparency and other roles, then change Server artwork and sync. Check persistence after Steam restart and preservation of a user override. Confirm a missing art role never prevents shortcut creation.
-7. Start with internal storage. With owner approval test an existing library split-root configuration on a microSD fixture, including card removal and return, before offering a location switch in Decky. The MVP displays the selected shared library location. Alternate-root UI is deferred. Windows Apps remain visible and the MVP does not configure Proton. Test actual SteamOS binary loading and Secret Service availability in Gaming Mode separately.
+7. Start with internal storage. With owner approval test an existing library split-root configuration on a microSD fixture, including card removal and return, before offering a location switch in Decky. The MVP displays the selected shared library location. Alternate-root UI is deferred. For Windows First Play, select an installed Wine or Proton runtime in Settings & About. Open the existing shortcut and review the Standard plan and prerequisite list in the SteamOS Zenity dialog. A pending installation asks for retry consent. Core binds the application to its own prefix, runs declared installers and launches the active generation. The native shortcut remains the Steam Input target. Test actual SteamOS binary loading and Secret Service availability in Gaming Mode separately.
 
 Debian verification covers the real Server, native X11 under Xvfb, Secret Service, an offline launch without a display, child exit code and SIGTERM propagation, mocked SteamClient and VDF readback, and package extraction/activation rollback with a fixture service. The hardware cases above are still open.
 
@@ -133,7 +133,7 @@ Manual Desktop Mode installation is the supported update policy. Gaming Mode off
 
 Owner acceptance on real Steam Deck hardware covered the official Desktop installer, Gaming Mode frontend and backend, Server connection and Guest access, catalog synchronization, stable Steam AppIDs and artwork assignment. Unreal Gold and Unreal Tournament 1999 showed grayscale artwork before native First Play downloaded, verified and launched the content. Subsequent Play launched directly. Later owner testing confirmed local Uninstall preserves the shortcut and returns the app to the not-downloaded state, ready for the next installation. The existing Steam non-Steam shortcuts remain the library interface, with grayscale grids before download and color after installation. Decky **Installed** provides local Uninstall, while Steam Play manages native launch.
 
-Coverage does not extend to all Steam Input and overlay combinations, alternate-storage scenarios, Windows execution through Proton, native Steam installation tabs or Gaming Mode plugin activation. Decky is in maintenance mode. Windows Desktop is the next major platform.
+Coverage does not extend to all Steam Input and overlay combinations, alternate-storage scenarios, Windows execution through Proton, native Steam installation tabs or Gaming Mode plugin activation. Windows Gaming Mode acceptance requires a physical first launch, installer interaction, gameplay, exit and a second launch.
 
 ## Deferred Gaming Mode update research
 

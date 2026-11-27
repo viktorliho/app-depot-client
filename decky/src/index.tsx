@@ -6,7 +6,7 @@ import type { Bridge, CatalogApp } from './steam.ts';
 import { describeInstalled, removalPrompt } from './installed.ts';
 
 type Profile = { id: string; origin: string; name: string; authenticated: boolean; status: string; lastSync: number | null };
-type Status = { profiles: Profile[]; library: string; usage: { writableInstallationsLogicalBytes: number }; version: string; coreVersion: string };
+type Status = { runtimes: string[]; windowsRuntime: string | null; profiles: Profile[]; library: string; usage: { writableInstallationsLogicalBytes: number }; version: string; coreVersion: string };
 type Steam = Parameters<typeof reconcile>[1];
 const environment = window as unknown as {
   SteamClient?: { Apps?: Steam; System?: { OpenInSystemBrowser?(url: string): void } };
@@ -66,6 +66,7 @@ function rpcMethod<A extends unknown[], T>(method: string) {
     return result.value as T;
   };
 }
+const setRuntime = rpcMethod<[string], boolean>('set_runtime');
 const statusRpc = rpcMethod<[], Status>('status');
 const discover = rpcMethod<[], Candidate[]>('discover');
 const test = rpcMethod<[string, string, boolean], Probe>('test');
@@ -349,6 +350,14 @@ function AppDepot() {
       {removeResult && <PanelSectionRow><div role="status">{removeResult}</div></PanelSectionRow>}
     </PanelSection>
     <PanelSection title="Settings & About">
+      {status && <PanelSectionRow>Default Windows runtime</PanelSectionRow>}
+      {status?.runtimes.map(path => <PanelSectionRow key={path}>
+        <ButtonItem disabled={busy || status.windowsRuntime === path} description={path}
+          onClick={() => operation(async () => { await setRuntime(path); await update(); })}>
+          {status.windowsRuntime === path ? 'Selected' : 'Select'} {path.split('/').slice(-2).join('/')}
+        </ButtonItem>
+      </PanelSectionRow>)}
+      {status && !status.runtimes.length && <PanelSectionRow>No compatible runtime found</PanelSectionRow>}
       <PanelSectionRow>{status ? `App Depot Decky ${status.version}` : 'Loading version…'}</PanelSectionRow>
       <PanelSectionRow>In Desktop Mode, run the official .desktop installer from a Decky release.</PanelSectionRow>
       <PanelSectionRow>{environment.SteamClient?.System?.OpenInSystemBrowser
