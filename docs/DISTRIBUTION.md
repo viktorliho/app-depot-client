@@ -10,6 +10,8 @@ Download `AppDepot-VERSION-x86_64.AppImage` and its `.sha256` file from the [off
 
 Stable Desktop releases use one annotated `vMAJOR.MINOR.PATCH` tag matching the workspace version and identifying one verified main commit. The owner accepted the first unified stable release, v0.1.4, on Linux and Windows. Release jobs build and test Linux x86-64 and Windows x64 independently from that commit. The workflow creates a draft only after both jobs succeed and verifies the exact asset set and GitHub digests. The required set is the versioned AppImage, its `.sha256` and `.zsync`, `AppDepot-Desktop-Windows-x64-Setup.exe` and `SHA256SUMS`. The publication job uses GitHub Actions permissions to publish the verified draft as stable and set it as Latest. Existing releases and tags are immutable under this procedure. Decky publishes independently. macOS joins the set when officially supported.
 
+Linux builds require clang, llvm-dlltool and lld-link to compile the embedded Windows prerequisite supervisor from source. End users need the selected Wine or Proton distribution and, for Proton, its declared Steam Linux Runtime.
+
 `scripts/build-appimage.sh` pins appimagetool 1.9.1 and its Type 2 runtime by SHA-256 and refuses mismatched downloads. The AppDir has `AppRun`, the desktop executable, update helper, `.desktop`, AppStream metadata and PNG icon sizes. It embeds `gh-releases-zsync|viktorliho|app-depot-client|latest|AppDepot-*-x86_64.AppImage.zsync` and publishes the corresponding `.zsync` asset for external AppImage-aware tools. The built-in updater uses full downloads; delta updates are not required for correctness.
 
 ## Built-in updater

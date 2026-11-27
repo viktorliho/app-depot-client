@@ -200,3 +200,9 @@ name, Windows receives the leaf name and a null rename root, avoiding another
 write-open of the pinned parent directory. Persistent contention
 reports the operation and path in the generation error. A completed download
 remains eligible for offline reuse.
+
+### Windows applications on Linux
+
+A Standard Windows plan on Linux uses the same saved plan, verified objects, generation layout and consent records as a native installation. The library stores the selected runtime executable in `library_meta` under `compatibility/<profile UUID>/<app UUID>`. The prefix lives under `prefixes/<profile UUID>/<app UUID>/pfx` in the content root and survives generation removal. Subsequent releases of the application use the bound runtime. A missing bound runtime requires restoring that external installation.
+
+Wine receives an explicit WINEPREFIX. Proton receives its installed Steam client root and a private compatibility data path, with the container selected from its tool manifest and Steam library metadata. The Windows prerequisite supervisor starts the declared executable in a Windows job, waits for the job to empty and returns the full signed 32-bit exit code through an attempt-specific result file. Missing or incomplete completion evidence requires review before retry. Runtime and container distribution are external to the client.

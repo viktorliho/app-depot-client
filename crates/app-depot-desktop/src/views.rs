@@ -1111,17 +1111,7 @@ impl Desktop {
                     )
                     .clicked()
                 {
-                    self.send(Command::Play {
-                        profile: candidate.profile_id.clone(),
-                        release: candidate.release_id.clone(),
-                        association: candidate.association_id.clone(),
-                        entry: candidate.entry_id.clone(),
-                        declaration_revision: candidate.selection_revision().to_owned(),
-                    });
-                    self.launch_states.insert(
-                        key.clone(),
-                        ("Starting".into(), "Starting application".into()),
-                    );
+                    self.start_candidate(candidate);
                 }
                 if let Some(label) = state.as_ref().map(|(s, _)| s.as_str()).or_else(|| {
                     (candidate.status == "PreparationRequired").then_some("Prepares on Play")
@@ -1576,13 +1566,11 @@ impl Desktop {
         }) {
             return;
         }
-        self.send(Command::Play {
-            profile: candidate.profile_id.clone(),
-            release: candidate.release_id.clone(),
-            association: candidate.association_id.clone(),
-            entry: candidate.entry_id.clone(),
-            declaration_revision: candidate.selection_revision().to_owned(),
-        });
+        if let Err(error) = self.worker.play(candidate) {
+            self.launch_states
+                .insert(key, ("Launch failed".into(), error));
+            return;
+        }
         self.launch_states
             .insert(key, ("Starting".into(), "Starting application".into()));
     }
@@ -2348,6 +2336,19 @@ impl Desktop {
                 }
             }); }
             if self.settings_tab==SettingsTab::Storage {
+                #[cfg(target_os = "linux")]
+                section(ui, "Windows compatibility runtime", |ui| {
+                    egui::ComboBox::from_id_salt("windows-runtime")
+                        .selected_text(self.prefs.windows_runtime.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "Select runtime".into()))
+                        .show_ui(ui, |ui| {
+                            for runtime in app_depot_core::compatibility::discover() {
+                                let path = runtime.executable();
+                                if ui.selectable_value(&mut self.prefs.windows_runtime, Some(path.to_owned()), path.display().to_string()).changed() {
+                                    self.remember();
+                                }
+                            }
+                        });
+                });
             section(ui,"Storage",|ui| {
                 ui.label(RichText::new("Your library").size(18.0).strong());
                 if worker::WINDOWS_INSTALL_ONLY {

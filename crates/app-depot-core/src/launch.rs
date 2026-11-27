@@ -563,6 +563,10 @@ impl LaunchCandidate {
 
     #[cfg(target_os = "linux")]
     pub(crate) fn local_readiness(&self) -> Result<(), String> {
+        self.check_local_target(true)
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn check_local_target(&self, executable: bool) -> Result<(), String> {
         use std::os::unix::fs::PermissionsExt;
         let root = self
             .local_root
@@ -581,7 +585,7 @@ impl LaunchCandidate {
         if !meta.is_file() {
             return Err("local target is missing or is not a regular file".into());
         }
-        if meta.permissions().mode() & 0o111 == 0 {
+        if executable && meta.permissions().mode() & 0o111 == 0 {
             return Err("declared target is not executable".into());
         }
         Ok(())

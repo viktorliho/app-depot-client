@@ -204,6 +204,13 @@ mod coordinator {
                 .map_err(|_| invalid("another Standard installation operation is active"))?;
             Ok(file)
         }
+        fn accepts_plan_platform(&self, _profile: &ServerProfileId, plan: &Plan) -> bool {
+            #[cfg(target_os = "linux")]
+            if plan.platform == "windows/x86_64" {
+                return self.application_runtime(_profile, &plan.app_id).is_ok();
+            }
+            crate::launch::host() == Some(&plan.platform)
+        }
         /// Explicit install/retry. No prerequisite execution or launch occurs here.
         pub fn install_saved_plan(
             &mut self,
@@ -211,9 +218,19 @@ mod coordinator {
             plan_id: &str,
             client: Option<&ApiClient>,
         ) -> Result<ReleaseInstallation, LibraryError> {
+            self.install_saved_plan_with_progress(profile, plan_id, client, &mut |_| {})
+        }
+        pub fn install_saved_plan_with_progress(
+            &mut self,
+            profile: &ServerProfileId,
+            plan_id: &str,
+            client: Option<&ApiClient>,
+            progress: &mut dyn FnMut(&str),
+        ) -> Result<ReleaseInstallation, LibraryError> {
+            progress("Downloading and preparing application files");
             let _lifecycle = self.manifest_lifecycle_lock()?;
             let plan = self.load_install_plan(profile, plan_id)?;
-            if crate::launch::host() != Some(&plan.platform) {
+            if !self.accepts_plan_platform(profile, &plan) {
                 return Err(invalid("installation platform does not match this host"));
             }
             let layout = destination_layout(&plan)?;
@@ -316,6 +333,13 @@ mod coordinator {
                         |digest, size| self.repair_install_object(&jobs, digest, size, client),
                     )?,
                     Err(e) => return Err(e.into()),
+                }
+                #[cfg(target_os = "linux")]
+                if plan.platform == "windows/x86_64" {
+                    progress("Preparing application prefix");
+                    self.application_runtime(profile, &plan.app_id)?
+                        .runtime
+                        .prepare_prefix(&self.paths, profile, &plan.app_id)?;
                 }
                 let state = if !plan
                     .prerequisites
@@ -524,7 +548,7 @@ mod coordinator {
                 params![generation, profile.0], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))
             ).optional()?.ok_or_else(|| invalid("pending prerequisite generation not found"))?;
             let plan = self.load_install_plan(profile, &plan_id)?;
-            if crate::launch::host() != Some(&plan.platform) {
+            if !self.accepts_plan_platform(profile, &plan) {
                 return Err(invalid("installation platform does not match this host"));
             }
             Ok((installation, plan_id, fingerprint, plan))
@@ -1058,11 +1082,11 @@ mod coordinator {
             }
             let g = self.active_release_generation(profile, release)?;
             let plan = self.load_install_plan(profile, &g.plan_id)?;
+            let ready = g.state == "Ready" && self.accepts_plan_platform(profile, &plan);
             let Some(launch) = plan.launch else {
                 return Ok(None);
             };
             let source = &plan.files.as_ref().expect("Standard plan")[&launch.path];
-            let ready = g.state == "Ready" && plan.platform == crate::launch::host().unwrap_or("");
             let mut candidate = LaunchCandidate {
                 profile_id: profile.clone(),
                 release_id: release.into(),
@@ -1091,7 +1115,7 @@ mod coordinator {
                     &g.id,
                 )
                 .map_err(|e| e.to_string())
-                .and_then(|_| candidate.local_readiness())
+                .and_then(|_| candidate.check_local_target(plan.platform.starts_with("linux/")))
             {
                 candidate.status = "Unavailable".into();
                 candidate.reason = reason;
@@ -1150,7 +1174,31 @@ mod coordinator {
             if runtime_busy(&g.path, tracked.0, tracked.1.as_deref())? {
                 return Err(invalid("installation is running"));
             }
-            let mut child = c.spawn()?;
+            let plan = self.load_install_plan(profile, &g.plan_id)?;
+            let mut child = if plan.platform == "windows/x86_64" {
+                if c.status != "Ready" {
+                    return Err(invalid("Windows launch is unavailable"));
+                }
+                c.check_local_target(false).map_err(LibraryError::Invalid)?;
+                let bound = self.application_runtime(profile, &plan.app_id)?;
+                crate::launch::open_nofollow(&bound.data, "pfx", true)?;
+                let target = g.path.join(
+                    c.target
+                        .as_deref()
+                        .ok_or_else(|| invalid("Missing launch target"))?,
+                );
+                let cwd = g.path.join(
+                    c.working_directory
+                        .as_deref()
+                        .ok_or_else(|| invalid("Missing working directory"))?,
+                );
+                bound
+                    .runtime
+                    .command(&bound.data, &target, &cwd, &c.arguments)
+                    .spawn()?
+            } else {
+                c.spawn()?
+            };
             let record = (|| -> Result<(), LibraryError> {
                 let start = process_start(child.id())?.unwrap_or_default();
                 self.conn.execute("UPDATE installation_generations SET process_id=?2,process_start=?3 WHERE id=?1",params![g.id,i64::from(child.id()),start])?;
@@ -1278,6 +1326,107 @@ mod tests {
         let fingerprint = format!("{:x}", Sha256::digest(raw.as_bytes()));
         lib.conn.execute("INSERT INTO installation_plans(id,profile_id,plan_json,fingerprint) VALUES (?1,?2,?3,?4)",params![id,profile.0,raw,fingerprint]).unwrap();
         id
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires installed Proton and its Windows cmd.exe fixture"]
+    fn proton_standard_prerequisite_and_play() {
+        let launcher = std::path::PathBuf::from(
+            std::env::var_os("M55_TEST_PROTON").expect("installed Proton launcher"),
+        );
+        let fixture = fs::read(std::env::var_os("M55_TEST_CMD").expect("Windows cmd.exe")).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut lib = Library::open(LibraryPaths {
+            metadata: temp.path().join("metadata"),
+            content: temp.path().join("content"),
+        })
+        .unwrap();
+        let profile = lib
+            .add_profile("fixture", "http://localhost:8787", false)
+            .unwrap()
+            .id;
+        let (app, release, revision) = (id(), id(), id());
+        lib.conn
+            .execute(
+                "INSERT INTO apps(profile_id,id,metadata_json,last_seen) VALUES (?1,?2,'{}',0)",
+                params![profile.0, app],
+            )
+            .unwrap();
+        lib.conn.execute("INSERT INTO releases(profile_id,id,app_id,metadata_json,last_seen) VALUES (?1,?2,?3,'{}',0)",params![profile.0,release,app]).unwrap();
+        let file = source_layout(
+            &lib,
+            &profile,
+            &release,
+            &fixture,
+            Some("fixture.exe"),
+            None,
+        );
+        let plan = json!({"version":1,"appId":app,"releaseId":release,"revisionId":revision,"platform":"windows/x86_64","selections":{},"unresolved":[],"files":{"fixture.exe":file},"directories":[],"prerequisites":[{"id":"check","name":"Full Windows exit code","file":file,"path":"fixture.exe","arguments":["/c",r"if exist C:\resume.txt (exit 4660) else (ping -n 20 127.0.0.1 >nul)"],"optional":false,"evidence":"fixture","successExitCodes":[4660]}],"launch":{"method":"NativePortableV1","associationId":file["associationId"],"entryPointId":"run","revisionId":revision,"path":"fixture.exe","workingDirectory":"","arguments":["/c","echo played>C:\\played.txt"]}});
+        let saved = save(&lib, &profile, &plan);
+        let mut executor = lib
+            .bind_application_runtime(&profile, &saved, &launcher)
+            .unwrap();
+        let pending = lib.install_saved_plan(&profile, &saved, None).unwrap();
+        let g = &pending.generations.last().unwrap().id;
+        let fingerprint = lib
+            .prerequisite_requirements(&profile, &saved)
+            .unwrap()
+            .fingerprint;
+        let consent = lib
+            .confirm_prerequisites(&profile, g, &fingerprint, &["check".into()], false)
+            .unwrap();
+        let observer = Library::open(lib.paths.clone()).unwrap();
+        std::thread::scope(|scope| {
+            let release = &release;
+            let profile = &profile;
+            scope.spawn(move || {
+                let start = std::time::Instant::now();
+                while observer
+                    .cancel_compatibility_prerequisite(profile, release)
+                    .is_err()
+                {
+                    assert!(start.elapsed() < std::time::Duration::from_secs(20));
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+            });
+            let interrupted = lib
+                .process_prerequisites(profile, g, &consent, None, &mut executor)
+                .unwrap();
+            assert!(interrupted.active_generation.is_none());
+        });
+        assert_eq!(
+            lib.prerequisite_progress(&profile, g).unwrap()["consents"][0]["attempts"][0]["state"],
+            "Cancelled"
+        );
+        fs::write(executor.data.join("pfx/drive_c/resume.txt"), b"retry").unwrap();
+        let consent = lib
+            .confirm_prerequisites(&profile, g, &fingerprint, &["check".into()], true)
+            .unwrap();
+        let ready = lib
+            .process_prerequisites(&profile, g, &consent, None, &mut executor)
+            .unwrap();
+        assert_eq!(
+            ready.active_generation.as_ref(),
+            Some(g),
+            "{:?}",
+            lib.prerequisite_progress(&profile, g)
+        );
+        let mut child = lib
+            .play_manifest(
+                &profile,
+                &release,
+                file["associationId"].as_str().unwrap(),
+                "run",
+                g,
+            )
+            .unwrap();
+        assert!(child.wait().unwrap().success());
+        assert_eq!(
+            fs::read_to_string(executor.data.join("pfx/drive_c/played.txt"))
+                .unwrap()
+                .trim(),
+            "played"
+        );
     }
     fn source(
         lib: &Library,

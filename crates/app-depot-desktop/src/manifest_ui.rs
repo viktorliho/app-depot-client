@@ -54,6 +54,7 @@ pub(crate) fn complete(manifest: &Manifest, selections: &Selections) -> bool {
 }
 
 pub(crate) struct InstallDialog {
+    pub platform: String,
     pub request: u64,
     pub profile: ServerProfileId,
     pub release: String,
@@ -84,6 +85,27 @@ impl InstallDialog {
 }
 
 impl Desktop {
+    fn install_platform(&self, release: &ReleaseView) -> Option<&'static str> {
+        let host = crate::worker::manifest_platform()?;
+        let platforms = release
+            .declaration
+            .as_ref()
+            .and_then(|d| {
+                d.release
+                    .convention::<app_depot_core::models::ReleaseConvention>()
+                    .ok()
+                    .flatten()
+            })
+            .and_then(|v| v.platforms)
+            .unwrap_or_default();
+        if platforms.is_empty() || platforms.iter().any(|p| p == host) {
+            return Some(host);
+        }
+        (cfg!(all(target_os = "linux", target_arch = "x86_64"))
+            && self.prefs.windows_runtime.is_some()
+            && platforms.iter().any(|p| p == "windows/x86_64"))
+        .then_some("windows/x86_64")
+    }
     pub(crate) fn open_manifest(&mut self, release: &ReleaseView, title: &str) {
         let Some(profile) = self.active.clone() else {
             return;
@@ -95,6 +117,7 @@ impl Desktop {
             Ok(Some(manifest)) if !manifest.recipe_payload => {
                 self.manifest_request += 1;
                 self.install_dialog = Some(InstallDialog {
+                    platform: self.install_platform(release).unwrap_or_default().into(),
                     request: self.manifest_request,
                     profile,
                     release: release.release.id.clone(),
@@ -129,6 +152,7 @@ impl Desktop {
     ) {
         self.manifest_request += 1;
         let mut dialog = InstallDialog {
+            platform: plan.plan["platform"].as_str().unwrap_or_default().into(),
             request: self.manifest_request,
             profile: plan.profile_id.clone(),
             release: release.into(),
@@ -189,20 +213,7 @@ impl Desktop {
             .as_ref()
             .and_then(|d| installation::manifest(&d.release).ok().flatten())
             .is_some_and(|m| !m.recipe_payload);
-        let host = crate::worker::manifest_platform();
-        let compatible = host.is_some_and(|host| {
-            release
-                .declaration
-                .as_ref()
-                .and_then(|d| {
-                    d.release
-                        .convention::<app_depot_core::models::ReleaseConvention>()
-                        .ok()
-                        .flatten()
-                })
-                .and_then(|c| c.platforms)
-                .is_none_or(|platforms| platforms.is_empty() || platforms.iter().any(|p| p == host))
-        });
+        let compatible = self.install_platform(release).is_some();
         let enabled = valid
             && compatible
             && self.profile().is_some_and(|p| !p.archived)
@@ -253,6 +264,8 @@ impl Desktop {
         let Some(mut d) = self.install_dialog.take() else {
             return;
         };
+        let executor_available = crate::worker::native_prerequisites_available()
+            || (cfg!(target_os = "linux") && d.platform == "windows/x86_64");
         let mut open = true;
         let mut close = false;
         egui::Window::new(format!("Install {}",d.title)).collapsible(false).resizable(true).default_width(530.0).open(&mut open).show(ctx,|ui|{
@@ -276,16 +289,16 @@ impl Desktop {
                             if !prereqs.is_empty(){ui.heading("Prerequisites");ui.label("Only selected declared installers may run. Review before authorizing.");}
                             for pre in prereqs {
                                 let mut selected=d.selected.contains(&pre.id);
-                                if ui.add_enabled(pre.optional && !d.busy && (crate::worker::native_prerequisites_available() || selected),egui::Checkbox::new(&mut selected,format!("{}{}",pre.name,if pre.optional{" (optional)"}else{" (required)"}))).changed(){if selected {d.selected.push(pre.id.clone());}else{d.selected.retain(|id|id!=&pre.id);}}
+                                if ui.add_enabled(pre.optional && !d.busy && (executor_available || selected),egui::Checkbox::new(&mut selected,format!("{}{}",pre.name,if pre.optional{" (optional)"}else{" (required)"}))).changed(){if selected {d.selected.push(pre.id.clone());}else{d.selected.retain(|id|id!=&pre.id);}}
                                 egui::CollapsingHeader::new("Installer information").id_salt(&pre.id).show(ui,|ui|{ui.label(&pre.evidence);ui.label(format!("Arguments: {:?}",pre.arguments));ui.label(format!("Expected exit codes: {:?}",pre.success_exit_codes));});
                             }
                         }
-                        if !crate::worker::native_prerequisites_available() && p.prerequisites.as_ref().is_some_and(|p|!p.is_empty()){ui.label(if d.selected.is_empty(){"Native prerequisite execution is unavailable. Optional installers will be skipped."}else{"Native prerequisite execution is unavailable. Files can be prepared, but required prerequisites keep the installation pending."});}
+                        if !executor_available && p.prerequisites.as_ref().is_some_and(|p|!p.is_empty()){ui.label(if d.selected.is_empty(){"Native prerequisite execution is unavailable. Optional installers will be skipped."}else{"Native prerequisite execution is unavailable. Files can be prepared, but required prerequisites keep the installation pending."});}
                         if !p.unresolved.is_empty(){ui.collapsing("Unresolved installation notes",|ui|{for note in &p.unresolved{ui.label(note);}});}
                         ui.collapsing("Technical details",|ui|{ui.label(&plan.fingerprint);ui.monospace(plan.plan.to_string());});
                         if d.manifest.is_some() && ui.button("Back to options").clicked(){d.plan=None;return;}
                         if p.recipe.is_some(){ui.label("Derived installation is unavailable.");}
-                        else if ui.add_enabled(!d.busy && !self.local_operations.contains_key(&crate::worker::standard_operation_key(&d.profile,&d.release)) && (d.generation.is_none() || d.selected.is_empty() || crate::worker::native_prerequisites_available()),design::primary(if d.retry{"Authorize retry"}else if d.generation.is_some(){"Confirm prerequisites"}else if !d.selected.is_empty() && !crate::worker::native_prerequisites_available(){"Confirm and prepare files"}else{"Confirm installation"},design::palette(ui))).clicked(){
+                        else if ui.add_enabled(!d.busy && !self.local_operations.contains_key(&crate::worker::standard_operation_key(&d.profile,&d.release)) && (d.generation.is_none() || d.selected.is_empty() || executor_available),design::primary(if d.retry{"Authorize retry"}else if d.generation.is_some(){"Confirm prerequisites"}else if !d.selected.is_empty() && !executor_available{"Confirm and prepare files"}else{"Confirm installation"},design::palette(ui))).clicked(){
                             self.send(Command::InstallManifest {profile:d.profile.clone(),release:d.release.clone(),plan:plan.id.clone(),fingerprint:plan.fingerprint.clone(),selected:d.selected.clone(),generation:d.generation.clone(),retry:d.retry});
                             self.local_operations.insert(crate::worker::standard_operation_key(&d.profile,&d.release),"Preparing installation".into());
                             self.screen=crate::Screen::Library;close=true;
@@ -306,7 +319,7 @@ impl Desktop {
                     }
                     if ui.add_enabled(!d.busy && complete(m,&d.selections),design::primary("Review installation",design::palette(ui))).clicked(){
                         d.busy=true;d.error=None;
-                        self.send(Command::ResolveManifest{request:d.request,profile:d.profile.clone(),release:d.release.clone(),revision:d.revision.clone(),selections:d.selections.clone()});
+                        self.send(Command::ResolveManifest{platform:d.platform.clone(),request:d.request,profile:d.profile.clone(),release:d.release.clone(),revision:d.revision.clone(),selections:d.selections.clone()});
                     }
                 }
                 if d.busy {ui.spinner();}
@@ -386,6 +399,18 @@ impl Desktop {
                         .and_then(|p| {
                             serde_json::from_value::<installation::Plan>(p.plan.clone()).ok()
                         });
+                    #[cfg(target_os = "linux")]
+                    if phase.starts_with("Running ")
+                        && plan
+                            .as_ref()
+                            .is_some_and(|p| p.platform == "windows/x86_64")
+                        && ui.button("Cancel prerequisite").clicked()
+                    {
+                        self.send(Command::CancelPrerequisite {
+                            profile: installation.profile_id.clone(),
+                            release: release.clone(),
+                        });
+                    }
                     for job in self.snapshot.jobs.iter().filter(|j| {
                         j.profile_id == installation.profile_id
                             && plan.as_ref().is_some_and(|p| {
@@ -456,6 +481,9 @@ impl Desktop {
                             {
                                 self.start_candidate(&c);
                             }
+                            if let Some((state, message)) = self.launch_states.get(&key) {
+                                ui.label(format!("{state}: {message}"));
+                            }
                         } else {
                             ui.label(&c.reason);
                         }
@@ -521,6 +549,11 @@ impl Desktop {
                     }
                     if g.state == "PrerequisitesPending"
                         && !crate::worker::native_prerequisites_available()
+                        && self
+                            .snapshot
+                            .plans
+                            .get(&g.plan_id)
+                            .is_none_or(|p| p.plan["platform"] != "windows/x86_64")
                     {
                         ui.label("Native prerequisite execution is unavailable on this device.");
                     }
@@ -634,6 +667,7 @@ mod tests {
         let profile = ServerProfileId("fixture".into());
         let manifest:Manifest=serde_json::from_value(json!({"version":1,"options":[{"id":"lang","name":"Language","required":true,"language":true,"choices":[{"id":"en","name":"English","payload":[]}]}],"localization":{"mode":"selectable"}})).unwrap();
         desktop.install_dialog = Some(InstallDialog {
+            platform: "linux/x86_64".into(),
             request: 1,
             profile: profile.clone(),
             release: "release".into(),

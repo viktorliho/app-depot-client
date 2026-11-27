@@ -79,6 +79,7 @@ pub struct Snapshot {
 #[derive(Clone)]
 pub enum Command {
     ResolveManifest {
+        platform: String,
         request: u64,
         profile: ServerProfileId,
         release: String,
@@ -93,6 +94,11 @@ pub enum Command {
         selected: Vec<String>,
         generation: Option<String>,
         retry: bool,
+    },
+    #[cfg(target_os = "linux")]
+    CancelPrerequisite {
+        profile: ServerProfileId,
+        release: String,
     },
     StandardVerify {
         profile: ServerProfileId,
@@ -171,13 +177,6 @@ pub enum Command {
         profile: ServerProfileId,
         association: String,
     },
-    Play {
-        profile: ServerProfileId,
-        release: String,
-        association: String,
-        entry: String,
-        declaration_revision: String,
-    },
 }
 
 static MANIFEST_BUSY: AtomicBool = AtomicBool::new(false);
@@ -237,7 +236,7 @@ fn run_standard(
         g.to_owned()
     } else {
         let state = lib
-            .install_saved_plan(profile, plan, api)
+            .install_saved_plan_with_progress(profile, plan, api, progress)
             .map_err(|e| e.to_string())?;
         if let Some(g) = state
             .generations
@@ -447,6 +446,9 @@ fn refresh_due(
 }
 
 pub struct Worker {
+    paths: LibraryPaths,
+    event_sender: Sender<Event>,
+    ctx: egui::Context,
     pub commands: Sender<Command>,
     pub events: Receiver<Event>,
     cancelled_connect: Arc<AtomicU64>,
@@ -465,12 +467,106 @@ impl Worker {
         let (tx, events) = mpsc::channel();
         let cancelled_connect = Arc::new(AtomicU64::new(0));
         let cancelled = cancelled_connect.clone();
-        thread::spawn(move || run(paths, rx, tx, ctx, cancelled));
-        Self {
+        let worker = Self {
+            paths: paths.clone(),
+            event_sender: tx.clone(),
+            ctx: ctx.clone(),
             commands,
             events,
             cancelled_connect,
+        };
+        thread::spawn(move || run(paths, rx, tx, ctx, cancelled));
+        worker
+    }
+    // Play must not wait behind a multi-gigabyte offline integrity inspection.
+    pub fn play(&self, candidate: &LaunchCandidate) -> Result<(), String> {
+        let profile = candidate.profile_id.clone();
+        let release = candidate.release_id.clone();
+        let entry = candidate.entry_id.clone();
+        let association = candidate.association_id.clone();
+        let declaration_revision = candidate.selection_revision().to_owned();
+        static ACTIVE: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+        let active = ACTIVE.get_or_init(|| Mutex::new(HashSet::new()));
+        let key = format!("{}:{association}:{entry}", profile.0);
+        if !active
+            .lock()
+            .map_err(|_| "launch state unavailable")?
+            .insert(key.clone())
+        {
+            return Ok(());
         }
+        let paths = self.paths.clone();
+        let tx = self.event_sender.clone();
+        let ctx = self.ctx.clone();
+        thread::spawn(move || {
+            let announce = |state: &str, message: String| {
+                send(
+                    &tx,
+                    &ctx,
+                    Event::Launch {
+                        profile: profile.clone(),
+                        association: association.clone(),
+                        entry: entry.clone(),
+                        state: state.into(),
+                        message,
+                    },
+                )
+            };
+            announce("Starting", "Checking local content before launch".into());
+            let result = (|| -> Result<(), String> {
+                let mut lib = Library::open(paths).map_err(|e| e.to_string())?;
+                let candidate = lib
+                    .launch_candidates(&profile, &release)
+                    .map_err(|e| e.to_string())?
+                    .into_iter()
+                    .find(|c| c.association_id == association && c.entry_id == entry)
+                    .ok_or("selected launch declaration is no longer cached")?;
+                if candidate.selection_revision() != declaration_revision {
+                    return Err(
+                        "Launch declaration changed; review the updated choice before playing"
+                            .into(),
+                    );
+                }
+                if candidate.status == "PreparationRequired" {
+                    announce("Preparing", "Creating the writable application copy".into());
+                    lib.prepare_portable(&profile, &association)
+                        .map_err(|e| format!("Preparation failed: {e}"))?;
+                    send(&tx, &ctx, Event::JobChanged);
+                } else if candidate.status != "Ready" {
+                    return Err(format!("{}: {}", candidate.status, candidate.reason));
+                }
+                let mut child = lib
+                    .play_declared(
+                        &profile,
+                        &release,
+                        &association,
+                        &entry,
+                        &declaration_revision,
+                    )
+                    .map_err(|e| e.to_string())?;
+                let pid = child.id();
+                if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+                    announce(
+                        "Exited",
+                        format!("Process {pid} exited immediately: {status}"),
+                    );
+                    return Ok(());
+                }
+                announce("Running", format!("Process {pid} started"));
+                let status = child.wait().map_err(|e| e.to_string())?;
+                announce("Exited", format!("Process {pid} exited: {status}"));
+                Ok(())
+            })();
+            if let Err(error) = result {
+                announce("Launch failed", error)
+            }
+            if let Some(active) = ACTIVE.get()
+                && let Ok(mut active) = active.lock()
+            {
+                active.remove(&key);
+            }
+        });
+        Ok(())
     }
     pub fn send(&self, command: Command) {
         if let Command::CancelConnect(attempt) = &command {
@@ -693,6 +789,7 @@ fn operation(
     let standard_remove = matches!(&cmd, Command::StandardUninstall { .. });
     match cmd {
         Command::ResolveManifest {
+            platform,
             request,
             profile,
             release,
@@ -710,14 +807,12 @@ fn operation(
                 let result = (|| {
                     let api = api?;
                     let lib = Library::open(paths).map_err(|e| e.to_string())?;
-                    let platform =
-                        manifest_platform().ok_or("Installation unavailable on this platform")?;
                     lib.resolve_plan(
                         &profile,
                         &api,
                         &release,
                         &ResolveRequest {
-                            platform: platform.into(),
+                            platform,
                             revision_id: Some(revision),
                             selections,
                         },
@@ -785,6 +880,21 @@ fn operation(
                 let result = Library::open(paths)
                     .map_err(|e| e.to_string())
                     .and_then(|mut lib| {
+                        #[cfg(target_os = "linux")]
+                        if lib
+                            .prerequisite_requirements(&profile, &plan)
+                            .map_err(|e| e.to_string())?
+                            .plan["platform"]
+                            == "windows/x86_64"
+                        {
+                            let selected = crate::preferences::load(&lib.paths.metadata)?
+                                .windows_runtime
+                                .ok_or("Select a Windows runtime in Settings")?;
+                            executor = Some(Box::new(
+                                lib.bind_application_runtime(&profile, &plan, &selected)
+                                    .map_err(|e| e.to_string())?,
+                            ));
+                        }
                         run_standard(
                             &mut lib,
                             &profile,
@@ -832,6 +942,11 @@ fn operation(
                 send(&tx, &ctx, Event::JobChanged);
             });
             return Ok(false);
+        }
+        #[cfg(target_os = "linux")]
+        Command::CancelPrerequisite { profile, release } => {
+            lib.cancel_compatibility_prerequisite(&profile, &release)
+                .map_err(|e| e.to_string())?;
         }
         Command::StandardVerify { profile, release }
         | Command::StandardUninstall { profile, release } => {
@@ -1343,96 +1458,6 @@ fn operation(
                     Err(error) => send(&tx, &ctx, Event::Error(error.to_string())),
                 }
                 send(&tx, &ctx, Event::JobChanged);
-            });
-            return Ok(false);
-        }
-        Command::Play {
-            profile,
-            release,
-            association,
-            entry,
-            declaration_revision,
-        } => {
-            static ACTIVE: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
-            let active = ACTIVE.get_or_init(|| Mutex::new(HashSet::new()));
-            let key = format!("{}:{association}:{entry}", profile.0);
-            if !active
-                .lock()
-                .map_err(|_| "launch state unavailable")?
-                .insert(key.clone())
-            {
-                return Err("This program is already running or starting".into());
-            }
-            let paths = paths.clone();
-            let tx = tx.clone();
-            let ctx = ctx.clone();
-            thread::spawn(move || {
-                let announce = |state: &str, message: String| {
-                    send(
-                        &tx,
-                        &ctx,
-                        Event::Launch {
-                            profile: profile.clone(),
-                            association: association.clone(),
-                            entry: entry.clone(),
-                            state: state.into(),
-                            message,
-                        },
-                    )
-                };
-                announce("Starting", "Checking local content before launch".into());
-                let result = (|| -> Result<(), String> {
-                    let mut lib = Library::open(paths).map_err(|e| e.to_string())?;
-                    let candidate = lib
-                        .launch_candidates(&profile, &release)
-                        .map_err(|e| e.to_string())?
-                        .into_iter()
-                        .find(|c| c.association_id == association && c.entry_id == entry)
-                        .ok_or("selected launch declaration is no longer cached")?;
-                    if candidate.selection_revision() != declaration_revision {
-                        return Err(
-                            "Launch declaration changed; review the updated choice before playing"
-                                .into(),
-                        );
-                    }
-                    if candidate.status == "PreparationRequired" {
-                        announce("Preparing", "Creating the writable application copy".into());
-                        lib.prepare_portable(&profile, &association)
-                            .map_err(|e| format!("Preparation failed: {e}"))?;
-                        send(&tx, &ctx, Event::JobChanged);
-                    } else if candidate.status != "Ready" {
-                        return Err(format!("{}: {}", candidate.status, candidate.reason));
-                    }
-                    let mut child = lib
-                        .play_declared(
-                            &profile,
-                            &release,
-                            &association,
-                            &entry,
-                            &declaration_revision,
-                        )
-                        .map_err(|e| e.to_string())?;
-                    let pid = child.id();
-                    if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
-                        announce(
-                            "Exited",
-                            format!("Process {pid} exited immediately: {status}"),
-                        );
-                        return Ok(());
-                    }
-                    announce("Running", format!("Process {pid} started"));
-                    let status = child.wait().map_err(|e| e.to_string())?;
-                    announce("Exited", format!("Process {pid} exited: {status}"));
-                    Ok(())
-                })();
-                if let Err(error) = result {
-                    announce("Launch failed", error)
-                }
-                if let Some(active) = ACTIVE.get()
-                    && let Ok(mut active) = active.lock()
-                {
-                    active.remove(&key);
-                }
             });
             return Ok(false);
         }

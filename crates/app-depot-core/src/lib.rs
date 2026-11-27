@@ -76,3 +76,6 @@ mod tests {
         assert_ne!(first, second);
     }
 }
+
+#[cfg(target_os = "linux")]
+pub mod compatibility;

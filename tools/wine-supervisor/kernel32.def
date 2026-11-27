@@ -1,0 +1,19 @@
+LIBRARY kernel32.dll
+EXPORTS
+AssignProcessToJobObject
+CreateFileW
+CreateJobObjectW
+CreateProcessW
+ExitProcess
+FlushFileBuffers
+GetCommandLineW
+GetEnvironmentVariableW
+GetExitCodeProcess
+QueryInformationJobObject
+ResumeThread
+Sleep
+TerminateProcess
+WaitForSingleObject
+WriteFile
+GetFileAttributesW
+TerminateJobObject

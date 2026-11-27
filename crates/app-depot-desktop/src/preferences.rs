@@ -19,6 +19,7 @@ pub enum Theme {
 pub struct Preferences {
     pub theme: Theme,
     pub grid: bool,
+    pub windows_runtime: Option<PathBuf>,
     pub last_profile: Option<String>,
     pub ui_scale: f32,
 }
@@ -27,6 +28,7 @@ impl Default for Preferences {
         Self {
             theme: Theme::System,
             grid: true,
+            windows_runtime: None,
             last_profile: None,
             ui_scale: 1.15,
         }
@@ -102,6 +104,7 @@ mod tests {
         let value = Preferences {
             theme: Theme::Light,
             grid: false,
+            windows_runtime: None,
             last_profile: Some("profile".into()),
             ui_scale: 1.25,
         };
