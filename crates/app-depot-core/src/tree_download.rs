@@ -261,6 +261,140 @@ fn tree_object_mismatch(
 }
 
 impl Library {
+    /// A Completed job bypasses acquisition. Recover only after the installation copy
+    /// detects a bad source, while the coordinator still holds the download slot.
+    #[cfg(windows)]
+    pub(crate) fn repair_install_object(
+        &self,
+        jobs: &[DownloadJob],
+        digest: &str,
+        size: u64,
+        client: Option<&ApiClient>,
+    ) -> Result<bool, LibraryError> {
+        let object = self.object(&format!("adfile:sha256:{digest}"))?;
+        let mismatch = match open_regular(&object, false) {
+            Ok(file) => match tree_object_mismatch(&file, &object, size, digest)? {
+                None => return Ok(false),
+                Some(reason) => Some(reason),
+            },
+            Err(LibraryError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e),
+        };
+        let detail = mismatch.clone().unwrap_or_else(|| {
+            format!(
+                "missing CAS object {}, expected {size} bytes SHA-256 {digest}",
+                object.display()
+            )
+        });
+        for job in jobs {
+            let (stage, visible, member) = if job.artifact_id.starts_with("adtree:") {
+                let entries = self
+                    .tree_inventory(&job.id)?
+                    .ok_or_else(|| invalid("missing completed Tree inventory"))?;
+                if identity(&entries)? != job.artifact_id {
+                    return Err(invalid("completed Tree inventory identity mismatch"));
+                }
+                validate_destination(&entries)?;
+                let Some((path, id)) = entries.iter().find_map(|e| match e {
+                    InventoryEntry::File {
+                        path,
+                        file_id,
+                        sha256,
+                        size: n,
+                        ..
+                    } if sha256 == digest && *n == size => Some((path, file_id)),
+                    _ => None,
+                }) else {
+                    continue;
+                };
+                (
+                    child_stage(self, &job.id, id)?,
+                    tree_destination(self, job)?.join(path),
+                    Some(id.clone()),
+                )
+            } else if job.artifact_id == format!("adfile:sha256:{digest}")
+                && job.expected_size == size
+            {
+                (self.stage(&job.id)?, self.materialized(job)?, None)
+            } else {
+                continue;
+            };
+            let recover = (|| -> Result<(), LibraryError> {
+                let mut source = None;
+                for path in [&stage, &visible] {
+                    if safe_regular(path)? {
+                        let file = open_regular(path, false)?;
+                        if file.metadata()?.len() == size
+                            && crate::transfer::hash_open_file(&file, size)? == digest
+                        {
+                            source = Some(path);
+                            break;
+                        }
+                    }
+                }
+                let source = if let Some(path) = source {
+                    path
+                } else {
+                    let api = client.ok_or_else(|| {
+                        invalid("connect the source profile to reacquire this member")
+                    })?;
+                    let profile = self.profile(&job.profile_id)?;
+                    if profile.archived || profile.origin != api.origin() {
+                        return Err(invalid(
+                            "active source profile and client origin must match",
+                        ));
+                    }
+                    private_dir(stage.parent().unwrap())?;
+                    let mut file = if safe_regular(&stage)? {
+                        open_regular(&stage, true)?
+                    } else {
+                        create_content_file(&stage)?
+                    };
+                    let response = if let Some(id) = member.as_ref() {
+                        api.tree_file_content(&job.artifact_id, id, None, None, size)?
+                    } else {
+                        api.file_content(&job.artifact_id, None, None)?
+                    };
+                    file.set_len(0)?;
+                    receive_blob(
+                        response,
+                        &mut file,
+                        0,
+                        Sha256::new(),
+                        BlobSpec {
+                            expected_size: size,
+                            expected_digest: digest,
+                            prior_etag: None,
+                            pause_after: None,
+                            checkpoint_on_complete: false,
+                        },
+                        |_, _, _, _| Ok(false),
+                        |_, _| {},
+                    )?;
+                    file.sync_all()?;
+                    &stage
+                };
+                private_dir(object.parent().unwrap())?;
+                if mismatch.is_some() {
+                    private_dir(&stage_root(self, &job.id)?)?;
+                    self.replace_invalid_tree_object(source, &object, size, digest, &job.id)?;
+                } else {
+                    publish_content(source, &object, size, digest)?;
+                    sync_dir(object.parent().unwrap())?;
+                }
+                Ok(())
+            })();
+            return recover.map(|()| true).map_err(|e| {
+                invalid(format!(
+                    "{detail}; completed download {}, source {}: {e}",
+                    job.id,
+                    visible.display()
+                ))
+            });
+        }
+        Err(invalid(format!("{detail}; no authorized completed source")))
+    }
+
     // Called under the download slot, only after a checked replacement is ready.
     fn replace_invalid_tree_object(
         &self,
@@ -351,6 +485,9 @@ impl Library {
         let artifact = client.artifact(&association.artifact_id)?;
         if artifact.kind != "Tree" {
             return Err(invalid("Association is not a Tree Artifact"));
+        }
+        if let Some(id) = self.failed_source_job(profile_id, association_id, &artifact.id)? {
+            return self.retry_job(&id);
         }
         let id = Uuid::new_v4().to_string();
         let time = now()?;
@@ -1484,6 +1621,117 @@ mod tests {
         }
         (root, library, job, entries)
     }
+    #[cfg(windows)]
+    #[test]
+    fn completed_tree_recovers_one_missing_member_when_local_copies_are_absent() {
+        use std::io::{BufRead, BufReader, Write};
+        let (_root, library, job, entries) = fixture();
+        library
+            .conn
+            .execute(
+                "UPDATE download_jobs SET state='Completed', progress=expected_size WHERE id=?1",
+                [&job.id],
+            )
+            .unwrap();
+        let InventoryEntry::File {
+            file_id,
+            sha256,
+            size,
+            ..
+        } = &entries[0]
+        else {
+            unreachable!()
+        };
+        let object = library.object(&format!("adfile:sha256:{sha256}")).unwrap();
+        fs::remove_file(&object).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let api = ApiClient::new(
+            &format!("http://{}", listener.local_addr().unwrap()),
+            None,
+            false,
+        )
+        .unwrap();
+        library
+            .conn
+            .execute(
+                "UPDATE profiles SET origin=?1 WHERE id=?2",
+                params![api.origin(), job.profile_id.0],
+            )
+            .unwrap();
+        let route = format!(
+            "GET /api/v1/artifacts/{}/files/{file_id} HTTP/1.1",
+            job.artifact_id
+        );
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut lines = BufReader::new(&stream).lines();
+            assert_eq!(lines.next().unwrap().unwrap(), route);
+            for line in lines {
+                if line.unwrap().is_empty() {
+                    break;
+                }
+            }
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: 1\r\nETag: \"fixture\"\r\nConnection: close\r\n\r\nA").unwrap();
+        });
+        assert!(
+            library
+                .repair_install_object(std::slice::from_ref(&job), sha256, *size, Some(&api))
+                .unwrap()
+        );
+        server.join().unwrap();
+        assert_eq!(fs::read(&object).unwrap(), b"A");
+        assert_eq!(library.job(&job.id).unwrap().state, "Completed");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn remove_failed_job_accepts_missing_staging_and_preserves_shared_objects() {
+        for missing in [false, true] {
+            let (_root, mut library, job, entries) = fixture();
+            let InventoryEntry::File {
+                path,
+                file_id,
+                size,
+                sha256,
+                ..
+            } = &entries[0]
+            else {
+                unreachable!()
+            };
+            library
+                .conn
+                .execute(
+                    "UPDATE download_jobs SET state='Failed',progress=expected_size WHERE id=?1",
+                    [&job.id],
+                )
+                .unwrap();
+            library.conn.execute("INSERT INTO tree_files(job_id,path,file_id,size,sha256,executable,progress,verified) VALUES (?1,?2,?3,?4,?5,0,?4,1)",params![job.id,path,file_id,size,sha256]).unwrap();
+            let stage = stage_root(&library, &job.id).unwrap();
+            if !missing {
+                private_dir(&stage.join("files")).unwrap();
+                fs::write(stage.join("job.lock"), b"").unwrap();
+                let part = child_stage(&library, &job.id, file_id).unwrap();
+                fs::write(&part, b"A").unwrap();
+                fs::write(stage.join("unrelated"), b"keep").unwrap();
+                assert!(
+                    library
+                        .remove_failed_download(&job.id)
+                        .unwrap_err()
+                        .to_string()
+                        .contains("unrelated")
+                );
+                assert!(part.exists());
+                fs::remove_file(stage.join("unrelated")).unwrap();
+            }
+            library.cancel_job(&job.id).unwrap();
+            library.remove_failed_download(&job.id).unwrap();
+            assert!(!stage.exists());
+            assert!(library.job(&job.id).is_err());
+            let object = library.object(&format!("adfile:sha256:{sha256}")).unwrap();
+            assert_eq!(fs::read(object).unwrap(), b"A");
+        }
+    }
+
     #[test]
     fn corrupt_tree_object_recovers_only_its_member() {
         use std::io::{BufRead, BufReader, Write};

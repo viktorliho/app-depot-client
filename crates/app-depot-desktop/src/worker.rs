@@ -140,6 +140,8 @@ pub enum Command {
     Retry(String),
     MoveToTop(String),
     Cancel(String),
+    #[cfg(windows)]
+    RemoveFailedDownload(String),
     TreeFiles(String),
     Artwork {
         profile: ServerProfileId,
@@ -275,7 +277,7 @@ fn run_standard(
 }
 
 pub(crate) const WINDOWS_INSTALL_ONLY: bool = cfg!(windows);
-pub(crate) const WINDOWS_INSTALL_NOTICE: &str = "Windows supports File and Tree installation, native Play and removal of verified working copies. Repair is unavailable.";
+pub(crate) const WINDOWS_INSTALL_NOTICE: &str = "Windows supports File and Tree downloads. Retry resumes a failed transfer. Uninstall removes installation working copies and retains verified downloads.";
 
 impl Command {
     fn blocked_on_windows(&self) -> bool {
@@ -809,7 +811,14 @@ fn operation(
                         )
                     });
                 if let Err(e) = result {
-                    send(&tx, &ctx, Event::Error(e));
+                    send(
+                        &tx,
+                        &ctx,
+                        Event::Error(format!(
+                            "Installation attempt (build {}, plan {plan}): {e}",
+                            env!("APP_DEPOT_SOURCE_REVISION")
+                        )),
+                    );
                 }
                 MANIFEST_BUSY.store(false, Ordering::SeqCst);
                 send(
@@ -1003,11 +1012,20 @@ fn operation(
                 lib.move_job_to_top(&job.id).map_err(|e| e.to_string())?;
             }
         }
+        #[cfg(windows)]
+        Command::RemoveFailedDownload(id) => {
+            lib.remove_failed_download(&id).map_err(|e| e.to_string())?;
+            if let Some(profile) = selected.as_ref() {
+                send_jobs(lib, profile, true, tx, ctx)?;
+            }
+            return Ok(false);
+        }
         Command::Pause(id) => {
             lib.pause_job(&id).map_err(|e| e.to_string())?;
         }
         Command::Cancel(id) => {
-            lib.cancel_job(&id).map_err(|e| e.to_string())?;
+            lib.cancel_job(&id)
+                .map_err(|e| format!("cancel download {id}: {e}"))?;
         }
         Command::Resume(id) | Command::Retry(id) => {
             lib.retry_job(&id).map_err(|e| e.to_string())?;
@@ -2303,6 +2321,24 @@ mod tests {
         let prereq = source(&db, &paths, &profile, &release, b"synthetic prerequisite");
         let mut plan = json!({"version":1,"appId":app,"releaseId":release,"revisionId":revision,"platform":manifest_platform().unwrap(),"selections":{},"unresolved":[],"files":{"app":payload},"directories":[],"prerequisites":[],"launch":null});
         let (base, fp) = save(&db, &profile, &plan);
+        #[cfg(windows)]
+        {
+            let hash = payload["sha256"].as_str().unwrap();
+            let object = paths.content.join("objects").join(&hash[..2]).join(hash);
+            fs::write(&object, b"damaged").unwrap();
+            let generation = id();
+            let install = id();
+            db.execute("INSERT INTO release_installations(id,profile_id,app_id,release_id) VALUES (?1,?2,?3,?4)",params![install,profile.0,app,release]).unwrap();
+            db.execute("INSERT INTO installation_generations(id,installation_id,plan_id,state,last_error) VALUES (?1,?2,?3,'Preparing',?4)", params![generation,install,base,"old cached failure"]).unwrap();
+            lib.uninstall_release_installation(&profile, &release)
+                .unwrap();
+            assert!(
+                lib.release_installation(&profile, &release)
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(fs::read(&object).unwrap(), b"damaged");
+        }
         run_standard(
             &mut lib,
             &profile,

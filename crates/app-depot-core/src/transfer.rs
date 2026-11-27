@@ -433,6 +433,48 @@ impl Library {
         id.map(|id| self.job(&id)).transpose()
     }
 
+    pub(crate) fn failed_source_job(
+        &self,
+        profile: &ServerProfileId,
+        association: &str,
+        artifact: &str,
+    ) -> Result<Option<String>, LibraryError> {
+        Ok(self.conn.query_row("SELECT id FROM download_jobs WHERE profile_id=?1 AND association_id=?2 AND artifact_id=?3 AND state='Failed' ORDER BY progress DESC,updated_at DESC,rowid DESC LIMIT 1",params![profile.0,association,artifact],|row| row.get(0)).optional()?)
+    }
+
+    #[cfg(windows)]
+    pub fn remove_failed_download(&mut self, id: &str) -> Result<(), LibraryError> {
+        let _slot = self.lock_download_slot()?;
+        let stage = self.stage(id)?;
+        let root = stage.parent().expect("job stage");
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let state: String =
+            tx.query_row("SELECT state FROM download_jobs WHERE id=?1", [id], |row| {
+                row.get(0)
+            })?;
+        if !matches!(state.as_str(), "Failed" | "Cancelled") {
+            return Err(invalid("only failed or cancelled downloads can be removed"));
+        }
+        let mut stmt = tx.prepare("SELECT file_id FROM tree_files WHERE job_id=?1")?;
+        let parts = stmt
+            .query_map([id], |row| row.get::<_, String>(0))?
+            .map(|id| id.map(|id| format!("{id}.part")))
+            .collect::<Result<std::collections::HashSet<_>, _>>()?;
+        drop(stmt);
+        crate::windows_fs::cleanup_job_stage(root, &parts).map_err(|error| {
+            invalid(format!(
+                "remove download {id}, staging {}: {error}",
+                root.display()
+            ))
+        })?;
+        tx.execute("DELETE FROM tree_files WHERE job_id=?1", [id])?;
+        tx.execute("DELETE FROM download_jobs WHERE id=?1", [id])?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn next_queued_job(&self) -> Result<Option<DownloadJob>, LibraryError> {
         let id: Option<String> = self.conn.query_row(
             "SELECT j.id FROM download_jobs j JOIN profiles p ON p.id=j.profile_id WHERE j.state='Queued' AND p.archived=0 ORDER BY j.queue_rank DESC,j.created_at,j.id LIMIT 1",
@@ -605,6 +647,9 @@ impl Library {
             .ok_or_else(|| invalid("File Artifact size missing"))?;
         if size > i64::MAX as u64 {
             return Err(invalid("File Artifact exceeds supported local size"));
+        }
+        if let Some(id) = self.failed_source_job(profile_id, association_id, &artifact.id)? {
+            return self.retry_job(&id);
         }
         let id = Uuid::new_v4().to_string();
         let time = now()?;

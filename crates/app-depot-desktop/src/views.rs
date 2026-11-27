@@ -2108,6 +2108,10 @@ impl Desktop {
                                     .id_salt(("history", &job.id))
                                     .show(ui, |ui| {
                                         if !worker::WINDOWS_INSTALL_ONLY && let Some(path)=&local_path && ui.button("Open folder").clicked(){self.send(Command::Reveal(path.clone()));}
+                                        #[cfg(windows)]
+                                        if job.state == "Cancelled" && ui.button("Remove cancelled download").clicked() {
+                                            self.send(Command::RemoveFailedDownload(job.id.clone()));
+                                        }
                                         copy_line(ui, "Job ID", &job.id);
                                         copy_line(ui, "Artifact ID", &job.artifact_id);
                                         copy_line(ui, "Association ID", &job.association_id);
@@ -3071,7 +3075,17 @@ pub(super) fn job_actions(job: &DownloadJob) -> Vec<(&'static str, Command)> {
         "Failed" => vec![
             ("Retry", Command::Retry(job.id.clone())),
             ("Cancel", Command::Cancel(job.id.clone())),
+            #[cfg(windows)]
+            (
+                "Remove failed download",
+                Command::RemoveFailedDownload(job.id.clone()),
+            ),
         ],
+        #[cfg(windows)]
+        "Cancelled" => vec![(
+            "Remove cancelled download",
+            Command::RemoveFailedDownload(job.id.clone()),
+        )],
         _ => vec![],
     }
 }

@@ -541,7 +541,7 @@ pub(crate) fn publish_tree_install(
     entries: &[crate::models::InventoryEntry],
     object: impl Fn(&str) -> io::Result<std::path::PathBuf>,
 ) -> io::Result<()> {
-    stage_install_tree(to, id, entries, object, true, &mut |_, _| {})
+    stage_install_tree(to, id, entries, object, true, None, &mut |_, _| {})
 }
 
 /// Private attempt workspace. The complete published layout is checked exactly
@@ -554,7 +554,7 @@ pub(crate) fn prepare_verified_tree(
     progress: &mut dyn FnMut(&str),
 ) -> io::Result<()> {
     let mut last = std::time::Instant::now();
-    stage_install_tree(to, id, entries, object, false, &mut |done, total| {
+    stage_install_tree(to, id, entries, object, false, None, &mut |done, total| {
         if done == total || last.elapsed() >= std::time::Duration::from_millis(500) {
             progress(&format!("Copying source entries: {done} / {total}"));
             last = std::time::Instant::now();
@@ -574,12 +574,15 @@ pub(crate) fn prepare_verified_tree(
     })
 }
 
-fn stage_install_tree(
+pub(crate) type MemberRepair<'a> = &'a dyn Fn(&str, u64) -> io::Result<bool>;
+
+pub(crate) fn stage_install_tree(
     to: &Path,
     id: &str,
     entries: &[crate::models::InventoryEntry],
     object: impl Fn(&str) -> io::Result<std::path::PathBuf>,
     verify_member: bool,
+    repair: Option<MemberRepair<'_>>,
     progress: &mut dyn FnMut(usize, usize),
 ) -> io::Result<()> {
     validate_install_layout(entries)?;
@@ -590,7 +593,7 @@ fn stage_install_tree(
             true,
             DIRECTORY_ACCESS | GENERIC_WRITE,
         )?;
-        write_tree(&payload, entries, object, verify_member, progress)
+        write_tree(&payload, entries, object, verify_member, repair, progress)
     })
 }
 
@@ -1126,6 +1129,69 @@ pub(crate) fn create_prerequisite_workspace(path: &Path, attempt: &str) -> io::R
     sync_directory(parent)
 }
 
+/// Delete only known private staging names. No CAS, published tree or installation
+/// paths are traversed. Preflight the whole selection before deleting by handle.
+pub(crate) fn cleanup_job_stage(
+    path: &Path,
+    parts: &std::collections::HashSet<String>,
+) -> io::Result<()> {
+    let parent = path.parent().unwrap();
+    let chain = directory_chain(parent, false)?;
+    let root = match open_removal_directory(chain.last().unwrap(), path.file_name().unwrap()) {
+        Ok(file) => file,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    require_case_insensitive(&root)?;
+    let mut handles = Vec::new();
+    for entry in std::fs::read_dir(path)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name == "files" {
+            let directory = open_removal_directory(&root, &name)?;
+            require_case_insensitive(&directory)?;
+            for child in std::fs::read_dir(entry.path())? {
+                let child = child?;
+                if !child
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|n| parts.contains(n))
+                {
+                    return Err(io::Error::other(format!(
+                        "unexpected staging entry {}",
+                        child.path().display()
+                    )));
+                }
+                handles.push(open_removal_file(&directory, &child.file_name())?);
+            }
+            handles.push(directory);
+        } else if name == "file.part"
+            || name == "job.lock"
+            || name.to_str().is_some_and(|n| {
+                n.strip_prefix("invalid-").is_some_and(|rest| {
+                    rest.split_once('-').is_some_and(|(hash, id)| {
+                        hash.len() == 64
+                            && hash.bytes().all(|b| b.is_ascii_hexdigit())
+                            && uuid::Uuid::parse_str(id).is_ok_and(|u| u.to_string() == id)
+                    })
+                })
+            })
+        {
+            handles.push(open_removal_file(&root, &name)?);
+        } else {
+            return Err(io::Error::other(format!(
+                "unexpected staging entry {}",
+                entry.path().display()
+            )));
+        }
+    }
+    for file in handles {
+        delete_open_file(file)?;
+    }
+    delete_open_file(root)?;
+    sync_directory(parent)
+}
+
 /// Ephemeral workspace cleanup, not removal of a user installation. Pin the
 /// entire owned tree before deletion, refusing reparse points, extra streams
 /// and multiply-linked files. Keep the ownership marker until the end.
@@ -1198,7 +1264,7 @@ pub(crate) fn publish_tree(
         true,
         DIRECTORY_ACCESS | DELETE | GENERIC_WRITE,
     )?;
-    write_tree(&stage, entries, object, true, &mut |_, _| {})?;
+    write_tree(&stage, entries, object, true, None, &mut |_, _| {})?;
     rename_noreplace(&stage, parent, &name_utf16(name)?)?;
     sync_directory(parent_path)
 }
@@ -1208,6 +1274,7 @@ fn write_tree(
     entries: &[crate::models::InventoryEntry],
     object: impl Fn(&str) -> io::Result<std::path::PathBuf>,
     verify_member: bool,
+    repair: Option<MemberRepair<'_>>,
     progress: &mut dyn FnMut(usize, usize),
 ) -> io::Result<()> {
     use crate::models::InventoryEntry;
@@ -1249,14 +1316,39 @@ fn write_tree(
             InventoryEntry::File { size, sha256, .. } => {
                 let path = object(sha256)?;
                 if verify_member {
-                    publish_copy_at(
-                        &path,
-                        target,
-                        &name_utf16(OsStr::new(leaf))?,
-                        *size,
-                        false,
-                        |source, out| crate::transfer::copy_verified(source, out, *size, sha256),
-                    )?;
+                    let copy = || {
+                        publish_copy_at(
+                            &path,
+                            target,
+                            &name_utf16(OsStr::new(leaf))?,
+                            *size,
+                            false,
+                            |source, out| {
+                                crate::transfer::copy_verified(source, out, *size, sha256)
+                            },
+                        )
+                    };
+                    if let Err(error) = copy() {
+                        if matches!(
+                            error.kind(),
+                            io::ErrorKind::InvalidData
+                                | io::ErrorKind::NotFound
+                                | io::ErrorKind::UnexpectedEof
+                        ) && let Some(repair) = repair
+                            && repair(sha256, *size)?
+                        {
+                            copy()?;
+                        } else {
+                            return Err(io::Error::new(
+                                error.kind(),
+                                format!(
+                                    "prepare {} from {} (expected {size} bytes, SHA-256 {sha256}): {error}",
+                                    entry.path(),
+                                    path.display()
+                                ),
+                            ));
+                        }
+                    }
                 } else {
                     copy_workspace_file(&path, target, OsStr::new(leaf), *size)?;
                 }

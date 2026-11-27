@@ -515,6 +515,7 @@ impl Desktop {
                     if let Some(error) = &g.last_error {
                         ui.label("Installation needs attention.");
                         ui.collapsing("Failure details", |ui| {
+                            ui.label(format!("Last recorded failure for generation {}", g.id));
                             ui.label(error);
                         });
                     }

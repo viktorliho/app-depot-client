@@ -271,11 +271,14 @@ mod coordinator {
             if pending.is_none() {
                 tx.execute("INSERT INTO installation_generations(id,installation_id,plan_id,state) VALUES (?1,?2,?3,'Preparing')",params![id,install_id,plan_id])?;
             }
+            tx.execute("UPDATE installation_generations SET last_error=NULL WHERE id=?1 AND state='Preparing'", [&id])?;
             for (association, artifact) in &retained {
                 tx.execute("INSERT OR IGNORE INTO installation_sources(generation_id,association_id,artifact_id) VALUES (?1,?2,?3)",params![id,association,artifact])?;
             }
             tx.commit()?;
             let prepared = (|| -> Result<(), LibraryError> {
+                #[cfg(windows)]
+                let mut jobs = Vec::new();
                 for ((association, artifact), files) in &sources {
                     let job = self.acquire_plan_source(
                         profile,
@@ -285,6 +288,8 @@ mod coordinator {
                         client,
                     )?;
                     self.authorize_plan_files(&job, files)?;
+                    #[cfg(windows)]
+                    jobs.push(job);
                 }
                 let _download = self.lock_download_slot()?;
                 let target = self.paths.content.join("apps").join(&id);
@@ -302,11 +307,14 @@ mod coordinator {
                         #[cfg(target_os = "linux")]
                         crate::transfer::sync_dir(&self.paths.content.join("staging"))?;
                     }
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                        publish_generation(&self.paths.content, &id, &layout, |digest| {
-                            self.object(&format!("adfile:sha256:{digest}"))
-                        })?
-                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => publish_generation(
+                        &self.paths.content,
+                        &id,
+                        &layout,
+                        |digest| self.object(&format!("adfile:sha256:{digest}")),
+                        #[cfg(windows)]
+                        |digest, size| self.repair_install_object(&jobs, digest, size, client),
+                    )?,
                     Err(e) => return Err(e.into()),
                 }
                 let state = if !plan
@@ -914,7 +922,11 @@ mod coordinator {
             })?;
             self.reconcile_file_jobs()?;
             self.reconcile_tree_jobs()?;
-            let mut job = if artifact.starts_with("adfile:") {
+            let mut job = if let Some(job) = self.active_association_job(profile, association)? {
+                job
+            } else if let Some(id) = self.failed_source_job(profile, association, artifact)? {
+                self.job(&id)?
+            } else if artifact.starts_with("adfile:") {
                 self.queue_file(client, profile, release, association)?
             } else {
                 self.queue_tree(client, profile, release, association)?
@@ -928,12 +940,21 @@ mod coordinator {
                 job = self.retry_job(&job.id)?;
             }
             let job = if artifact.starts_with("adfile:") {
-                self.run_file_job(client, &job.id, None)?
+                self.run_file_job(client, &job.id, None)
             } else {
-                self.run_tree_job(client, &job.id, None)?
-            };
+                self.run_tree_job(client, &job.id, None)
+            }
+            .map_err(|e| {
+                invalid(format!(
+                    "download job {} ({}), source {association}, artifact {artifact}: {e}",
+                    job.id, job.state
+                ))
+            })?;
             if job.state != "Completed" {
-                return Err(invalid("download did not complete"));
+                return Err(invalid(format!(
+                    "download job {} stopped in {} for source {association}",
+                    job.id, job.state
+                )));
             }
             Ok(job)
         }

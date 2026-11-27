@@ -250,12 +250,16 @@ pub(crate) fn publish_generation(
     id: &str,
     entries: &[InventoryEntry],
     object: impl Fn(&str) -> Result<std::path::PathBuf, LibraryError>,
+    repair: impl Fn(&str, u64) -> Result<bool, LibraryError>,
 ) -> Result<(), LibraryError> {
-    crate::windows_fs::publish_tree_install(
+    crate::windows_fs::stage_install_tree(
         &content.join("apps").join(id),
         id,
         entries,
         |digest| object(digest).map_err(std::io::Error::other),
+        true,
+        Some(&|digest, size| repair(digest, size).map_err(std::io::Error::other)),
+        &mut |_, _| {},
     )?;
     Ok(())
 }

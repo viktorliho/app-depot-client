@@ -469,6 +469,7 @@ impl Library {
         let Some(installation) = self.release_installation(profile, release)? else {
             return Ok(());
         };
+        let mut unpublished = std::collections::HashSet::new();
         let mut intents = Vec::new();
         for generation in &installation.generations {
             let id = &generation.id;
@@ -484,10 +485,24 @@ impl Library {
                 continue;
             }
             let root = self.generation_removal_root(id)?;
+            if generation.state == "Preparing"
+                && installation.active_generation.as_ref() != Some(id)
+                && !present(&root)?
+            {
+                unpublished.insert(id.clone());
+                continue;
+            }
             let plan = self.load_install_plan(profile, &generation.plan_id)?;
             let entries = crate::materialization::destination_layout(&plan)?;
             let inspection =
-                windows_fs::inspect_removal_layout(&root, id, |_| Ok(()), Some(&entries))?;
+                windows_fs::inspect_removal_layout(&root, id, |_| Ok(()), Some(&entries)).map_err(
+                    |e| {
+                        invalid(&format!(
+                            "inspect generation {id} at {} for removal: {e}",
+                            root.display()
+                        ))
+                    },
+                )?;
             intents.push((
                 id,
                 Uuid::new_v4().to_string(),
@@ -499,6 +514,17 @@ impl Library {
             "UPDATE release_installations SET active_generation=NULL WHERE id=?1",
             [&installation.id],
         )?;
+        for id in &unpublished {
+            tx.execute(
+                "DELETE FROM installation_sources WHERE generation_id=?1",
+                [id],
+            )?;
+            tx.execute(
+                "DELETE FROM installation_generations WHERE id=?1 AND state='Preparing'",
+                [id],
+            )?;
+        }
+        tx.execute("DELETE FROM release_installations WHERE id=?1 AND NOT EXISTS(SELECT 1 FROM installation_generations WHERE installation_id=?1)",[&installation.id])?;
         for (id, nonce, identities) in intents {
             tx.execute(
                 "UPDATE installation_generations SET state='Removing' WHERE id=?1",
@@ -508,7 +534,9 @@ impl Library {
         }
         tx.commit()?;
         for generation in &installation.generations {
-            self.continue_generation_removal(&generation.id)?;
+            if !unpublished.contains(&generation.id) {
+                self.continue_generation_removal(&generation.id)?;
+            }
         }
         Ok(())
     }
