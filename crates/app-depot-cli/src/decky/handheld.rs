@@ -159,7 +159,7 @@ impl Session {
                 .map(|c| {
                     format!(
                         "{}  {}",
-                        if ids.contains(&c.id) { "✓" } else { "○" },
+                        if ids.contains(&c.id) { "[x]" } else { "[ ]" },
                         c.name
                     )
                 })
@@ -490,6 +490,7 @@ impl eframe::App for PlayUi {
             }
             if let Some(p) = &self.prompt {
                 ui.heading(&p.title);
+                let mut scrollable = false;
                 if !p.detail.is_empty() {
                     let height = (ui.available_height() * 0.40).clamp(62., 240.);
                     let mut area = egui::ScrollArea::vertical()
@@ -498,11 +499,10 @@ impl eframe::App for PlayUi {
                     if page != 0. {
                         area = area.vertical_scroll_offset((self.review_scroll + page).max(0.));
                     }
-                    self.review_scroll = area
-                        .show(ui, |ui| ui.label(egui::RichText::new(&p.detail).size(18.)))
-                        .state
-                        .clamped_offset()
-                        .y;
+                    let review =
+                        area.show(ui, |ui| ui.label(egui::RichText::new(&p.detail).size(18.)));
+                    self.review_scroll = review.state.clamped_offset().y;
+                    scrollable = review.content_size.y > review.inner_rect.height();
                 }
                 self.focus = (self.focus as isize + step as isize)
                     .rem_euclid(p.actions.len() as isize) as usize;
@@ -527,6 +527,7 @@ impl eframe::App for PlayUi {
                             }
                         }
                     });
+                let navigate = p.actions.len() > 1;
                 let back_label = if p.back { "B  Back" } else { "B  Exit" };
                 if let Some(i) = picked
                     && let Some(p) = self.prompt.take()
@@ -535,7 +536,13 @@ impl eframe::App for PlayUi {
                     let _ = p.reply.send(Some(i));
                 }
                 ui.horizontal(|ui| {
-                    ui.label("↑ ↓  Choose     A  Confirm     LB / RB  Scroll");
+                    if navigate {
+                        ui.label("D-pad / stick  Choose");
+                    }
+                    ui.label("A  Confirm");
+                    if scrollable {
+                        ui.label("LB / RB  Scroll");
+                    }
                     if ui.button(back_label).clicked() {
                         self.back();
                     }
