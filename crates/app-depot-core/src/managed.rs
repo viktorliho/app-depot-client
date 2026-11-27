@@ -517,9 +517,30 @@ impl Library {
     }
 
     #[cfg(target_os = "linux")]
+    fn uninstall_releases(
+        &self,
+        profile: &ServerProfileId,
+        app: &str,
+    ) -> Result<Vec<String>, LibraryError> {
+        let mut stmt = self.conn.prepare("SELECT i.release_id,r.app_id FROM release_installations i LEFT JOIN releases r ON (r.profile_id,r.id)=(i.profile_id,i.release_id) WHERE i.profile_id=?1 AND i.app_id=?2 ORDER BY i.release_id")?;
+        let mut releases = Vec::new();
+        for entry in stmt.query_map(params![profile.0, app], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        })? {
+            let (release, owner) = entry?;
+            if owner.as_deref() != Some(app) {
+                return Err(invalid("local uninstall release owner changed"));
+            }
+            releases.push(release);
+        }
+        Ok(releases)
+    }
+
+    #[cfg(target_os = "linux")]
     fn inspect_uninstall(
         &self,
         profile: &ServerProfileId,
+        app: &str,
         targets: &[UninstallTarget],
     ) -> Result<Option<LocalUninstall>, LibraryError> {
         let mut revision = Sha256::new();
@@ -528,9 +549,22 @@ impl Library {
         let mut download_bytes = 0u64;
         let mut blocked = false;
         let mut local = false;
+        for release in self.uninstall_releases(profile, app)? {
+            let installation = self
+                .release_installation(profile, &release)?
+                .ok_or_else(|| invalid("local uninstall selection changed"))?;
+            local = true;
+            revision.update(serde_json::to_vec(&installation)?);
+            blocked |= self.release_removal_busy(&installation)?;
+            for generation in installation.generations {
+                states.insert(generation.state);
+                runtime_bytes =
+                    runtime_bytes.saturating_add(owned_logical_bytes(&generation.path)?);
+            }
+        }
         for (association, artifact, release, id) in targets {
             revision.update(serde_json::to_vec(&(association, artifact, release, id))?);
-            blocked |= self.source_in_use(profile, association, artifact)?;
+            blocked |= self.conn.query_row("SELECT EXISTS(SELECT 1 FROM installation_sources s JOIN installation_generations g ON g.id=s.generation_id JOIN release_installations i ON i.id=g.installation_id WHERE i.profile_id=?1 AND s.association_id=?2 AND s.artifact_id=?3 AND i.app_id<>?4)",params![profile.0,association,artifact,app], |r|r.get::<_,bool>(0))?;
             if let Some(id) = id {
                 let item = self.installation(id)?;
                 let (updated, pid, start): (i64, Option<i64>, Option<String>) =
@@ -592,7 +626,7 @@ impl Library {
         app: &str,
     ) -> Result<Option<LocalUninstall>, LibraryError> {
         let mut preview =
-            self.inspect_uninstall(profile, &self.uninstall_targets(profile, app)?)?;
+            self.inspect_uninstall(profile, app, &self.uninstall_targets(profile, app)?)?;
         if let Some(preview) = &mut preview {
             for lock in [self.lifecycle_lock(), self.lock_download_slot()] {
                 match lock {
@@ -621,6 +655,9 @@ impl Library {
         let _lifecycle = self.lifecycle_lock()?;
         let _download = self.lock_download_slot()?;
         let ids = self.journal_uninstall(profile, app, revision)?;
+        for release in self.uninstall_releases(profile, app)? {
+            self.uninstall_release_installation_locked(profile, &release)?;
+        }
         for id in ids {
             self.remove_installation_locked(&id, true, false, &mut |_| {})?;
         }
@@ -640,7 +677,7 @@ impl Library {
         )?;
         let targets = self.uninstall_targets(profile, app)?;
         let preview = self
-            .inspect_uninstall(profile, &targets)?
+            .inspect_uninstall(profile, app, &targets)?
             .ok_or_else(|| invalid("local uninstall selection changed"))?;
         if preview.blocked {
             return Err(invalid("local uninstall blocked by an active operation"));
@@ -1040,7 +1077,7 @@ impl Library {
                     continue;
                 }
                 self.conn.execute(
-                    "UPDATE installations SET last_error=?2,updated_at=?3 WHERE id=?1",
+                    "UPDATE installations SET last_error=?2,updated_at=?3 WHERE id=?1 AND last_error IS NOT ?2",
                     params![id, error.to_string(), now()?],
                 )?;
             }

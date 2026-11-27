@@ -39,7 +39,7 @@ xvfb-run -a dbus-run-session -- sh -ec '
 
 ~~~sh
 out="$HOME/app-depot-dev/releases/m3.1a.1"
-/usr/bin/python3 -B decky/package.py   --binary target/release/app-depot --out "$out" --development-loopback
+/usr/bin/python3 -B decky/package.py   --binary target/release/app-depot --out "$out" --development
 (cd "$out" && sha256sum -c SHA256SUMS)
 desktop-file-validate "$out/AppDepot-Decky-Installer.desktop"
 ~~~
@@ -50,7 +50,7 @@ For the public beta, download only the `AppDepot-Decky-Installer.desktop` asset 
 
 The dedicated Decky workflow builds public beta tags using `decky/package.py --github-release-tag TAG`. It publishes the ZIP, compact desktop entry, versioned Python installer and `SHA256SUMS` as a GitHub prerelease. It compares all four artifacts across two packaging runs, verifies that the desktop entry pins the script URL and digest and that the script pins the ZIP URL and digest, and checks that the Desktop latest release still has the same ID.
 
-The desktop entry keeps only a short bootstrap in `Exec` to keep the command within Dolphin's practical limits. Dolphin may reserialize the entry when its permissions change. The bootstrap downloads the versioned script over verified HTTPS, allows a single redirect to GitHub's release-asset host, limits script size, and checks the SHA-256 embedded in the desktop entry before running any downloaded code. The script stays in memory through verification and execution. The script's ZIP downloader applies the same host policy and supports resumption. App Depot Server traffic follows the Rust core's separate redirect policy. The explicit development-loopback build remains available for disposable fixtures.
+The desktop entry keeps only a short bootstrap in `Exec` to keep the command within Dolphin's practical limits. Dolphin may reserialize the entry when its permissions change. The bootstrap downloads the versioned script over verified HTTPS, allows a single redirect to GitHub's release-asset host, limits script size, and checks the SHA-256 embedded in the desktop entry before running any downloaded code. The script stays in memory through verification and execution. The script's ZIP downloader applies the same host policy and supports resumption. App Depot Server traffic follows the Rust core's separate redirect policy. For development builds, keep the desktop entry, versioned installer script and ZIP in the same directory. The launcher verifies both local files offline. Installation failures are recorded in `~/AppDepot-Decky-Installer.log`.
 
 For installer acceptance on SteamOS, download the published desktop entry using a graphical browser, enable execution in Dolphin Properties, then launch it from Dolphin. Confirm installation, enter the sudo password if prompted, observe download and verification progress and the success dialog, then confirm the new version in Gaming Mode. A local build with official URLs needs the matching assets at those exact release URLs before it can complete this test.
 
@@ -169,7 +169,7 @@ Loader 3.3.1 recognizes `PRIVILEGED_PATH` and `UNPRIVILEGED_PATH`. Its internal 
 
 `decky/update_transaction_fixture.py` runs only with a disposable protected directory named `/run/app-depot-update-fixture-*`. It exercises the signature gate, protected staging, atomic exchange, single transaction lock, shared session lease, durable journal and rollback. A prepared journal without a healthy generation restores the old directory. A recorded healthy generation survives recovery. The reload adapters in the tests simulate success, failure or interruption and compare the expected version, digest and fixture generation. This is not a Loader RPC, privileged service, enrollment implementation or actual Steam session detector. Kernel peer authentication is exercised separately on a local fixture socket. The ordinary Decky ZIP carries none of the fixture modules or test keys.
 
-Build the local review bundle after compiling the Decky CLI and frontend. It uses a loopback Desktop installer and creates a signed test manifest plus checksums. The installer does not request enrollment. Run root fixture tests only on a disposable Debian development environment.
+Build the local review bundle after compiling the Decky CLI and frontend. It uses an offline Desktop installer and creates a signed test manifest plus checksums. The installer does not request enrollment. Run root fixture tests only on a disposable Debian development environment.
 
 ~~~sh
 cargo build --release -p app-depot --features decky --locked

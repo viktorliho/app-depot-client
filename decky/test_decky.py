@@ -5,6 +5,8 @@ import io
 import json
 from pathlib import Path
 import stat
+import os
+import subprocess
 import shlex
 import sys
 import tempfile
@@ -417,6 +419,25 @@ class InstallerTests(unittest.TestCase):
         for changed in (target.replace("https:", "http:"), target.replace(".com/", ".com.evil/"),
                         target.replace(".com/", ".com:8443/"), target.replace(".com/", ".com@evil/")):
             self.assertIsNone(redirect.redirect_request(request, None, 302, "", {}, changed))
+
+    def test_offline_bootstrap_and_persistent_failure(self):
+        with tempfile.TemporaryDirectory(prefix="installer test ") as tmp:
+            directory = Path(tmp)
+            name = "AppDepot-Decky-Installer-v0.1.0-beta.8.py"
+            script = directory / name
+            script.write_text("print(development_directory)")
+            entry = package.desktop_entry(name, hashlib.sha256(script.read_bytes()).hexdigest(), True)
+            line = next(row for row in entry.splitlines() if row.startswith("Exec="))
+            args = shlex.split(line[5:])
+            desktop = directory / "Installer.desktop"
+            args[args.index("%k")] = desktop.as_uri()
+            env = {**os.environ, "HOME": tmp}
+            result = subprocess.run(args, env=env, capture_output=True, text=True, check=True)
+            self.assertEqual(result.stdout.strip(), tmp)
+            script.write_text("raise AssertionError('unverified code executed')")
+            failed = subprocess.run(args, env=env, capture_output=True, text=True)
+            self.assertNotEqual(failed.returncode, 0)
+            self.assertIn("SHA-256 verification failed", (directory / "AppDepot-Decky-Installer.log").read_text())
 
     def test_compact_bootstrap_verifies_script_before_execution(self):
         script = b"print('installer fixture executed')"

@@ -348,11 +348,17 @@ def desktop(source, url, checksum, version, development):
                 return
         elif input(note + " [y/N] ").lower() != "y":
             return
-        print("Downloading the official package…", flush=True)
-        try:
-            payload = get_package(url, checksum, development, progress=print_download_progress())
-        finally:
-            print(flush=True)
+        if development:
+            print("Reading the development package…", flush=True)
+            with (development_directory / Path(urlparse(url).path).name).open("rb") as stream:
+                payload = stream.read(MAX_PACKAGE + 1)
+            verify_digest(payload, checksum)
+        else:
+            print("Downloading the official package…", flush=True)
+            try:
+                payload = get_package(url, checksum, development, progress=print_download_progress())
+            finally:
+                print(flush=True)
         print("Checksum verified. Validating the archive…", flush=True)
         with tempfile.TemporaryDirectory(prefix="app-depot-check-") as scratch:
             unpack(payload, Path(scratch), version)
@@ -371,7 +377,11 @@ def desktop(source, url, checksum, version, development):
         if shutil.which("kdialog"):
             subprocess.run(["kdialog", "--msgbox", message], check=False)
     except Exception as error:
-        message = f"App Depot installation failed: {error}"
+        detail = f"Activation exited with status {error.returncode}" if isinstance(error, subprocess.CalledProcessError) else str(error)
+        log = Path.home() / "AppDepot-Decky-Installer.log"
+        message = f"App Depot installation failed: {detail}"
+        log.write_text(message + "\n", encoding="utf-8")
+        message += f"\nDiagnostics: {log}"
         print(message, file=sys.stderr)
         if shutil.which("kdialog"):
             subprocess.run(["kdialog", "--error", message], check=False)

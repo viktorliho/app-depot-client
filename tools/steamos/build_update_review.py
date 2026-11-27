@@ -30,7 +30,7 @@ def main():
         "DEVELOPMENT-ONLY.public-key.der": TEST_PUBLIC,
         "README.txt": (
             "Development only. The manifest uses a publicly known test key.\n"
-            "The Desktop installer downloads only from local loopback and does not enroll a helper.\n"
+            "The Desktop installer reads the neighboring ZIP offline and does not enroll a helper.\n"
             "The manifest's filename field is the canonical logical name, not a published asset.\n"
             "Do not enroll this key or distribute this bundle as an official release.\n"
         ).encode("ascii"),

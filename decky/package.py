@@ -16,7 +16,7 @@ RELEASE_BASE = "https://github.com/viktorliho/app-depot-client/releases/download
 
 def desktop_entry(url, digest, development):
     location = (
-        rf"http://127\.0\.0\.1:[0-9]+/AppDepot-Decky-Installer-v{VERSION}\.py"
+        rf"AppDepot-Decky-Installer-v{VERSION}\.py"
         if development else
         rf"{re.escape(RELEASE_BASE)}/decky-v({VERSION})/AppDepot-Decky-Installer-v\1\.py"
     )
@@ -41,10 +41,28 @@ def desktop_entry(url, digest, development):
         " or sys.exit('Installer SHA-256 verification failed'); "
         "exec(compile(source,'App Depot installer','exec'),{'installer_source':source})"
     )
+    arguments = f"{url} {digest}"
+    if development:
+        # %k is expanded by the desktop launcher as a single argument.
+        command = (
+            "import sys,hashlib,traceback; from pathlib import Path; "
+            "from urllib.parse import urlsplit,unquote; "
+            "log=Path.home()/'AppDepot-Decky-Installer.log'; "
+            "sys.excepthook=lambda *exc: (log.write_text(''.join(traceback.format_exception(*exc))),"
+            "sys.__excepthook__(*exc)); "
+            "location,name,digest=sys.argv[1:]; "
+            "directory=Path(unquote(urlsplit(location).path) if location.startswith('file:') else location).parent; "
+            f"source=(directory/name).open('rb').read({SCRIPT_LIMIT + 1}); "
+            f"0<len(source)<={SCRIPT_LIMIT} and hashlib.sha256(source).hexdigest()==digest"
+            " or (_ for _ in ()).throw(ValueError('Installer SHA-256 verification failed')); "
+            "exec(compile(source,'App Depot installer','exec'),"
+            "{'installer_source':source,'development_directory':directory})"
+        )
+        arguments = f"%k {url} {digest}"
     return ('#!/usr/bin/env xdg-open\n[Desktop Entry]\nType=Application\n'
             'Name=Install App Depot for Decky\nIcon=system-software-install\n'
-            'Terminal=true\n'
-            f'Exec=/usr/bin/python3 -I -c "{command}" {url} {digest}\n'
+            'Terminal=true\nTerminalOptions=--noclose\n'
+            f'Exec=/usr/bin/python3 -I -c "{command}" {arguments}\n'
             f'\n# Script: {url}\n# Script SHA-256: {digest}\n')
 
 
@@ -84,7 +102,7 @@ def build(binary, out, base_url, development, github_release_tag=None):
     ):
         raise ValueError("Use an official release tag or an explicit development-loopback URL")
     script = out / f"AppDepot-Decky-Installer-v{version}.py"
-    package_url = f"{base_url}/{package.name}"
+    package_url = package.name if development else f"{base_url}/{package.name}"
     source_bytes = (source / "installer.py").read_bytes() + (
         f"\ndesktop(installer_source, {package_url!r}, {digest!r}, {version!r}, {development!r})\n"
     ).encode("utf-8")
@@ -93,7 +111,7 @@ def build(binary, out, base_url, development, github_release_tag=None):
     script.write_bytes(source_bytes)
     script_digest = hashlib.sha256(source_bytes).hexdigest()
     desktop = out / "AppDepot-Decky-Installer.desktop"
-    desktop.write_text(desktop_entry(f"{base_url}/{script.name}", script_digest, development), encoding="utf-8")
+    desktop.write_text(desktop_entry(script.name if development else f"{base_url}/{script.name}", script_digest, development), encoding="utf-8")
     (out / "SHA256SUMS").write_text(
         f"{digest}  {package.name}\n{script_digest}  {script.name}\n"
     )
@@ -109,7 +127,7 @@ if __name__ == "__main__":
     parser.add_argument("--binary", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--base-url", default="http://127.0.0.1:8765")
-    parser.add_argument("--development-loopback", action="store_true")
+    parser.add_argument("--development", "--development-loopback", dest="development_loopback", action="store_true")
     parser.add_argument("--github-release-tag")
     args = parser.parse_args()
     build(args.binary, args.out, args.base_url, args.development_loopback, args.github_release_tag)

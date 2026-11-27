@@ -121,12 +121,13 @@ pub(super) fn error_code(error: &CliError) -> &'static str {
             ApiError::Http { .. } => "server_error",
         },
         CliError::Library(LibraryError::Invalid(message)) => match message.as_str() {
-            "local uninstall selection changed" | "local uninstall association owner changed" => {
-                "uninstall_stale"
-            }
+            "local uninstall selection changed"
+            | "local uninstall release owner changed"
+            | "local uninstall association owner changed" => "uninstall_stale",
             "local uninstall blocked by an active operation"
             | "another library lifecycle operation is active"
             | "another application download holds the library slot"
+            | "installation is running"
             | "application is running from this managed runtime"
             | "a download is active for this Association" => "uninstall_busy",
             _ => "internal",

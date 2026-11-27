@@ -1242,9 +1242,14 @@ mod coordinator {
         ) -> Result<(), LibraryError> {
             let _lock = self.lifecycle_lock()?;
             let _download = self.lock_download_slot()?;
-            let i = self
-                .release_installation(profile, release)?
-                .ok_or_else(|| invalid("Release installation not found"))?;
+            self.uninstall_release_installation_locked(profile, release)
+        }
+
+        #[cfg(target_os = "linux")]
+        pub(crate) fn release_removal_busy(
+            &self,
+            i: &ReleaseInstallation,
+        ) -> Result<bool, LibraryError> {
             for g in &i.generations {
                 canonical(&g.id)?;
                 let root = self.paths.content.join("apps").join(&g.id);
@@ -1261,7 +1266,7 @@ mod coordinator {
                         &attempt,
                     )?;
                     if runtime_busy(&workspace, None, None)? {
-                        return Err(invalid("prerequisite source workspace is running"));
+                        return Ok(true);
                     }
                 }
                 let tracked: (Option<i64>, Option<String>) = self.conn.query_row(
@@ -1274,8 +1279,23 @@ mod coordinator {
                     tracked.0,
                     tracked.1.as_deref(),
                 )? {
-                    return Err(invalid("installation is running"));
+                    return Ok(true);
                 }
+            }
+            Ok(false)
+        }
+
+        #[cfg(target_os = "linux")]
+        pub(crate) fn uninstall_release_installation_locked(
+            &mut self,
+            profile: &ServerProfileId,
+            release: &str,
+        ) -> Result<(), LibraryError> {
+            let i = self
+                .release_installation(profile, release)?
+                .ok_or_else(|| invalid("Release installation not found"))?;
+            if self.release_removal_busy(&i)? {
+                return Err(invalid("installation is running"));
             }
             let tx = self.conn.transaction()?;
             tx.execute(
@@ -1432,6 +1452,20 @@ mod tests {
                 .trim(),
             "played"
         );
+        let preview = lib
+            .local_uninstall_preview(&profile, &app)
+            .unwrap()
+            .unwrap();
+        assert!(!preview.blocked);
+        assert!(preview.states.iter().any(|state| state == "Ready"));
+        lib.uninstall_local_app(&profile, &app, &preview.revision)
+            .unwrap();
+        assert!(
+            lib.release_installation(&profile, &release)
+                .unwrap()
+                .is_none()
+        );
+        assert!(executor.data.join("pfx/drive_c/played.txt").is_file());
     }
     fn source(
         lib: &Library,
@@ -1713,6 +1747,48 @@ mod tests {
         );
         lib.install_saved_plan(&profile, &plan_id, None).unwrap();
         lib.verify_release_installation(&profile, &release).unwrap();
+        let pid = std::process::id();
+        let start = crate::managed::process_start(pid).unwrap().unwrap();
+        lib.conn
+            .execute(
+                "UPDATE installation_generations SET process_id=?1,process_start=?2",
+                params![pid, start],
+            )
+            .unwrap();
+        let busy = lib
+            .local_uninstall_preview(&profile, &app)
+            .unwrap()
+            .unwrap();
+        assert!(busy.blocked);
+        assert!(
+            lib.uninstall_local_app(&profile, &app, &busy.revision)
+                .is_err()
+        );
+        lib.conn
+            .execute(
+                "UPDATE installation_generations SET process_start='stale'",
+                [],
+            )
+            .unwrap();
+        let preview = lib
+            .local_uninstall_preview(&profile, &app)
+            .unwrap()
+            .unwrap();
+        assert!(!preview.blocked);
+        assert!(preview.states.iter().any(|state| state == "Ready"));
+        assert!(lib.uninstall_local_app(&profile, &app, "stale").is_err());
+        lib.uninstall_local_app(&profile, &app, &preview.revision)
+            .unwrap();
+        assert!(
+            lib.release_installation(&profile, &release)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            lib.local_uninstall_preview(&profile, &app)
+                .unwrap()
+                .is_none()
+        );
     }
     #[test]
     fn prerequisite_consent_order_outcomes_and_recoverable_activation() {

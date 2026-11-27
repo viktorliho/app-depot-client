@@ -222,8 +222,8 @@ function AppDepot() {
     try {
       const result = await uninstall(app.profile, app.id, app.revision);
       setRows(current => current.filter(row => row.id !== app.id || row.profile !== app.profile));
-      setRemoveResult(result.cleanupComplete ? `${app.name} uninstalled. Some unused storage could not be reclaimed.`
-        : `${app.name} uninstalled.`);
+      setRemoveResult(result.cleanupComplete ? `${app.name} uninstalled.`
+        : `${app.name} uninstalled. Some unused storage could not be reclaimed.`);
       void observeInstallations();
     } catch (error) {
       setRemoveResult(`${app.name}: ${error instanceof ConnectionFailure && error.code !== 'internal'
