@@ -195,6 +195,8 @@ execution remains unavailable in the CLI. Windows may leave unpublished staging 
 manual inspection, as in its existing Tree installer; the Linux retry cleanup
 policy does not apply to those directories. Windows retries a sharing violation
 on a pinned open, flush or no-replace rename with bounded backoff. A rename
-retry retains the checked temporary handle and its bytes. Persistent contention
+retry retains the checked temporary handle and its bytes. When publishing a sibling
+name, Windows receives the leaf name and a null rename root, avoiding another
+write-open of the pinned parent directory. Persistent contention
 reports the operation and path in the generation error. A completed download
 remains eligible for offline reuse.

@@ -423,7 +423,7 @@ pub(crate) fn rename_directory_noreplace(from: &Path, to: &Path) -> io::Result<(
         false,
         DIRECTORY_ACCESS | DELETE,
     )?;
-    rename_noreplace(&source, target, &name_utf16(to_name)?)
+    rename_noreplace(&source, Some(target), &name_utf16(to_name)?)
 }
 
 pub(crate) fn publish_verified_copy(
@@ -495,7 +495,7 @@ fn publish_copy_at(
             temporary.set_permissions(permissions)?;
         }
         sync_handle(&temporary)?;
-        rename_noreplace(&temporary, target, name)
+        rename_noreplace(&temporary, None, name)
     })();
     if let Err(original) = &result {
         delete_open_file(temporary).map_err(|cleanup| {
@@ -666,7 +666,7 @@ fn publish_install(
     sync_handle(&stage)?;
     #[cfg(test)]
     pause_tree_test("before-tree-install-publication");
-    rename_noreplace(&stage, parent, &name_utf16(OsStr::new(id))?)?;
+    rename_noreplace(&stage, None, &name_utf16(OsStr::new(id))?)?;
     sync_directory(to.parent().unwrap())
 }
 
@@ -991,7 +991,7 @@ impl RemovalInspection {
         if volume(&self.root)? != volume(parent)? {
             return Err(invalid("quarantine must stay on the installation volume"));
         }
-        rename_noreplace(&self.root, parent, &name_utf16(name)?)
+        rename_noreplace(&self.root, None, &name_utf16(name)?)
     }
 }
 
@@ -1086,7 +1086,7 @@ pub(crate) fn quarantine_tree_object(
     if let Some(reason) = &detail {
         rename_noreplace(
             &source,
-            target.last().unwrap(),
+            Some(target.last().unwrap()),
             &name_utf16(backup.file_name().unwrap())?,
         )
         .map_err(|error| io::Error::new(error.kind(), format!("{reason}; quarantine: {error}")))?;
@@ -1265,7 +1265,7 @@ pub(crate) fn publish_tree(
         DIRECTORY_ACCESS | DELETE | GENERIC_WRITE,
     )?;
     write_tree(&stage, entries, object, true, None, &mut |_, _| {})?;
-    rename_noreplace(&stage, parent, &name_utf16(name)?)?;
+    rename_noreplace(&stage, None, &name_utf16(name)?)?;
     sync_directory(parent_path)
 }
 
@@ -1607,10 +1607,12 @@ fn delete_open_file(file: File) -> io::Result<()> {
     )
 }
 
-fn rename_noreplace(source: &File, target: &File, name: &[u16]) -> io::Result<()> {
+// A simple leaf with NULL RootDirectory renames in place. Supplying a root
+// asks Windows to open the target directory again with write access.
+fn rename_noreplace(source: &File, target: Option<&File>, name: &[u16]) -> io::Result<()> {
     let mut info = RenameInformation {
         flags: 0,
-        root: target.as_raw_handle(),
+        root: target.map_or(std::ptr::null_mut(), AsRawHandle::as_raw_handle),
         name_bytes: std::mem::size_of_val(name) as u32,
         name: [0; MAX_NAME],
     };
@@ -1631,12 +1633,16 @@ fn rename_noreplace(source: &File, target: &File, name: &[u16]) -> io::Result<()
             })
         },
         || {
+            let from = diagnostic_path(source);
+            let leaf = String::from_utf16_lossy(name);
+            let to = match target {
+                Some(directory) => diagnostic_path(directory).join(leaf),
+                None => from.with_file_name(leaf),
+            };
             format!(
                 "NtSetInformationFile(FileRenameInformation) {} -> {}",
-                diagnostic_path(source).display(),
-                diagnostic_path(target)
-                    .join(String::from_utf16_lossy(name))
-                    .display()
+                from.display(),
+                to.display()
             )
         },
     )
@@ -1834,6 +1840,34 @@ mod tests {
         assert_eq!(fs::read(stage.join("payload/a-good")).unwrap(), b"good");
         assert!(!stage.join("payload/z-bad").exists());
         assert!(!stage.join(".app-depot-installation-id").exists());
+    }
+
+    #[test]
+    fn publish_config_in_stage_with_parent_write_sharing_denied() {
+        let fixture = tempfile::tempdir().unwrap();
+        let source = fixture.path().join("object");
+        fs::write(&source, b"data").unwrap();
+        let chain = directory_chain(fixture.path(), false).unwrap();
+        // A directory pin can deny a second write-open of the directory while
+        // still allowing creation and rename of its children.
+        let stage = open_child(
+            chain.last().unwrap(),
+            OsStr::new(".app-depot-tree-fixture"),
+            DIRECTORY_ACCESS | GENERIC_WRITE | DELETE,
+            FILE_CREATE,
+            FILE_DIRECTORY_FILE,
+            FILE_SHARE_READ,
+        )
+        .unwrap();
+        let leaf = name_utf16(OsStr::new("Config.exe")).unwrap();
+        publish_copy_at(&source, &stage, &leaf, 4, false, |source, out| {
+            copy_then_verify(source, out, 4, |_| Ok(()))
+        })
+        .unwrap();
+        assert_eq!(
+            fs::read(fixture.path().join(".app-depot-tree-fixture/Config.exe")).unwrap(),
+            b"data"
+        );
     }
 
     #[test]
