@@ -1070,6 +1070,27 @@ fn open_removal_file(parent: &File, name: &OsStr) -> io::Result<File> {
     Ok(file)
 }
 
+// Recheck and move the same exclusive plain-file handle. Never overwrite a competing name.
+pub(crate) fn quarantine_tree_object(
+    from: &Path,
+    backup: &Path,
+    check: impl FnOnce(&File) -> io::Result<Option<String>>,
+) -> io::Result<Option<String>> {
+    let parents = directory_chain(from.parent().unwrap(), false)?;
+    let target = directory_chain(backup.parent().unwrap(), false)?;
+    let source = open_removal_file(parents.last().unwrap(), from.file_name().unwrap())?;
+    let detail = check(&source)?;
+    if let Some(reason) = &detail {
+        rename_noreplace(
+            &source,
+            target.last().unwrap(),
+            &name_utf16(backup.file_name().unwrap())?,
+        )
+        .map_err(|error| io::Error::new(error.kind(), format!("{reason}; quarantine: {error}")))?;
+    }
+    Ok(detail)
+}
+
 fn open_removal_directory(parent: &File, name: &OsStr) -> io::Result<File> {
     let dir = directory_child(parent, name, false, DIRECTORY_ACCESS | DELETE)?;
     reject_named_streams(&dir)?;

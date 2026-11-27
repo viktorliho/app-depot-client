@@ -1,6 +1,6 @@
 //! Durable Tree Artifact transfer and materialization.
 #[cfg(not(windows))]
-use crate::transfer::existing_dir;
+use crate::transfer::{existing_dir, hash_file};
 #[cfg(any(test, not(windows)))]
 use std::fs;
 #[cfg(not(windows))]
@@ -13,7 +13,7 @@ use crate::{
     models::InventoryEntry,
     transfer::{
         BlobOutcome, BlobSpec, DownloadJob, TransferObservation, TransferPhase,
-        create_content_file, hash_file, open_regular, private_dir, publish_content, receive_blob,
+        create_content_file, open_regular, private_dir, publish_content, receive_blob,
         safe_regular, sync_dir,
     },
     tree::{identity, validate_destination},
@@ -236,7 +236,83 @@ pub(crate) fn rename_tree_noreplace(from: &Path, to: &Path) -> Result<(), Librar
     }
 }
 
+// A fresh handle starts at byte zero. Only content mismatches qualify for repair.
+fn tree_object_mismatch(
+    file: &File,
+    path: &Path,
+    size: u64,
+    digest: &str,
+) -> Result<Option<String>, LibraryError> {
+    let length = file.metadata()?.len();
+    let actual = crate::transfer::hash_open_file(file, length)?;
+    if actual == digest && length == size {
+        return Ok(None);
+    }
+    let detail = format!(
+        "Tree CAS {}: expected {size} bytes SHA-256 {digest}, actual {length} bytes SHA-256 {actual}",
+        path.display()
+    );
+    if actual == digest {
+        return Err(invalid(format!(
+            "{detail}; inventory size conflicts with digest-identical content"
+        )));
+    }
+    Ok(Some(detail))
+}
+
 impl Library {
+    // Called under the download slot, only after a checked replacement is ready.
+    fn replace_invalid_tree_object(
+        &self,
+        stage: &Path,
+        object: &Path,
+        size: u64,
+        digest: &str,
+        job: &str,
+    ) -> Result<(), LibraryError> {
+        let backup = stage_root(self, job)?.join(format!("invalid-{digest}-{}", Uuid::new_v4()));
+        #[cfg(windows)]
+        let detail = crate::windows_fs::quarantine_tree_object(object, &backup, |file| {
+            tree_object_mismatch(file, object, size, digest).map_err(std::io::Error::other)
+        })?;
+        #[cfg(not(windows))]
+        let detail = {
+            let checked = open_regular(object, false)?;
+            let Some(detail) = tree_object_mismatch(&checked, object, size, digest)? else {
+                return Ok(());
+            };
+            rename_tree_noreplace(object, &backup)
+                .map_err(|e| invalid(format!("{detail}; quarantine: {e}")))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                let before = checked.metadata()?;
+                let moved = fs::symlink_metadata(&backup)?;
+                if (before.dev(), before.ino()) != (moved.dev(), moved.ino()) {
+                    return Err(invalid(format!(
+                        "{detail}; object changed during quarantine; retained {}",
+                        backup.display()
+                    )));
+                }
+            }
+            Some(detail)
+        };
+        let Some(detail) = detail else { return Ok(()) };
+        let repair = (|| -> Result<(), LibraryError> {
+            sync_dir(backup.parent().unwrap())?;
+            sync_dir(object.parent().unwrap())?;
+            publish_content(stage, object, size, digest)?;
+            sync_dir(object.parent().unwrap())?;
+            Ok(())
+        })();
+        repair.map_err(|e| {
+            invalid(format!(
+                "{detail}; retained at {}; recovery: {e}",
+                backup.display()
+            ))
+        })
+    }
+
     pub fn queue_tree(
         &mut self,
         client: &ApiClient,
@@ -462,11 +538,23 @@ impl Library {
         path: &str,
         file_id: &str,
         size: u64,
+        digest: &str,
     ) -> Result<(File, u64, Sha256, Option<String>), LibraryError> {
         let stage = child_stage(self, job_id, file_id)?;
         private_dir(stage.parent().unwrap())?;
         if !safe_regular(&stage)? {
             create_content_file(&stage)?;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if open_regular(&stage, false)?.metadata()?.nlink() > 1 {
+                // A surviving staging link may alias a CAS object or a retained bad object.
+                // Detach the private name before granting write access or truncating.
+                fs::remove_file(&stage)?;
+                create_content_file(&stage)?;
+                sync_dir(stage.parent().unwrap())?;
+            }
         }
         // Promotion may have been interrupted after making staging immutable but before the
         // object link became durable. Reopen by descriptor and restore write access for resume.
@@ -502,6 +590,20 @@ impl Library {
         let mut len = file.metadata()?.len();
         let mut hash = Sha256::new();
         let mut validator = etag;
+        // Small completed members may have a durable .part but no final checkpoint.
+        // Recover it even across interruption between quarantine and publication.
+        if size > 0
+            && len == size
+            && (progress != size as i64 || checkpoint.as_deref() != Some(digest))
+        {
+            file.seek(SeekFrom::Start(0))?;
+            std::io::copy(&mut file, &mut hash)?;
+            if format!("{:x}", hash.clone().finalize()) == digest {
+                self.tree_checkpoint(job_id, path, &file, size, &hash, None)?;
+                return Ok((file, size, hash, None));
+            }
+            hash = Sha256::new();
+        }
         if progress < 0 || progress as u64 > size || len < progress as u64 {
             file.set_len(0)?;
             len = 0;
@@ -522,8 +624,10 @@ impl Library {
             hash.update(&buffer[..count]);
             remaining -= count as u64;
         }
+        let checked_prefix = format!("{:x}", hash.clone().finalize());
         if len > 0
-            && checkpoint.as_deref() != Some(format!("{:x}", hash.clone().finalize()).as_str())
+            && (checkpoint.as_deref() != Some(&checked_prefix)
+                || (len == size && checked_prefix != digest))
         {
             file.set_len(0)?;
             len = 0;
@@ -548,6 +652,7 @@ impl Library {
         network_bytes: &mut u64,
         files_done: usize,
         files_total: usize,
+        repairing: bool,
     ) -> Result<bool, LibraryError> {
         let InventoryEntry::File {
             path,
@@ -561,13 +666,6 @@ impl Library {
         };
         let job = self.job(job_id)?;
         let object = self.object(&format!("adfile:sha256:{sha256}"))?;
-        if safe_regular(&object)? {
-            if hash_file(&object, *size)? != *sha256 {
-                return Err(invalid("existing object conflicts with Tree file identity"));
-            }
-            self.mark_tree_file_verified(job_id, path)?;
-            return Ok(false);
-        }
         let free = fs2::available_space(&self.paths.content)?;
         let progress: i64 = self.conn.query_row(
             "SELECT progress FROM tree_files WHERE job_id=?1 AND path=?2",
@@ -578,7 +676,7 @@ impl Library {
             return Err(invalid("insufficient content-root space"));
         }
         let (mut file, offset, hash, etag) =
-            self.prepare_tree_stage(job_id, path, file_id, *size)?;
+            self.prepare_tree_stage(job_id, path, file_id, *size, sha256)?;
         let local_pause = pause_after.map(|remaining| offset.saturating_add(remaining));
         if offset == *size {
             if format!("{:x}", hash.finalize()) != *sha256 {
@@ -595,7 +693,7 @@ impl Library {
                 let (mut file, offset, hash, etag) = if let Some(value) = first.take() {
                     value
                 } else {
-                    self.prepare_tree_stage(job_id, path, file_id, *size)?
+                    self.prepare_tree_stage(job_id, path, file_id, *size, sha256)?
                 };
                 let result = (|| {
                     observer(TransferObservation {
@@ -693,18 +791,21 @@ impl Library {
         verified_stage.set_permissions(permissions)?;
         #[cfg(not(windows))]
         verified_stage.sync_all()?;
-        let newly_linked = match publish_content(&stage, &object, *size, sha256) {
-            Ok(()) => {
-                sync_dir(object.parent().unwrap())?;
-                true
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                if hash_file(&object, *size)? != *sha256 {
-                    return Err(invalid("existing object conflicts with Tree file identity"));
+        let newly_linked = if repairing {
+            self.replace_invalid_tree_object(&stage, &object, *size, sha256, job_id)?;
+            false
+        } else {
+            match publish_content(&stage, &object, *size, sha256) {
+                Ok(()) => {
+                    sync_dir(object.parent().unwrap())?;
+                    true
                 }
-                false
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    self.replace_invalid_tree_object(&stage, &object, *size, sha256, job_id)?;
+                    false
+                }
+                Err(error) => return Err(error.into()),
             }
-            Err(error) => return Err(error.into()),
         };
         let linked = open_regular(&object, false)?;
         #[cfg(unix)]
@@ -1109,19 +1210,33 @@ impl Library {
                     return self.job(id);
                 }
                 let already = completed.get(entry.path()).copied().unwrap_or(false);
-                if already
-                    && let InventoryEntry::File {
-                        path, size, sha256, ..
-                    } = entry
-                {
-                    let object = self.object(&format!("adfile:sha256:{sha256}"))?;
-                    if safe_regular(&object)? {
-                        if hash_file(&object, *size)? == *sha256 {
+                let InventoryEntry::File {
+                    path, size, sha256, ..
+                } = entry
+                else {
+                    continue;
+                };
+                let object = self.object(&format!("adfile:sha256:{sha256}"))?;
+                let mismatch = match open_regular(&object, false) {
+                    Ok(file) => {
+                        let mismatch = tree_object_mismatch(&file, &object, *size, sha256)?;
+                        if mismatch.is_none() {
+                            if !already {
+                                self.mark_tree_file_verified(id, path)?;
+                            }
                             files_done += 1;
                             continue;
                         }
-                        return Err(invalid("existing object conflicts with Tree file identity"));
+                        mismatch
                     }
+                    Err(LibraryError::Io(error))
+                        if error.kind() == std::io::ErrorKind::NotFound =>
+                    {
+                        None
+                    }
+                    Err(error) => return Err(error),
+                };
+                if already {
                     self.reset_missing_tree_file(id, path)?;
                 }
                 let limit = pause_after
@@ -1130,21 +1245,26 @@ impl Library {
                     self.state(id, "Paused", None)?;
                     return self.job(id);
                 }
-                if self.obtain_tree_file(
-                    client,
-                    id,
-                    entry,
-                    limit,
-                    observer,
-                    &mut network_bytes,
-                    files_done,
-                    files_total,
-                )? {
+                if self
+                    .obtain_tree_file(
+                        client,
+                        id,
+                        entry,
+                        limit,
+                        observer,
+                        &mut network_bytes,
+                        files_done,
+                        files_total,
+                        mismatch.is_some(),
+                    )
+                    .map_err(|error| match mismatch {
+                        Some(detail) => invalid(format!("{detail}; repairing {path}: {error}")),
+                        None => error,
+                    })?
+                {
                     return self.job(id);
                 }
-                if matches!(entry, InventoryEntry::File { .. }) {
-                    files_done += 1;
-                }
+                files_done += 1;
             }
             if self
                 .tree_files(id)?
@@ -1365,6 +1485,122 @@ mod tests {
         (root, library, job, entries)
     }
     #[test]
+    fn corrupt_tree_object_recovers_only_its_member() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+
+        for (bad, retained_part, response) in [
+            (&b"X"[..], false, "A"),
+            (&b"truncated or oversized"[..], true, ""),
+            (&b"X"[..], false, "Z"),
+        ] {
+            let (_root, mut library, job, entries) = fixture();
+            let InventoryEntry::File {
+                file_id, sha256, ..
+            } = &entries[0]
+            else {
+                unreachable!()
+            };
+            let object = library.object(&format!("adfile:sha256:{sha256}")).unwrap();
+            fs::write(&object, bad).unwrap();
+            for entry in &entries {
+                if let InventoryEntry::File {
+                    path,
+                    file_id,
+                    size,
+                    sha256,
+                    executable,
+                } = entry
+                {
+                    library.conn.execute("INSERT INTO tree_files(job_id,path,file_id,size,sha256,executable,verified,progress) VALUES (?1,?2,?3,?4,?5,?6,1,?4)",params![job.id,path,file_id,size,sha256,executable]).unwrap();
+                }
+            }
+            library
+                .conn
+                .execute(
+                    "UPDATE download_jobs SET progress=2,state='Queued' WHERE id=?1",
+                    [&job.id],
+                )
+                .unwrap();
+            let dir = stage_root(&library, &job.id).unwrap();
+            private_dir(&dir).unwrap();
+            if retained_part {
+                let part = child_stage(&library, &job.id, file_id).unwrap();
+                private_dir(part.parent().unwrap()).unwrap();
+                fs::write(part, b"A").unwrap();
+            }
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let client = ApiClient::new(
+                &format!("http://{}", listener.local_addr().unwrap()),
+                None,
+                false,
+            )
+            .unwrap();
+            library
+                .conn
+                .execute(
+                    "UPDATE profiles SET origin=?2 WHERE id=?1",
+                    params![job.profile_id.0, client.origin()],
+                )
+                .unwrap();
+            let artifact = format!("/api/v1/artifacts/{}", job.artifact_id);
+            let mut replies = vec![(
+                artifact.clone(),
+                "application/json",
+                serde_json::json!({"id":job.artifact_id,"kind":"Tree"}).to_string(),
+            )];
+            if !retained_part {
+                replies.push((
+                    format!("{artifact}/files/{file_id}"),
+                    "application/octet-stream",
+                    response.into(),
+                ));
+            }
+            let server = thread::spawn(move || {
+                for (path, mime, body) in replies {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    let mut lines = BufReader::new(&stream).lines();
+                    let request = lines.next().unwrap().unwrap();
+                    for line in lines {
+                        if line.unwrap().is_empty() {
+                            break;
+                        }
+                    }
+                    assert_eq!(request, format!("GET {path} HTTP/1.1"));
+                    write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: {mime}\r\nContent-Length: {}\r\nETag: \"fixture\"\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
+                }
+            });
+            let result = library.run_tree_job(&client, &job.id, None);
+            if response == "Z" {
+                let message = result.unwrap_err().to_string();
+                for expected in [
+                    object.display().to_string(),
+                    sha256.clone(),
+                    format!("{:x}", Sha256::digest(bad)),
+                    "repairing a.txt".into(),
+                ] {
+                    assert!(message.contains(&expected), "{message}");
+                }
+                assert_eq!(fs::read(&object).unwrap(), bad);
+            } else {
+                assert_eq!(result.unwrap().state, "Completed");
+                assert_eq!(fs::read(&object).unwrap(), b"A");
+                let backup = fs::read_dir(&dir)
+                    .unwrap()
+                    .map(Result::unwrap)
+                    .find(|entry| entry.file_name().to_string_lossy().starts_with("invalid-"))
+                    .unwrap();
+                assert_eq!(fs::read(backup.path()).unwrap(), bad);
+            }
+            let good = library
+                .object(&format!("adfile:sha256:{:x}", Sha256::digest(b"B")))
+                .unwrap();
+            assert_eq!(fs::read(good).unwrap(), b"B");
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
     fn tree_member_checkpoints_update_aggregate_by_exact_delta() {
         let (_root, mut library, job, entries) = fixture();
         for entry in &entries {
@@ -1452,7 +1688,7 @@ mod tests {
         permissions.set_readonly(true);
         file.set_permissions(permissions).unwrap();
         let (file, offset, _, _) = library
-            .prepare_tree_stage(&job.id, path, file_id, 1)
+            .prepare_tree_stage(&job.id, path, file_id, 1, digest)
             .unwrap();
         assert_eq!(offset, 1);
         assert!(!file.metadata().unwrap().permissions().readonly());
