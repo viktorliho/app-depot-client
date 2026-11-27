@@ -1049,6 +1049,7 @@ impl Library {
         &self,
         job: &DownloadJob,
         entries: &[InventoryEntry],
+        progress: &mut dyn FnMut(usize, usize, &str),
     ) -> Result<PathBuf, LibraryError> {
         if identity(entries)? != job.artifact_id {
             return Err(invalid("Tree identity mismatch before materialization"));
@@ -1150,6 +1151,11 @@ impl Library {
                 }
             }
         }
+        let files_total = entries
+            .iter()
+            .filter(|e| matches!(e, InventoryEntry::File { .. }))
+            .count();
+        let mut prepared = 0;
         for entry in entries {
             if let InventoryEntry::File {
                 path,
@@ -1159,6 +1165,7 @@ impl Library {
                 ..
             } = entry
             {
+                progress(prepared, files_total, path);
                 let object = self.object(&format!("adfile:sha256:{sha256}"))?;
                 let mut source = open_regular(&object, false)?;
                 #[cfg(unix)]
@@ -1194,6 +1201,7 @@ impl Library {
                 #[cfg(not(unix))]
                 let _ = executable;
                 output.sync_all()?;
+                prepared += 1;
             }
         }
         // Sync directories deepest first so the complete structure is durable before promotion.
@@ -1221,6 +1229,16 @@ impl Library {
         job: &DownloadJob,
         entries: &[InventoryEntry],
     ) -> Result<(), LibraryError> {
+        self.complete_tree_with_progress(job, entries, &mut |_, _, _| {})
+    }
+    fn complete_tree_with_progress(
+        &mut self,
+        job: &DownloadJob,
+        entries: &[InventoryEntry],
+        progress: &mut dyn FnMut(usize, usize, &str),
+    ) -> Result<(), LibraryError> {
+        #[cfg(windows)]
+        let _ = progress;
         let destination = tree_destination(self, job)?;
         let parent = destination.parent().unwrap();
         private_dir(parent.parent().unwrap())?;
@@ -1250,7 +1268,7 @@ impl Library {
         if fs::symlink_metadata(&destination).is_ok() {
             self.verify_tree_directory(&destination, entries)?;
         } else {
-            let ready = self.prepare_tree_materialization(job, entries)?;
+            let ready = self.prepare_tree_materialization(job, entries, progress)?;
             if let Err(error) = rename_tree_noreplace(&ready, &destination)
                 && !matches!(&error,LibraryError::Io(io) if io.kind()==std::io::ErrorKind::AlreadyExists)
             {
@@ -1279,7 +1297,12 @@ impl Library {
         id: &str,
         pause_after: Option<u64>,
     ) -> Result<DownloadJob, LibraryError> {
-        self.run_tree_job_observed(client, id, pause_after, &mut |_| {})
+        let listener = self.transfer_observer.clone();
+        self.run_tree_job_observed(client, id, pause_after, &mut |event| {
+            if let Some(listener) = &listener {
+                listener(id, event);
+            }
+        })
     }
 
     pub fn run_tree_job_observed(
@@ -1428,10 +1451,23 @@ impl Library {
                 network_bytes,
                 received_bytes: total_bytes,
                 current_file: None,
-                files_done,
+                files_done: 0,
                 files_total,
             });
-            self.complete_tree(&self.job(id)?, &entries)?;
+            self.complete_tree_with_progress(
+                &self.job(id)?,
+                &entries,
+                &mut |prepared, total, path| {
+                    observer(TransferObservation {
+                        phase: TransferPhase::PreparingLocalFiles,
+                        network_bytes,
+                        received_bytes: total_bytes,
+                        current_file: Some(path.to_owned()),
+                        files_done: prepared,
+                        files_total: total,
+                    })
+                },
+            )?;
             self.job(id)
         })();
         if let Err(error) = &result
@@ -1982,7 +2018,7 @@ mod tests {
         let (_root, mut library, job, entries) = fixture();
         #[cfg(not(windows))]
         let ready = library
-            .prepare_tree_materialization(&job, &entries)
+            .prepare_tree_materialization(&job, &entries, &mut |_, _, _| {})
             .unwrap();
         let destination = tree_destination(&library, &job).unwrap();
         private_dir(destination.parent().unwrap().parent().unwrap()).unwrap();

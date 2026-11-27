@@ -1,5 +1,5 @@
 //! Session-only transfer observations. SQLite remains the recovery authority.
-use app_depot_core::transfer::{TransferObservation, TransferPhase};
+use crate::transfer::{TransferObservation, TransferPhase};
 use std::time::{Duration, Instant};
 
 #[derive(Clone)]
@@ -24,13 +24,13 @@ impl LiveProgress {
     }
 
     pub fn update(&mut self, observation: TransferObservation, at: Instant) {
-        if self.observation.phase != TransferPhase::Downloading
-            && observation.phase == TransferPhase::Downloading
+        if observation.network_bytes < self.last_bytes
+            || (self.observation.phase != TransferPhase::Downloading
+                && observation.phase == TransferPhase::Downloading)
         {
+            self.rate = None;
             self.last_bytes = observation.network_bytes;
             self.last_sample = at;
-        } else if observation.network_bytes < self.last_bytes {
-            self.rate = None;
         } else if observation.network_bytes > self.last_bytes {
             let seconds = at.saturating_duration_since(self.last_sample).as_secs_f64();
             if seconds >= 0.05 {
@@ -39,11 +39,9 @@ impl LiveProgress {
                     self.rate
                         .map_or(measured, |prior| prior * 0.7 + measured * 0.3),
                 );
+                self.last_sample = at;
+                self.last_bytes = observation.network_bytes;
             }
-        }
-        if observation.network_bytes != self.last_bytes {
-            self.last_bytes = observation.network_bytes;
-            self.last_sample = at;
         }
         self.observation = observation;
         self.at = at;
@@ -94,6 +92,21 @@ mod tests {
             files_done: 0,
             files_total: 1,
         }
+    }
+    #[test]
+    fn frequent_chunks_accumulate_until_the_rate_sample() {
+        let start = Instant::now();
+        let mut state = LiveProgress::new(sample(0, 0, TransferPhase::Downloading), start);
+        for n in 1..=10 {
+            state.update(
+                sample(n * 1024, n * 1024, TransferPhase::Downloading),
+                start + Duration::from_millis(n * 10),
+            );
+        }
+        assert_eq!(
+            state.speed(start + Duration::from_millis(100)),
+            Some(102400.0)
+        );
     }
     #[test]
     fn measured_speed_eta_and_idle() {

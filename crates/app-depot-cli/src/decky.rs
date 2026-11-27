@@ -1,12 +1,13 @@
 use super::*;
+mod handheld;
 mod manifest;
 use base64::{Engine, engine::general_purpose::STANDARD};
 use eframe::egui;
+use handheld::Session;
 use serde_json::{Value, json};
 use std::{
     fs,
-    io::{BufRead, BufReader, Cursor},
-    process::{Command, Stdio},
+    io::Cursor,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -476,7 +477,7 @@ fn play(options: &Options, mut library: Library, id: &str, app: &str) -> Result<
         signal_hook::flag::register(signal, stop.clone()).map_err(LibraryError::Io)?;
     }
     let path = selection_path(options, id, app)?;
-    let mut choices = candidates(&library, &profile, app)?;
+    let choices = candidates(&library, &profile, app)?;
     let name = library
         .cached_apps(&profile)?
         .into_iter()
@@ -490,92 +491,177 @@ fn play(options: &Options, mut library: Library, id: &str, app: &str) -> Result<
             .iter()
             .position(|choice| choice_key(choice) == *saved)
     });
-    if selected.is_none() {
-        match manifest::first_play(&mut library, &profile, app, &name, &stop, &choices, &path) {
-            Ok(true) => return Ok(()),
-            Ok(false) => (),
-            Err(error) => {
-                manifest::show_error(&name, &error.to_string());
-                return Err(error);
-            }
-        }
+    let fast =
+        selected.or_else(|| (choices.len() == 1 && choices[0].status == "Ready").then_some(0));
+    if let Some(i) = fast
+        && choices[i].status == "Ready"
+    {
+        return supervise(&mut library, &choices[i], &stop);
     }
-    let selected = selected.or_else(|| (choices.len() == 1).then_some(0));
-    if let Some(index) = selected {
-        let choice = choices.swap_remove(index);
-        if matches!(choice.status.as_str(), "Ready" | "PreparationRequired") {
-            return supervise(&mut library, &choice, &stop);
+    let worker_options = options.clone();
+    let app = app.to_owned();
+    let session_name = name.clone();
+    let paths = library.paths.clone();
+    let ui_profile = profile.clone();
+    let choice = handheld::run(name, paths, ui_profile, stop.clone(), move |session| {
+        let choices = candidates(&library, &profile, &app)?;
+        // A cancellation may finish an atomic activation before control returns.
+        if choices.len() == 1 && choices[0].status == "Ready" {
+            return Ok(choices[0].clone());
         }
-        choices = vec![choice];
-    }
-    drop(library);
-    let paths = selected_library_paths(options)?;
-    let window = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([720., 420.]),
-        ..Default::default()
-    };
-    let completed = std::sync::Arc::new(std::sync::Mutex::new(None));
-    let mut state = PlayUi {
-        name,
-        path,
-        paths,
-        profile: profile.clone(),
-        app: app.into(),
-        auto_start: selected.is_some(),
-        choices,
-        index: 0,
-        worker: None,
-        started: None,
-        phase: String::new(),
-        error: None,
-        active: None,
-        completed: completed.clone(),
-        stop: stop.clone(),
-        gamepad: gilrs::Gilrs::new().ok(),
-        initial_progress: None,
-    };
-    eframe::run_native(
-        "App Depot · Play",
-        window,
-        Box::new(move |context| {
-            context.egui_ctx.set_pixels_per_point(1.2);
-            if state.auto_start
-                && let Err(error) = state.start()
-            {
-                state.error = Some(error.to_string());
+        let selected = saved.as_ref().and_then(|saved| {
+            choices
+                .iter()
+                .position(|choice| choice_key(choice) == *saved)
+        });
+        let events = session.activity.clone();
+        library.observe_transfers(Arc::new(move |id, event| {
+            events.lock().unwrap().observe(id, event)
+        }));
+        if selected.is_none()
+            && let Some(choice) = manifest::first_play(
+                &mut library,
+                &profile,
+                &app,
+                &session_name,
+                &choices,
+                session,
+            )?
+        {
+            save_choice(&path, &choice)?;
+            return Ok(choice);
+        }
+        let index = match selected {
+            Some(i) => i,
+            None if choices.len() == 1 => 0,
+            None if choices.is_empty() => {
+                return Err(LibraryError::Invalid(
+                    "No supported launch is declared. Synchronize this application in Decky."
+                        .into(),
+                )
+                .into());
             }
-            Ok(Box::new(state))
-        }),
-    )
-    .map_err(|error| LibraryError::Invalid(format!("Could not open Play window: {error}")))?;
-    let selected = completed.lock().unwrap().take();
-    if let Some(choice) = selected {
-        let mut library = open_library(options)?;
-        supervise(&mut library, &choice, &stop)?;
+            None => session.choose(
+                "Choose a launch option",
+                "",
+                choices
+                    .iter()
+                    .map(|c| {
+                        format!(
+                            "{} · {}",
+                            c.label.as_ref().unwrap_or(&c.entry_id),
+                            c.release_id
+                        )
+                    })
+                    .collect(),
+            )?,
+        };
+        let choice = &choices[index];
+        if choice.status != "Ready" {
+            let size = if choice.status == "PreparationRequired" {
+                "Already downloaded".into()
+            } else {
+                download_summary(&library, &profile, &[&choice.artifact_id])?
+            };
+            session.choose(
+                "Install application",
+                &format!("{size}\nRuntime: Native Linux\nAdditional components: None"),
+                vec!["Install and play".into()],
+            )?;
+            session.phase("Preparing installation");
+            library.reconcile_file_jobs()?;
+            library.reconcile_tree_jobs()?;
+            if let Some(job) = library.jobs(Some(&profile))?.into_iter().find(|j| {
+                j.association_id == choice.association_id
+                    && j.artifact_id == choice.artifact_id
+                    && matches!(j.state.as_str(), "Paused" | "Failed")
+            }) {
+                library.retry_job(&job.id)?;
+            }
+            let mut args = worker_options.clone();
+            args.profile = Some(profile.clone());
+            args.positional = [
+                "decky-prepare",
+                &app,
+                &choice.release_id,
+                &choice.association_id,
+                &choice.entry_id,
+                choice.selection_revision(),
+            ]
+            .map(str::to_owned)
+            .into();
+            first_play_in_library(&args, true, &mut library, &mut |s| session.phase(s))?;
+        }
+        save_choice(&path, choice)?;
+        Ok(choice.clone())
+    })?;
+    if let Some(choice) = choice {
+        supervise(&mut open_library(options)?, &choice, &stop)?;
     }
     Ok(())
 }
 
-struct PlayUi {
-    name: String,
-    path: PathBuf,
-    paths: LibraryPaths,
-    profile: ServerProfileId,
-    app: String,
-    choices: Vec<LaunchCandidate>,
-    index: usize,
-    worker: Option<Receiver<String>>,
-    active: Option<std::process::Child>,
-    auto_start: bool,
-    completed: std::sync::Arc<std::sync::Mutex<Option<LaunchCandidate>>>,
-    started: Option<Instant>,
-    initial_progress: Option<u64>,
-    stop: Arc<AtomicBool>,
-    gamepad: Option<gilrs::Gilrs>,
-    phase: String,
-    error: Option<String>,
+fn download_summary(
+    lib: &Library,
+    profile: &ServerProfileId,
+    artifacts: &[&str],
+) -> Result<String, CliError> {
+    let jobs = lib.jobs(Some(profile))?;
+    let mut bytes = 0u64;
+    let unique = artifacts
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    for artifact in unique {
+        let matching = jobs.iter().filter(|j| j.artifact_id == artifact);
+        let completed = matching.clone().any(|j| j.state == "Completed");
+        if completed {
+            continue;
+        }
+        let known = matching
+            .clone()
+            .map(|j| j.expected_size)
+            .max()
+            .filter(|v| *v > 0)
+            .or(lib
+                .cached_artifact(profile, artifact)?
+                .and_then(|a| a.value.size));
+        let size = match known {
+            Some(size) => size,
+            None if artifact.starts_with("adtree:") => {
+                let api = profile_client(lib, profile)?;
+                let page = api
+                    .ensure_read_compatible()?
+                    .page_size()
+                    .map_err(ApiError::Incompatible)?;
+                let (entries, _) = api.tree_inventory(artifact, page)?;
+                entries
+                    .into_iter()
+                    .map(|e| match e {
+                        app_depot_core::models::InventoryEntry::File { size, .. } => size,
+                        _ => 0,
+                    })
+                    .sum()
+            }
+            None => return Ok("Download size unavailable".into()),
+        };
+        let checkpoint = matching
+            .filter(|j| {
+                matches!(
+                    j.state.as_str(),
+                    "Paused" | "Failed" | "Downloading" | "Queued"
+                )
+            })
+            .map(|j| j.progress)
+            .max()
+            .unwrap_or(0);
+        bytes = bytes.saturating_add(size.saturating_sub(checkpoint));
+    }
+    Ok(format!(
+        "Download: up to {} · verified files are reused",
+        handheld::bytes(bytes)
+    ))
 }
-
 fn save_choice(path: &std::path::Path, choice: &LaunchCandidate) -> Result<(), CliError> {
     let destination = path.parent().unwrap();
     fs::create_dir_all(destination).map_err(LibraryError::Io)?;
@@ -596,222 +682,4 @@ fn save_choice(path: &std::path::Path, choice: &LaunchCandidate) -> Result<(), C
     }
 
     Ok(())
-}
-
-impl PlayUi {
-    fn start(&mut self) -> Result<(), CliError> {
-        let choice = &self.choices[self.index];
-        save_choice(&self.path, choice)?;
-
-        // Resume only after explicit Retry/Play. The shared library still arbitrates
-        // the single transfer slot, and running jobs are never restarted here.
-        let mut library = Library::open(self.paths.clone())?;
-        library.reconcile_file_jobs()?;
-        library.reconcile_tree_jobs()?;
-        if let Some(job) = library.jobs(Some(&self.profile))?.into_iter().find(|job| {
-            job.association_id == choice.association_id
-                && job.artifact_id == choice.artifact_id
-                && matches!(job.state.as_str(), "Paused" | "Failed")
-        }) {
-            library.retry_job(&job.id)?;
-        }
-        let mut child = Command::new(env::current_exe().map_err(LibraryError::Io)?)
-            .arg("--library-data")
-            .arg(&self.paths.metadata)
-            .arg("--library-content")
-            .arg(&self.paths.content)
-            .args([
-                "--profile",
-                &self.profile.0,
-                "decky-prepare",
-                &self.app,
-                &choice.release_id,
-                &choice.association_id,
-                &choice.entry_id,
-                choice.selection_revision(),
-            ])
-            .env("APP_DEPOT_DECKY_RPC", "1")
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(LibraryError::Io)?;
-        let stderr = child.stderr.take().unwrap();
-        let (sender, receiver) = mpsc::channel();
-        std::thread::spawn(move || {
-            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                if sender.send(line).is_err() {
-                    break;
-                }
-            }
-        });
-        self.active = Some(child);
-        self.worker = Some(receiver);
-        self.started = Some(Instant::now());
-        self.initial_progress = None;
-        self.phase = "Connecting to Server…".into();
-        self.error = None;
-        Ok(())
-    }
-
-    fn cancel(&mut self) {
-        if let Some(mut child) = self.active.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-        self.worker = None;
-    }
-
-    fn progress(&self) -> Option<DownloadJob> {
-        let library = Library::open(self.paths.clone()).ok()?;
-        let choice = self.choices.get(self.index)?;
-        library
-            .active_association_job(&self.profile, &choice.association_id)
-            .ok()
-            .flatten()
-    }
-}
-
-impl Drop for PlayUi {
-    fn drop(&mut self) {
-        self.cancel();
-    }
-}
-
-impl eframe::App for PlayUi {
-    fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        let ctx = root.ctx().clone();
-        let (mut confirm, mut back, mut up, mut down) = (false, false, false, false);
-        if let Some(gamepad) = &mut self.gamepad {
-            while let Some(event) = gamepad.next_event() {
-                use gilrs::{Button, EventType};
-                match event.event {
-                    EventType::ButtonPressed(Button::South, _) => confirm = true,
-                    EventType::ButtonPressed(Button::East, _) => back = true,
-                    EventType::ButtonPressed(Button::DPadUp, _) => up = true,
-                    EventType::ButtonPressed(Button::DPadDown, _) => down = true,
-                    _ => {}
-                }
-            }
-        }
-        ctx.request_repaint_after(Duration::from_millis(100));
-        if self.stop.load(Ordering::Relaxed) {
-            self.cancel();
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-            return;
-        }
-        if let Some(receiver) = &self.worker {
-            for line in receiver.try_iter() {
-                self.phase = if let Ok(data) = serde_json::from_str::<Value>(&line) {
-                    match data["code"].as_str() {
-                        Some("authentication_required" | "invalid_token") => "This server requires authentication to access its catalog.",
-                        Some("secret_service_unavailable") => "Unlock Secret Service before retrying.",
-                        Some("server_unavailable") => "The Server is unavailable. Check the connection and retry.",
-                        Some("timeout") => "The Server did not respond in time. Try again.",
-                        Some("tls_failure") => "The HTTPS certificate or TLS connection could not be verified.",
-                        Some("catalog_forbidden") => "This profile cannot access the selected content.",
-                        Some("unsupported_protocol") => "The Server protocol is not supported.",
-                        _ => "App Depot could not prepare the application. Synchronize the Server profile and try again.",
-                    }.into()
-                } else {
-                    line
-                };
-            }
-            let exited = self
-                .active
-                .as_mut()
-                .and_then(|child| child.try_wait().ok().flatten());
-            if let Some(status) = exited {
-                self.active.take();
-                self.worker = None;
-                if status.success() {
-                    *self.completed.lock().unwrap() = Some(self.choices[self.index].clone());
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                    return;
-                }
-                self.error = Some(format!("{} ({status})", self.phase));
-            }
-        }
-
-        if ctx.input(|input| {
-            input.viewport().close_requested() || input.key_pressed(egui::Key::Escape)
-        }) {
-            self.cancel();
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-            return;
-        }
-        root.heading(&self.name);
-        root.add_space(12.);
-        if let Some(error) = &self.error {
-            root.label(error);
-        }
-        let downloading = self.worker.is_some();
-        if downloading {
-            root.label(&self.phase);
-            if let Some(job) = self.progress() {
-                root.label(&job.state);
-                if job.expected_size > 0 {
-                    let ratio = job.progress as f32 / job.expected_size as f32;
-                    root.add(egui::ProgressBar::new(ratio).show_percentage());
-                    if let Some(started) = self.started {
-                        let initial = *self.initial_progress.get_or_insert(job.progress);
-                        let rate = job.progress.saturating_sub(initial) as f64
-                            / started.elapsed().as_secs_f64().max(1.);
-                        if rate > 0. && started.elapsed() > Duration::from_secs(3) {
-                            root.label(format!(
-                                "{:.1} MiB/s · {:.0}s remaining",
-                                rate / 1048576.,
-                                job.expected_size.saturating_sub(job.progress) as f64 / rate
-                            ));
-                        }
-                    }
-                } else {
-                    root.spinner();
-                }
-            } else {
-                root.spinner();
-            }
-            if root.button("Cancel").clicked() || back {
-                self.cancel();
-                self.error =
-                    Some("Download interrupted. Retry resumes from a verified checkpoint.".into());
-            }
-            ctx.request_repaint_after(Duration::from_millis(250));
-        } else if self.choices.is_empty() {
-            root.label("No supported launch is declared for this application.");
-        } else {
-            if self.choices.len() > 1 {
-                if down || ctx.input(|input| input.key_pressed(egui::Key::ArrowDown)) {
-                    self.index = (self.index + 1) % self.choices.len();
-                }
-                if up || ctx.input(|input| input.key_pressed(egui::Key::ArrowUp)) {
-                    self.index = (self.index + self.choices.len() - 1) % self.choices.len();
-                }
-                for (index, choice) in self.choices.iter().enumerate() {
-                    let label = choice.label.as_deref().unwrap_or(&choice.entry_id);
-                    if root
-                        .selectable_label(
-                            index == self.index,
-                            format!("{label} · {} · {}", choice.release_id, choice.status),
-                        )
-                        .clicked()
-                    {
-                        self.index = index;
-                    }
-                }
-            }
-            let play = root.button(if self.error.is_some() {
-                "Retry"
-            } else {
-                "Play"
-            });
-            if (play.clicked() || confirm || ctx.input(|input| input.key_pressed(egui::Key::Enter)))
-                && let Err(error) = self.start()
-            {
-                self.error = Some(error.to_string());
-            }
-        }
-        if root.button("Exit").clicked() || (back && !downloading) {
-            self.cancel();
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-        }
-    }
 }

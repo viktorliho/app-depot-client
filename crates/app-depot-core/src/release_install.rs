@@ -308,6 +308,7 @@ mod coordinator {
                     #[cfg(windows)]
                     jobs.push(job);
                 }
+                progress("Preparing application files");
                 let _download = self.lock_download_slot()?;
                 let target = self.paths.content.join("apps").join(&id);
                 #[cfg(windows)]
@@ -328,6 +329,8 @@ mod coordinator {
                         &self.paths.content,
                         &id,
                         &layout,
+                        #[cfg(target_os = "linux")]
+                        progress,
                         |digest| self.object(&format!("adfile:sha256:{digest}")),
                         #[cfg(windows)]
                         |digest, size| self.repair_install_object(&jobs, digest, size, client),
@@ -355,6 +358,7 @@ mod coordinator {
 
                 if tx.execute("UPDATE installation_generations SET state=?2,last_error=NULL WHERE id=?1 AND installation_id=?3 AND state='Preparing'",params![id,state,install_id])? != 1 {return Err(invalid("pending generation changed before activation"));}
                 if state == "Ready" {
+                    progress("Activating installation");
                     Self::activate_generation(&tx, &install_id, &id)?;
                 }
                 tx.commit()?;
@@ -906,6 +910,7 @@ mod coordinator {
             progress("Verifying installed application files before activation");
             let activation = (|| -> Result<(), LibraryError> {
                 crate::materialization::check_generation(&root, generation, &layout, &mut checks)?;
+                progress("Activating installation");
                 // Activation and completion are atomic; an interrupted transaction
                 // leaves the old generation active and requires fresh authorization.
                 let tx = self.conn.transaction()?;

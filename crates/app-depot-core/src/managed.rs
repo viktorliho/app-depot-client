@@ -1483,6 +1483,16 @@ impl Library {
         profile: &ServerProfileId,
         association: &str,
     ) -> Result<Installation, LibraryError> {
+        self.prepare_portable_with_progress(profile, association, &mut |_| {})
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn prepare_portable_with_progress(
+        &mut self,
+        profile: &ServerProfileId,
+        association: &str,
+        progress: &mut dyn FnMut(&str),
+    ) -> Result<Installation, LibraryError> {
         let _lock = self.lifecycle_lock()?;
         let (release, app, artifact): (String,String,String) = self.conn.query_row(
             "SELECT a.release_id,r.app_id,a.artifact_id FROM associations a JOIN releases r ON r.profile_id=a.profile_id AND r.id=a.release_id WHERE a.profile_id=?1 AND a.id=?2",
@@ -1581,7 +1591,13 @@ impl Library {
                     return Err(invalid("Tree identity mismatch"));
                 }
                 validate_destination(&entries)?;
-                for entry in &entries {
+                for (index, entry) in entries.iter().enumerate() {
+                    progress(&format!(
+                        "Preparing item {} of {} · {}",
+                        index + 1,
+                        entries.len(),
+                        entry.path()
+                    ));
                     match entry {
                         InventoryEntry::Directory { path } => {
                             dir_beneath(&root, path, true)?;
@@ -1614,6 +1630,7 @@ impl Library {
             } else {
                 return Err(invalid("unsupported Artifact identity"));
             }
+            progress("Activating installation");
             root.sync_all()?;
             rename_tree_noreplace(&stage, &final_path)?;
             sync_dir(&self.paths.content.join("apps"))?;

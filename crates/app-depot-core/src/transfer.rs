@@ -420,7 +420,13 @@ pub(crate) fn receive_blob(
     Ok(BlobOutcome::Complete)
 }
 
+pub type SessionObserver = std::sync::Arc<dyn Fn(&str, TransferObservation) + Send + Sync>;
 impl Library {
+    /// Observe nested acquisitions on this library connection only.
+    pub fn observe_transfers(&mut self, observer: SessionObserver) {
+        self.transfer_observer = Some(observer);
+    }
+
     pub fn active_association_job(
         &self,
         profile: &ServerProfileId,
@@ -1035,7 +1041,12 @@ impl Library {
         id: &str,
         pause_after: Option<u64>,
     ) -> Result<DownloadJob, LibraryError> {
-        self.run_file_job_observed(client, id, pause_after, &mut |_| {})
+        let listener = self.transfer_observer.clone();
+        self.run_file_job_observed(client, id, pause_after, &mut |event| {
+            if let Some(listener) = &listener {
+                listener(id, event);
+            }
+        })
     }
 
     pub fn run_file_job_observed(

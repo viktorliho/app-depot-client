@@ -2,12 +2,13 @@
 mod design;
 mod manifest_ui;
 mod preferences;
-mod telemetry;
+
 #[cfg(any(target_os = "linux", windows))]
 mod updater;
 mod views;
 mod worker;
 
+use app_depot_core::telemetry::LiveProgress;
 use app_depot_core::{
     ServerProfileId,
     api::ApiClient,
@@ -24,7 +25,6 @@ use std::{
     path::PathBuf,
     time::{Duration, Instant},
 };
-use telemetry::LiveProgress;
 use worker::{AppView, ArtUse, Command, Event, Snapshot, Worker};
 
 #[derive(Clone, Copy, PartialEq, Eq)]

@@ -234,8 +234,24 @@ def verify_decky(args, root, origin, token, app, server, opener, server_origin):
     env = dict(os.environ, HOME=str(plugin_home), XDG_STATE_HOME=str(state))
     env.pop("APP_DEPOT_TOKEN", None)
     command = [args.client, "decky", "play", profile, app]
-    play = subprocess.run(command, check=True, timeout=45, env=env, capture_output=True, text=True)
-    assert "m30 fixture executed" in play.stdout
+    def install_with_keyboard(command, env):
+        with subprocess.Popen(command, env=env, stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, text=True) as wrapper:
+            try:
+                found = subprocess.run(["xdotool", "search", "--sync", "--onlyvisible",
+                                        "--name", "^Install application"],
+                                       check=True, timeout=25, capture_output=True, text=True)
+                window = found.stdout.splitlines()[-1]
+                subprocess.run(["xdotool", "windowfocus", "--sync", window, "key", "Return"],
+                               check=True, timeout=5)
+                stdout, stderr = wrapper.communicate(timeout=45)
+                assert wrapper.returncode == 0, stderr
+                return stdout
+            finally:
+                if wrapper.poll() is None:
+                    wrapper.kill()
+
+    assert "m30 fixture executed" in install_with_keyboard(command, env)
     trace = json.loads((state / "app-depot-decky/last-launch.json").read_text())
     assert set(trace) == {"pid", "exitCode", "stage"}
     assert trace["stage"] == "exited" and trace["exitCode"] == 0
@@ -286,8 +302,7 @@ def verify_decky(args, root, origin, token, app, server, opener, server_origin):
     guest_env = dict(os.environ, HOME=str(guest_home), XDG_STATE_HOME=str(root / "guest-state"),
                      APP_DEPOT_TOKEN="invalid-fixture-token")
     guest_command = [args.client, "decky", "play", guest_profile, app]
-    first = subprocess.run(guest_command, check=True, timeout=45, env=guest_env, capture_output=True, text=True)
-    assert "m30 fixture executed" in first.stdout
+    assert "m30 fixture executed" in install_with_keyboard(guest_command, guest_env)
     os.environ["DECKY_USER_HOME"] = str(plugin_home)
     os.environ["XDG_DATA_HOME"] = str(plugin_home / "data")
 
@@ -319,8 +334,7 @@ def verify_decky(args, root, origin, token, app, server, opener, server_origin):
             await backend._unload()
 
     asyncio.run(uninstall_backend())
-    again = subprocess.run(command, check=True, timeout=45, env=env, capture_output=True, text=True)
-    assert "m30 fixture executed" in again.stdout
+    assert "m30 fixture executed" in install_with_keyboard(command, env)
     print("PASS stale selection, complete local removal, repeat removal refusal and First Play reacquisition")
     server.terminate()
     server.wait(timeout=20)
@@ -444,7 +458,7 @@ def run(args, root):
                 assert wrapper.poll() is None, "wrapper exited while its child was active"
                 stdout, stderr = wrapper.communicate(timeout=10)
                 assert wrapper.returncode == 0, stderr
-                assert "m30 fixture executed" in stdout and "downloading Artifact" in stderr
+                assert "m30 fixture executed" in stdout and "Downloading application files" in stderr
             finally:
                 if wrapper.poll() is None:
                     wrapper.kill()

@@ -32,11 +32,12 @@ pub(crate) fn publish_generation(
     content: &std::path::Path,
     id: &str,
     entries: &[InventoryEntry],
+    progress: &mut dyn FnMut(&str),
     object: impl Fn(&str) -> Result<std::path::PathBuf, LibraryError>,
 ) -> Result<(), LibraryError> {
     let stage = content.join("staging").join(format!("manifest-{id}"));
     let target = content.join("apps").join(id);
-    publish_layout(content, &stage, &target, id, entries, object)
+    publish_layout(content, &stage, &target, id, entries, progress, object)
 }
 
 #[cfg(target_os = "linux")]
@@ -46,6 +47,7 @@ fn publish_layout(
     target: &std::path::Path,
     id: &str,
     entries: &[InventoryEntry],
+    progress: &mut dyn FnMut(&str),
     object: impl Fn(&str) -> Result<std::path::PathBuf, LibraryError>,
 ) -> Result<(), LibraryError> {
     use crate::{
@@ -71,7 +73,13 @@ fn publish_layout(
     // Original Tree inventories need not arrive in parent-before-child order.
     let mut ordered: Vec<_> = entries.iter().collect();
     ordered.sort_unstable_by(|left, right| left.path().cmp(right.path()));
-    for entry in &ordered {
+    for (index, entry) in ordered.iter().enumerate() {
+        progress(&format!(
+            "Preparing item {} of {} · {}",
+            index + 1,
+            ordered.len(),
+            entry.path()
+        ));
         match entry {
             InventoryEntry::Directory { path } => {
                 dir_beneath(&payload, path, true)?;
@@ -364,6 +372,7 @@ pub(crate) fn publish_prerequisite_source(
         &owned,
         attempt,
         entries,
+        progress,
         object,
     )?;
     #[cfg(windows)]

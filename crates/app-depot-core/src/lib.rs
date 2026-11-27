@@ -14,6 +14,7 @@ pub mod models;
 pub mod prerequisite;
 pub mod release_install;
 pub mod secrets;
+pub mod telemetry;
 pub mod transfer;
 pub mod tree;
 pub mod tree_download;

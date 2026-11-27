@@ -18,6 +18,7 @@ use std::{
     process::ExitCode,
 };
 
+#[derive(Clone)]
 struct Options {
     server: Option<String>,
     profile: Option<ServerProfileId>,
@@ -704,6 +705,18 @@ fn run_launch(options: &Options) -> Result<(), CliError> {
 }
 
 fn run_first_play(options: &Options, prepare_only: bool) -> Result<(), CliError> {
+    let mut library = open_library(options)?;
+    first_play_in_library(options, prepare_only, &mut library, &mut |message| {
+        eprintln!("{message}")
+    })
+}
+
+fn first_play_in_library(
+    options: &Options,
+    prepare_only: bool,
+    library: &mut Library,
+    progress: &mut dyn FnMut(&str),
+) -> Result<(), CliError> {
     let profile_id = options
         .profile
         .as_ref()
@@ -717,7 +730,7 @@ fn run_first_play(options: &Options, prepare_only: bool) -> Result<(), CliError>
         }
         _ => return Err(ApiError::Config(usage().into()).into()),
     };
-    let mut library = open_library(options)?;
+
     let cached_release = library
         .cached_releases(profile_id, app)?
         .into_iter()
@@ -793,7 +806,7 @@ fn run_first_play(options: &Options, prepare_only: bool) -> Result<(), CliError>
         }
         if job.state == "Queued" {
             library.move_job_to_top(&job.id)?;
-            eprintln!("downloading Artifact");
+            progress("Downloading application files");
             if is_tree {
                 library.run_tree_job(&client, &job.id, None)?;
             } else {
@@ -812,17 +825,30 @@ fn run_first_play(options: &Options, prepare_only: bool) -> Result<(), CliError>
             .ok_or_else(|| {
                 LibraryError::Invalid("cached selection changed during download".into())
             })?;
-        return finish_first_play(&mut library, &refreshed, prepare_only);
+        return finish_first_play(library, &refreshed, prepare_only, progress);
     }
-    finish_first_play(&mut library, &selected, prepare_only)
+    finish_first_play(library, &selected, prepare_only, progress)
 }
 
 fn finish_first_play(
     library: &mut Library,
     selected: &LaunchCandidate,
     prepare_only: bool,
+    progress: &mut dyn FnMut(&str),
 ) -> Result<(), CliError> {
+    #[cfg(not(target_os = "linux"))]
+    let _ = progress;
     if prepare_only {
+        #[cfg(target_os = "linux")]
+        if selected.status == "PreparationRequired" {
+            progress("Preparing application files");
+            library.prepare_portable_with_progress(
+                &selected.profile_id,
+                &selected.association_id,
+                progress,
+            )?;
+            return Ok(());
+        }
         return prepare_selected(library, selected);
     }
     play_selected(library, selected)

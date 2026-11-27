@@ -137,6 +137,7 @@ pub struct Library {
     pub(crate) conn: Connection,
     pub paths: LibraryPaths,
     pub id: String,
+    pub(crate) transfer_observer: Option<crate::transfer::SessionObserver>,
     _access_lock: fs::File,
 }
 
@@ -476,6 +477,7 @@ impl Library {
             conn,
             paths,
             id,
+            transfer_observer: None,
             _access_lock: access,
         };
         library.recover_removals()?;

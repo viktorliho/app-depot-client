@@ -4,7 +4,7 @@ use app_depot_core::{
     compatibility,
     installation::{self, Plan, ResolveRequest},
 };
-use std::{io::Write, path::Path};
+use std::path::Path;
 
 fn invalid(message: &str) -> CliError {
     LibraryError::Invalid(message.into()).into()
@@ -47,37 +47,14 @@ pub(super) fn set_runtime(lib: &Library, path: &str) -> Result<(), CliError> {
     Ok(result.map_err(LibraryError::Io)?)
 }
 
-fn dialog(name: &str) -> Command {
-    let mut cmd = Command::new("/usr/bin/zenity");
-    cmd.arg(format!("--title={name}")).arg("--width=660");
-    cmd
-}
-
-pub(super) fn show_error(name: &str, message: &str) {
-    let _ = dialog(name)
-        .args(["--error", "--no-markup"])
-        .arg(format!("--text={message}"))
-        .status();
-}
-
-fn confirm(name: &str, message: &str) -> Result<bool, CliError> {
-    let status = dialog(name)
-        .args(["--question", "--no-markup", "--default-cancel"])
-        .arg(format!("--text={message}"))
-        .status()
-        .map_err(LibraryError::Io)?;
-    Ok(status.success())
-}
-
 pub(super) fn first_play(
     lib: &mut Library,
     profile: &ServerProfileId,
     app: &str,
     name: &str,
-    stop: &AtomicBool,
     choices: &[LaunchCandidate],
-    selection_path: &Path,
-) -> Result<bool, CliError> {
+    session: &Session,
+) -> Result<Option<LaunchCandidate>, CliError> {
     let mut releases = Vec::new();
     for row in lib.cached_releases(profile, app)? {
         if row.stale || choices.iter().any(|c| c.release_id == row.value.id) {
@@ -102,40 +79,23 @@ pub(super) fn first_play(
         }
     }
     if releases.is_empty() {
-        return Ok(false);
+        return Ok(None);
     }
     let index = if releases.len() == 1 && choices.is_empty() {
         0
     } else {
-        let mut cmd = dialog(name);
-        cmd.args([
-            "--list",
-            "--text=Select release",
-            "--column=Index",
-            "--column=Release",
-            "--hide-column=1",
-        ]);
+        let mut options: Vec<_> = releases
+            .iter()
+            .map(|(r, _, _)| r.version.clone().unwrap_or_else(|| r.id.clone()))
+            .collect();
         if !choices.is_empty() {
-            cmd.args(["other", "Existing launch options"]);
+            options.push("Existing launch options".into());
         }
-        for (i, (r, _, _)) in releases.iter().enumerate() {
-            cmd.arg(i.to_string())
-                .arg(r.version.as_ref().unwrap_or(&r.id));
+        let index = session.choose("Choose a release", "", options)?;
+        if index == releases.len() {
+            return Ok(None);
         }
-        let output = cmd.output().map_err(LibraryError::Io)?;
-        if !output.status.success() {
-            return Ok(true);
-        }
-        let selection = String::from_utf8_lossy(&output.stdout);
-        if selection.trim() == "other" {
-            return Ok(false);
-        }
-        selection
-            .trim()
-            .parse::<usize>()
-            .ok()
-            .filter(|i| *i < releases.len())
-            .ok_or_else(|| invalid("Invalid release selection"))?
+        index
     };
     let (release, revision, manifest) = releases.swap_remove(index);
     let pending = lib
@@ -144,53 +104,14 @@ pub(super) fn first_play(
             s.generations
                 .into_iter()
                 .rev()
-                .find(|g| g.state == "PrerequisitesPending")
+                .find(|g| matches!(g.state.as_str(), "Preparing" | "PrerequisitesPending"))
         });
     let mut selections = installation::Selections::new();
     for group in manifest.options.into_iter().filter(|_| pending.is_none()) {
-        let mut cmd = dialog(name);
-        cmd.args([
-            "--list",
-            if group.multiple {
-                "--checklist"
-            } else {
-                "--radiolist"
-            },
-            "--no-markup",
-            "--column=Selected",
-            "--column=Index",
-            "--column=Choice",
-            "--hide-column=2",
-            "--print-column=2",
-        ])
-        .arg(format!("--text={}", group.name));
-        for (i, item) in group.choices.iter().enumerate() {
-            cmd.arg(if group.defaults.contains(&item.id) {
-                "TRUE"
-            } else {
-                "FALSE"
-            })
-            .arg(i.to_string())
-            .arg(&item.name);
-        }
-        let output = cmd.output().map_err(LibraryError::Io)?;
-        if !output.status.success() {
-            return Ok(true);
-        }
-        let ids = String::from_utf8_lossy(&output.stdout)
-            .trim()
-            .split('|')
-            .filter(|v| !v.is_empty())
-            .map(|v| {
-                v.parse::<usize>()
-                    .ok()
-                    .and_then(|i| group.choices.get(i))
-                    .map(|c| c.id.clone())
-                    .ok_or_else(|| invalid("Invalid option selection"))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let ids = session.options(&group)?;
         selections.insert(group.id, ids);
     }
+    session.phase("Resolving installation plan");
     let api = profile_client(lib, profile)?;
     let saved = if let Some(g) = &pending {
         lib.prerequisite_requirements(profile, &g.plan_id)?
@@ -221,104 +142,107 @@ pub(super) fn first_play(
         .or(default_runtime(lib)?)
         .ok_or_else(|| invalid("Select a Windows runtime in Decky Settings first"))?;
     let prerequisites = plan.prerequisites.unwrap_or_default();
-    let mut review = format!("Install {name} using {}?\n", selected.display());
+    let mut consent = Vec::new();
+    let mut sources: Vec<_> = plan
+        .files
+        .iter()
+        .flat_map(|files| files.values())
+        .map(|f| f.artifact_id.as_str())
+        .collect();
+    let mut components = Vec::new();
     for p in &prerequisites {
-        review.push_str(&format!("\n{} · {} {:?}", p.name, p.path, p.arguments));
+        if !p.optional
+            || session.choose(
+                &p.name,
+                "Optional component",
+                vec!["Skip".into(), "Include".into()],
+            )? == 1
+        {
+            consent.push(p.id.clone());
+            sources.push(&p.file.artifact_id);
+            components.push(format!("{} · {} {:?}", p.name, p.path, p.arguments));
+        }
     }
+    let mut review = format!(
+        "{}\nRuntime: {}\nComponents: {}",
+        download_summary(lib, profile, &sources)?,
+        selected.display(),
+        if components.is_empty() {
+            "None".into()
+        } else {
+            components.join("\n")
+        }
+    );
     for note in plan.unresolved {
         review.push_str(&format!("\n{note}"));
     }
-    if pending.is_some() {
-        review.push_str("\nResume this installation and retry incomplete prerequisites?");
-    }
-    let mut prompt = dialog(name)
-        .args([
-            "--text-info",
-            "--height=420",
-            "--ok-label=Install",
-            "--checkbox=I approve this installation and the required prerequisites",
-        ])
-        .stdin(Stdio::piped())
-        .spawn()
-        .map_err(LibraryError::Io)?;
-    prompt
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(review.as_bytes())
-        .map_err(LibraryError::Io)?;
-    if !prompt.wait().map_err(LibraryError::Io)?.success() {
-        return Ok(true);
-    }
-    let mut consent = Vec::new();
-    for p in prerequisites {
-        if !p.optional || confirm(name, &format!("Run optional prerequisite {}?", p.name))? {
-            consent.push(p.id);
-        }
-    }
-    if stop.load(Ordering::Relaxed) {
-        return Ok(true);
-    }
-    let mut runtime = lib.bind_application_runtime(profile, &saved.id, Path::new(&selected))?;
-    let mut window = dialog(name)
-        .args([
-            "--progress",
-            "--pulsate",
-            "--no-cancel",
-            "--auto-close",
-            "--text=Preparing application resources",
-        ])
-        .stdin(Stdio::piped())
-        .spawn()
-        .map_err(LibraryError::Io)?;
-    let mut pipe = window.stdin.take();
-    let mut progress = |phase: &str| {
-        if let Some(p) = &mut pipe {
-            let _ = writeln!(p, "# {}", phase.replace(['\r', '\n'], " "));
-        }
+    let action = if pending.is_some() {
+        "Resume and retry incomplete components"
+    } else {
+        "Approve installation and play"
     };
-    let installation = (|| -> Result<(), CliError> {
-        let retry = pending.is_some();
-        let generation = if let Some(g) = pending {
-            Some(g)
-        } else {
-            lib.install_saved_plan_with_progress(profile, &saved.id, Some(&api), &mut progress)?
-                .generations
-                .into_iter()
-                .rev()
-                .find(|g| g.plan_id == saved.id && g.state == "PrerequisitesPending")
-        };
-        if let Some(g) = generation {
-            if stop.load(Ordering::Relaxed) {
-                return Ok(());
-            }
-            let round =
-                lib.confirm_prerequisites(profile, &g.id, &saved.fingerprint, &consent, retry)?;
-            lib.process_prerequisites_with_progress(
-                profile,
-                &g.id,
-                &round,
-                Some(&api),
-                &mut runtime,
-                &mut progress,
-            )?;
-        }
-        Ok(())
-    })();
-    drop(pipe);
-    let _ = window.kill();
-    let _ = window.wait();
-    installation?;
-    if !stop.load(Ordering::Relaxed) {
-        let choice = lib
-            .launch_candidates(profile, &release.id)?
+    session.choose(&format!("Install {name}"), &review, vec![action.into()])?;
+    session.check()?;
+    session.activity.lock().unwrap().release = Some(release.id.clone());
+    let mut runtime = lib.bind_application_runtime(profile, &saved.id, Path::new(&selected))?;
+    let mut progress = |phase: &str| session.phase(phase);
+    let retry = pending.is_some();
+    let generation = if let Some(g) = pending.filter(|g| g.state == "PrerequisitesPending") {
+        Some(g)
+    } else {
+        lib.install_saved_plan_with_progress(profile, &saved.id, Some(&api), &mut progress)?
+            .generations
             .into_iter()
-            .find(|c| c.status == "Ready")
-            .ok_or_else(|| {
-                invalid("Installation is incomplete. Play again to review and retry.")
-            })?;
-        save_choice(selection_path, &choice)?;
-        supervise(lib, &choice, stop)?;
+            .rev()
+            .find(|g| g.plan_id == saved.id && g.state == "PrerequisitesPending")
+    };
+    if let Some(g) = generation {
+        session.check()?;
+        let round =
+            lib.confirm_prerequisites(profile, &g.id, &saved.fingerprint, &consent, retry)?;
+        use app_depot_core::prerequisite::{
+            PrerequisiteExecutor, PrerequisiteOutcome, PrerequisiteRequest,
+        };
+        struct Cancellable<'a> {
+            runtime: &'a mut compatibility::ApplicationRuntime,
+            session: &'a Session,
+        }
+        impl PrerequisiteExecutor for Cancellable<'_> {
+            fn execute(&mut self, request: &PrerequisiteRequest<'_>) -> PrerequisiteOutcome {
+                if self.session.check().is_err() {
+                    PrerequisiteOutcome::Cancelled
+                } else {
+                    self.runtime.execute(request)
+                }
+            }
+        }
+        let result = lib.process_prerequisites_with_progress(
+            profile,
+            &g.id,
+            &round,
+            Some(&api),
+            &mut Cancellable {
+                runtime: &mut runtime,
+                session,
+            },
+            &mut progress,
+        )?;
+        if let Some(error) = result
+            .generations
+            .iter()
+            .find(|value| value.id == g.id)
+            .and_then(|g| g.last_error.as_deref())
+        {
+            return Err(invalid(error));
+        }
     }
-    Ok(true)
+    session.check()?;
+    let choice = lib
+        .launch_candidates(profile, &release.id)?
+        .into_iter()
+        .find(|c| c.status == "Ready")
+        .ok_or_else(|| {
+            invalid("Installation is incomplete. Retry to review the pending components.")
+        })?;
+    Ok(Some(choice))
 }
